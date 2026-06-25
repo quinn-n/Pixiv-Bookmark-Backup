@@ -1,0 +1,79 @@
+[project]
+name = "pixiv-bookmark-backup"
+description = "Back up your Pixiv bookmarks from the command line."
+authors = [
+    { name = "Quinn N", email = "88954051+quinn-n@users.noreply.github.com" },
+]
+requires-python = ">=3.12"
+dynamic = ["version"]
+dependencies = ["click", "attrs"]
+
+[project.scripts]
+pixiv-bookmark-backup = "pixiv_bookmark_backup.cli:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/pixiv_bookmark_backup/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pixiv_bookmark_backup"]
+
+# --- pixi -----------------------------------------------------------------
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+# Runtime dependencies (conda-forge preferred). Add with `pixi add <pkg>`.
+[tool.pixi.dependencies]
+python = ">=3.12"
+click = "*"
+attrs = "*"
+
+# Install this package itself (editable) so the console entry point exists in
+# the env. The `click`/`attrs` requirements above satisfy its metadata deps.
+[tool.pixi.pypi-dependencies]
+pixiv-bookmark-backup = { path = ".", editable = true }
+
+# Dev/test/quality tooling lives on its own feature; the default environment
+# folds it in so the documented bare `pixi run check` works.
+# Add with `pixi add --feature dev <pkg>`.
+[tool.pixi.feature.dev.dependencies]
+pytest = "*"
+pytest-cov = "*"
+black = "*"
+flake8 = "*"
+flake8-bugbear = "*"
+basedpyright = "*"
+bandit = "*"
+
+[tool.pixi.environments]
+default = { features = ["dev"], solve-group = "default" }
+
+[tool.pixi.tasks]
+fmt = "black ."
+fmt-check = "black --check --diff ."
+lint = "flake8"
+typecheck = "basedpyright"
+test = "pytest --cov=pixiv_bookmark_backup --cov-report=term-missing"
+bandit = "bandit -r src"
+check = { depends-on = ["fmt-check", "lint", "typecheck", "test"] }
+
+# --- tooling config -------------------------------------------------------
+
+[tool.black]
+line-length = 88
+target-version = ["py312"]
+extend-exclude = '\.pixi/'
+
+[tool.pyright]
+include = ["src", "tests"]
+typeCheckingMode = "standard"
+pythonVersion = "3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

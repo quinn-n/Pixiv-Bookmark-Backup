@@ -1,0 +1,10 @@
+{
+  "_comment": "Copy to settings.local.json (gitignored) for personal overrides — e.g. permission allowlists so common pixi commands don't re-prompt.",
+  "permissions": {
+    "allow": [
+      "Bash(pixi run:*)", "Bash(pixi install:*)", "Bash(pixi list:*)",
+      "Bash(pixi tree:*)", "Bash(pixi search:*)", "Bash(pixi add:*)",
+      "Bash(git diff:*)", "Bash(git status:*)"
+    ]
+  }
+}

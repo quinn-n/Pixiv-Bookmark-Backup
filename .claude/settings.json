@@ -1,0 +1,37 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pixi run:*)",
+      "Bash(pixi install:*)",
+      "Bash(pixi add:*)",
+      "Bash(pixi update:*)",
+      "Bash(pixi list:*)",
+      "Bash(pixi tree:*)",
+      "Bash(pixi search:*)",
+      "Bash(pytest:*)",
+      "Bash(python -m pytest:*)",
+      "Bash(black:*)",
+      "Bash(flake8:*)",
+      "Bash(basedpyright:*)",
+      "Bash(git diff:*)",
+      "Bash(git status:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git branch:*)"
+    ],
+    "ask": [
+      "Bash(sudo:*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Write|Edit", "hooks": [ { "type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/protect-secrets.sh" } ] }
+    ],
+    "PostToolUse": [
+      { "matcher": "Write|Edit", "hooks": [ { "type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/format-check.sh" } ] }
+    ],
+    "SubagentStop": [
+      { "hooks": [ { "type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/no-secrets-in-diff.sh" } ] }
+    ]
+  }
+}

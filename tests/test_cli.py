@@ -1,13 +1,184 @@
-"""CLI smoke tests driven through click's CliRunner."""
+"""CLI tests driven through click's ``CliRunner``.
+
+These exercise the thin click layer end to end. Two injection strategies are
+used:
+
+* A fully offline :class:`FakePixivClient` (whose ``download`` writes a small
+  real file) is patched in for ``cli.Pixivpy3Client`` to drive the *real*
+  orchestrator for the happy-path / dry-run / metadata-only cases, so we can
+  assert on the ``details.json`` it writes.
+* For deterministic exit-code mapping (auth/network/interrupt/partial/empty),
+  ``cli.run_backup`` itself is monkeypatched to return a scripted
+  :class:`RunSummary` or raise a scripted exception.
+
+CliRunner in click 8.4.1 has no ``mix_stderr`` kwarg: data is asserted on
+``result.stdout`` and logs/errors on ``result.stderr``; ``result.output`` is the
+combined stream and is therefore not used to prove a clean stdout.
+"""
 
 from __future__ import annotations
 
+import json
+import os
+import sys
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
+import pytest
 from click.testing import CliRunner
 
-from pixiv_bookmark_backup import __version__
+from pixiv_bookmark_backup import __version__, cli as cli_module
+from pixiv_bookmark_backup.backup import BackupUsageError
 from pixiv_bookmark_backup.cli import cli
+from pixiv_bookmark_backup.core import RunSummary
+from pixiv_bookmark_backup.models import (
+    Author,
+    BookmarkWork,
+    UgoiraInfo,
+    WorkImage,
+)
+from pixiv_bookmark_backup.pixiv_client import ApiError, AuthRejected, PixivClient
+
+# A deliberately fake, non-secret placeholder: any non-empty string lets
+# resolve_auth() succeed so the offline tests can run without real credentials.
+FAKE_REFRESH = "fake-x"
+SELF_ID = "555"
+
+
+# -- fakes & helpers ----------------------------------------------------
+
+
+def _make_work(
+    work_id: int,
+    *,
+    work_type: str = "illust",
+    pages: int = 1,
+    title: str = "A Work",
+) -> BookmarkWork:
+    """Build a :class:`BookmarkWork` with ``pages`` original-resolution images."""
+
+    images = [
+        WorkImage(page=i, source_url=f"https://i.pximg.net/{work_id}_p{i}.jpg")
+        for i in range(pages)
+    ]
+    if work_type == "ugoira":
+        images = []
+    return BookmarkWork(
+        id=work_id,
+        type=work_type,
+        title=title,
+        author=Author(id=7, name="Artist", account="artist_acct"),
+        posted_at="2024-05-01T12:00:00+09:00",
+        x_restrict=0,
+        sanity_level=2,
+        work_tags=[],
+        bookmark_tags=None,
+        page_count=max(pages, 1),
+        images=images,
+    )
+
+
+class FakePixivClient:
+    """Offline stand-in for :class:`PixivClient` that writes real files.
+
+    ``authenticate`` returns a fixed self id. ``iter_bookmarks`` yields the
+    scripted works for the requested ``restrict`` pass. ``download`` writes a
+    few bytes to ``dest_path`` and returns the byte count, so a real
+    orchestrator run produces image files and a ``details.json`` recording
+    ``downloaded`` statuses. ``ugoira_metadata`` is unused by the illust-only
+    fixtures here.
+    """
+
+    def __init__(
+        self,
+        works_by_restrict: dict[str, list[BookmarkWork]],
+        *,
+        self_id: str = SELF_ID,
+    ) -> None:
+        self._works_by_restrict = works_by_restrict
+        self._self_id = self_id
+        self.download_calls: list[str] = []
+
+    def authenticate(self, refresh_token: str) -> str:
+        return self._self_id
+
+    def iter_bookmarks(self, user_id: str, restrict: str) -> Iterator[BookmarkWork]:
+        yield from self._works_by_restrict.get(restrict, [])
+
+    def ugoira_metadata(self, work_id: int) -> UgoiraInfo:  # pragma: no cover
+        raise NotImplementedError
+
+    def download(
+        self,
+        url: str,
+        dest_path: Path,
+        referer: str = "https://www.pixiv.net/",
+    ) -> int:
+        self.download_calls.append(url)
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        data = b"fake-image-bytes"
+        dest_path.write_bytes(data)
+        return len(data)
+
+
+# Static guarantee the fake satisfies the public Protocol.
+_: type[PixivClient] = FakePixivClient
+
+
+def _install_client(monkeypatch: pytest.MonkeyPatch, client: FakePixivClient) -> None:
+    """Patch ``cli.Pixivpy3Client`` so constructing it returns ``client``."""
+
+    monkeypatch.setattr(cli_module, "Pixivpy3Client", lambda: client)
+
+
+def _install_run(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    summary: RunSummary | None = None,
+    raises: BaseException | None = None,
+) -> None:
+    """Patch ``cli.run_backup`` to return ``summary`` or raise ``raises``."""
+
+    def fake_run(
+        config: Any,
+        auth: Any,
+        client: Any,
+        *,
+        progress: Any = None,
+        **_kw: Any,
+    ) -> RunSummary:
+        if raises is not None:
+            raise raises
+        assert summary is not None
+        return summary
+
+    monkeypatch.setattr(cli_module, "run_backup", fake_run)
+
+
+def _token_env() -> dict[str, str]:
+    """Environment providing a refresh token via the env var."""
+
+    return {"PIXIV_REFRESH_TOKEN": FAKE_REFRESH}
+
+
+def _no_token_env() -> dict[str, str]:
+    """Environment with the refresh-token env var explicitly cleared."""
+
+    return {"PIXIV_REFRESH_TOKEN": ""}
+
+
+def _missing_config(tmp_path: Path) -> str:
+    """Path to a nonexistent config file under ``tmp_path``.
+
+    Pointing ``--config`` here keeps auth resolution deterministic: it never
+    falls through to the user's real default config file.
+    """
+
+    return str(tmp_path / "nope.toml")
+
+
+# -- preserved smoke tests ---------------------------------------------
 
 
 def test_version(runner: CliRunner) -> None:
@@ -22,30 +193,463 @@ def test_help_lists_summary(runner: CliRunner) -> None:
     assert "Back up your Pixiv bookmarks" in result.output
 
 
-def test_backup_dry_run_succeeds(runner: CliRunner, tmp_path: Path) -> None:
+# -- exit 0: success ----------------------------------------------------
+
+
+def test_success_end_to_end_writes_manifest(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "out"
+    client = FakePixivClient({"public": [_make_work(100, pages=2)]})
+    _install_client(monkeypatch, client)
+
     result = runner.invoke(
         cli,
-        ["backup", "12345", "--output-dir", str(tmp_path), "--dry-run"],
+        ["backup", "--output-dir", str(out), "--config", _missing_config(tmp_path)],
+        env=_token_env(),
     )
-    assert result.exit_code == 0
-    assert "12345" in result.output
-    assert "Would back up" in result.output
+
+    assert result.exit_code == 0, result.output
+    assert "Backed up 1/1 works" in result.stdout
+    # The orchestrator wrote its manifest and the downloaded images.
+    assert (out / "details.json").exists()
+    assert (out / "100_p0.jpg").exists()
+    assert client.download_calls  # real downloads were attempted
 
 
-def test_backup_without_dry_run_is_not_implemented(
+def test_success_human_summary_via_scripted_run(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_run(
+        monkeypatch,
+        summary=RunSummary(
+            works_total=3, works_succeeded=3, files_downloaded=5, bytes_downloaded=99
+        ),
+    )
+
+    result = runner.invoke(
+        cli,
+        ["backup", "--config", _missing_config(tmp_path)],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Backed up 3/3 works (0 failed), 5 files" in result.stdout
+
+
+# -- exit 2: usage errors ----------------------------------------------
+
+
+def test_no_token_anywhere_is_usage_error(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Never construct a client / call run if auth resolution fails first.
+    _install_run(monkeypatch, raises=AssertionError("must not run"))
+
+    result = runner.invoke(
+        cli,
+        ["backup", "--config", _missing_config(tmp_path)],
+        env=_no_token_env(),
+    )
+
+    assert result.exit_code == 2
+    assert "No Pixiv refresh token found" in result.stderr
+
+
+def test_quiet_and_verbose_are_mutually_exclusive(
     runner: CliRunner, tmp_path: Path
 ) -> None:
     result = runner.invoke(
         cli,
-        ["backup", "12345", "--output-dir", str(tmp_path)],
+        ["backup", "--quiet", "--verbose", "--config", _missing_config(tmp_path)],
+        env=_token_env(),
     )
-    assert result.exit_code == 1
-    assert "not implemented" in result.output
+
+    assert result.exit_code == 2
+    assert "mutually exclusive" in result.stderr
 
 
-def test_backup_rejects_unknown_visibility(runner: CliRunner, tmp_path: Path) -> None:
+def test_rejects_unknown_visibility(runner: CliRunner, tmp_path: Path) -> None:
     result = runner.invoke(
         cli,
-        ["backup", "12345", "-o", str(tmp_path), "--visibility", "bogus"],
+        ["backup", "--visibility", "bogus", "--config", _missing_config(tmp_path)],
+        env=_token_env(),
     )
-    assert result.exit_code == 2  # click usage error
+
+    assert result.exit_code == 2  # click Choice rejects it before we run
+
+
+def test_rejects_bad_since_date(runner: CliRunner, tmp_path: Path) -> None:
+    result = runner.invoke(
+        cli,
+        ["backup", "--since", "2025/01/01", "--config", _missing_config(tmp_path)],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 2
+    assert "YYYY-MM-DD" in result.stderr
+
+
+def test_backup_usage_error_from_run_is_exit_2(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_run(
+        monkeypatch,
+        raises=BackupUsageError("private bookmarks of another user are not accessible"),
+    )
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup",
+            "999",
+            "--visibility",
+            "private",
+            "--config",
+            _missing_config(tmp_path),
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 2
+    assert "another user" in result.stderr
+
+
+# -- exit 3 / 4 / 130 ---------------------------------------------------
+
+
+def test_auth_rejected_is_exit_3(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_run(monkeypatch, raises=AuthRejected("Pixiv rejected the refresh token"))
+
+    result = runner.invoke(
+        cli,
+        ["backup", "--config", _missing_config(tmp_path)],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 3
+    assert "Pixiv rejected the refresh token" in result.stderr
+
+
+def test_api_error_is_exit_4(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_run(monkeypatch, raises=ApiError("Failed to list bookmarks: boom"))
+
+    result = runner.invoke(
+        cli,
+        ["backup", "--config", _missing_config(tmp_path)],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 4
+    assert "Pixiv API error" in result.stderr
+
+
+def test_keyboard_interrupt_is_exit_130(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_run(monkeypatch, raises=KeyboardInterrupt())
+
+    result = runner.invoke(
+        cli,
+        ["backup", "--config", _missing_config(tmp_path)],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 130
+    assert "interrupted" in result.stderr
+
+
+# -- exit 5 / 6 (decided from the summary) ------------------------------
+
+
+def test_zero_works_is_exit_5(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_run(monkeypatch, summary=RunSummary(works_total=0))
+
+    result = runner.invoke(
+        cli,
+        ["backup", "--config", _missing_config(tmp_path)],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 5
+    assert "Backed up 0/0 works" in result.stdout
+
+
+def test_partial_run_is_exit_6(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_run(
+        monkeypatch,
+        summary=RunSummary(
+            works_total=2,
+            works_succeeded=1,
+            works_failed=1,
+            files_downloaded=1,
+        ),
+    )
+
+    result = runner.invoke(
+        cli,
+        ["backup", "--config", _missing_config(tmp_path)],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 6
+    assert "(1 failed)" in result.stdout
+
+
+# -- --json -------------------------------------------------------------
+
+
+def test_json_output_is_single_object_on_stdout(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "out"
+    _install_run(
+        monkeypatch,
+        summary=RunSummary(
+            works_total=2,
+            works_succeeded=2,
+            files_downloaded=4,
+            bytes_downloaded=128,
+        ),
+    )
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup",
+            "12345",
+            "--json",
+            "--output-dir",
+            str(out),
+            "--config",
+            _missing_config(tmp_path),
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    # stdout is exactly one JSON object and nothing else (logs are on stderr).
+    payload = json.loads(result.stdout)
+    # The forward-compat schema marker is present (and first) for scripts.
+    assert payload["schema"] == 1
+    assert next(iter(payload)) == "schema"
+    assert payload["user_id"] == "12345"
+    assert payload["visibility"] == "public"
+    assert payload["output_dir"] == str(out)
+    assert payload["works_total"] == 2
+    assert payload["works_succeeded"] == 2
+    assert payload["files_downloaded"] == 4
+    assert payload["bytes_downloaded"] == 128
+    assert payload["dry_run"] is False
+    assert payload["details_json"] == str(out / "details.json")
+    assert payload["exit_code"] == 0
+
+
+def test_json_output_keeps_logs_off_stdout(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = FakePixivClient({"public": [_make_work(100, pages=1)]})
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup",
+            "--json",
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--config",
+            _missing_config(tmp_path),
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    # The "Backing up ..." progress line must not pollute stdout.
+    assert "Backing up" not in result.stdout
+    assert "Backing up" in result.stderr
+    json.loads(result.stdout)  # stdout parses cleanly as one object
+
+
+# -- --dry-run ----------------------------------------------------------
+
+
+def test_dry_run_writes_nothing_and_says_would(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "out"
+    client = FakePixivClient({"public": [_make_work(100, pages=2)]})
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup",
+            "--dry-run",
+            "--output-dir",
+            str(out),
+            "--config",
+            _missing_config(tmp_path),
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Would back up" in result.stdout
+    # Nothing was downloaded and no manifest / output dir was created.
+    assert client.download_calls == []
+    assert not (out / "details.json").exists()
+    assert not out.exists() or list(out.iterdir()) == []
+
+
+def test_dry_run_json_has_null_details(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_run(
+        monkeypatch,
+        summary=RunSummary(works_total=1, works_succeeded=1, files_downloaded=2),
+    )
+
+    result = runner.invoke(
+        cli,
+        ["backup", "--dry-run", "--json", "--config", _missing_config(tmp_path)],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["dry_run"] is True
+    assert payload["details_json"] is None
+
+
+# -- --metadata-only ----------------------------------------------------
+
+
+def test_metadata_only_records_without_downloading(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "out"
+    client = FakePixivClient({"public": [_make_work(100, pages=2)]})
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup",
+            "--metadata-only",
+            "--output-dir",
+            str(out),
+            "--config",
+            _missing_config(tmp_path),
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    # No image bytes fetched, but the manifest records metadata-only entries.
+    assert client.download_calls == []
+    assert not (out / "100_p0.jpg").exists()
+    manifest = json.loads((out / "details.json").read_text(encoding="utf-8"))
+    statuses = {img["status"] for work in manifest["works"] for img in work["images"]}
+    assert statuses == {"metadata-only"}
+
+
+# -- security warnings (token visibility, insecure config) --------------
+
+
+def test_refresh_token_on_command_line_warns_on_stderr(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A token passed as a flag is visible in ps/proc, so the CLI warns. The
+    # scripted run keeps it fully offline; the token must never be echoed.
+    _install_run(monkeypatch, summary=RunSummary(works_total=1, works_succeeded=1))
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup",
+            "--refresh-token",
+            FAKE_REFRESH,
+            "--config",
+            _missing_config(tmp_path),
+        ],
+        env=_no_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "visible to other processes" in result.stderr
+    assert "PIXIV_REFRESH_TOKEN" in result.stderr
+    # The secret itself is never printed (not on stdout, not on stderr).
+    assert FAKE_REFRESH not in result.stdout
+    assert FAKE_REFRESH not in result.stderr
+
+
+def test_refresh_token_from_env_does_not_warn(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An env-var-sourced token is not visible in the process args, so no warning.
+    _install_run(monkeypatch, summary=RunSummary(works_total=1, works_succeeded=1))
+
+    result = runner.invoke(
+        cli,
+        ["backup", "--config", _missing_config(tmp_path)],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "visible to other processes" not in result.stderr
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX file-mode bits are not meaningful on Windows.",
+)
+def test_insecure_config_file_warns_on_stderr(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A world-readable config supplying the token triggers a chmod warning.
+    config = tmp_path / "config.toml"
+    config.write_text(f'[auth]\nrefresh_token = "{FAKE_REFRESH}"\n', encoding="utf-8")
+    os.chmod(config, 0o644)
+    _install_run(monkeypatch, summary=RunSummary(works_total=1, works_succeeded=1))
+
+    result = runner.invoke(
+        cli,
+        ["backup", "--config", str(config)],
+        env=_no_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "readable by other users" in result.stderr
+    assert "chmod 600" in result.stderr
+    assert str(config) in result.stderr
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX file-mode bits are not meaningful on Windows.",
+)
+def test_secure_config_file_does_not_warn(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text(f'[auth]\nrefresh_token = "{FAKE_REFRESH}"\n', encoding="utf-8")
+    os.chmod(config, 0o600)
+    _install_run(monkeypatch, summary=RunSummary(works_total=1, works_succeeded=1))
+
+    result = runner.invoke(
+        cli,
+        ["backup", "--config", str(config)],
+        env=_no_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "readable by other users" not in result.stderr

@@ -6,7 +6,7 @@ authors = [
 ]
 requires-python = ">=3.12"
 dynamic = ["version"]
-dependencies = ["click", "attrs"]
+dependencies = ["click", "attrs", "pixivpy3>=3.7.5,<4"]
 
 [project.scripts]
 pixiv-bookmark-backup = "pixiv_bookmark_backup.cli:cli"
@@ -16,10 +16,10 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.version]
-path = "src/pixiv_bookmark_backup/__init__.py"
+path = "pixiv_bookmark_backup/__init__.py"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/pixiv_bookmark_backup"]
+packages = ["pixiv_bookmark_backup"]
 
 # --- pixi -----------------------------------------------------------------
 
@@ -32,6 +32,7 @@ platforms = ["linux-64"]
 python = ">=3.12"
 click = "*"
 attrs = "*"
+pillow = ">=12.2.0,<13"
 
 # Install this package itself (editable) so the console entry point exists in
 # the env. The `click`/`attrs` requirements above satisfy its metadata deps.
@@ -59,7 +60,7 @@ fmt-check = "black --check --diff ."
 lint = "flake8"
 typecheck = "basedpyright"
 test = "pytest --cov=pixiv_bookmark_backup --cov-report=term-missing"
-bandit = "bandit -r src"
+bandit = "bandit -r pixiv_bookmark_backup"
 check = { depends-on = ["fmt-check", "lint", "typecheck", "test"] }
 
 # --- tooling config -------------------------------------------------------
@@ -70,7 +71,7 @@ target-version = ["py312"]
 extend-exclude = '\.pixi/'
 
 [tool.pyright]
-include = ["src", "tests"]
+include = ["pixiv_bookmark_backup", "tests"]
 typeCheckingMode = "standard"
 pythonVersion = "3.12"
 

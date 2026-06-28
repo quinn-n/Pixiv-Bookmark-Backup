@@ -175,7 +175,7 @@ class Pixivpy3Client:
         try:
             result = self._api.user_bookmarks_illust(user_id, restrict)
             while True:
-                for illust in result.illusts:
+                for illust in result.illusts or []:
                     yield self._to_work(illust, fetch_bookmark_tags)
                 next_url = result.next_url
                 if not next_url:

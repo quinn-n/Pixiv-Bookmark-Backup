@@ -286,6 +286,8 @@ class Pixivpy3Client:
             detail = self._api.illust_bookmark_detail(illust_id).bookmark_detail
         except PixivError:
             return None
+        if detail is None:
+            return None
         return [tag.name for tag in detail.tags if tag.is_registered]
 
     def _to_ugoira(self, meta: Any) -> UgoiraInfo:

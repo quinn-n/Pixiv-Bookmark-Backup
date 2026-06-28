@@ -124,11 +124,28 @@ def test_decide_exit_code_table(summary: RunSummary, expected: ExitCode) -> None
     assert decide_exit_code(summary) == expected
 
 
-def test_exit_code_numeric_values() -> None:
-    assert ExitCode.SUCCESS == 0
-    assert ExitCode.USAGE == 2
-    assert ExitCode.AUTH == 3
-    assert ExitCode.NETWORK == 4
-    assert ExitCode.NO_BOOKMARKS == 5
-    assert ExitCode.PARTIAL == 6
-    assert ExitCode.INTERRUPTED == 130
+@pytest.mark.parametrize(
+    "member, value",
+    [
+        (ExitCode.SUCCESS, 0),
+        (ExitCode.USAGE, 2),
+        (ExitCode.AUTH, 3),
+        (ExitCode.NETWORK, 4),
+        (ExitCode.NO_BOOKMARKS, 5),
+        (ExitCode.PARTIAL, 6),
+        (ExitCode.LOGIN_DRIVER, 7),
+        (ExitCode.LOGIN_FAILED, 8),
+        (ExitCode.CONFIG_WRITE, 9),
+        (ExitCode.INTERRUPTED, 130),
+    ],
+)
+def test_exit_code_numeric_values(member: ExitCode, value: int) -> None:
+    # The numeric values are part of the CLI contract; guard against drift.
+    assert member == value
+    assert int(member) == value
+
+
+def test_login_exit_codes_are_distinct_members() -> None:
+    assert ExitCode.LOGIN_DRIVER is ExitCode(7)
+    assert ExitCode.LOGIN_FAILED is ExitCode(8)
+    assert ExitCode.CONFIG_WRITE is ExitCode(9)

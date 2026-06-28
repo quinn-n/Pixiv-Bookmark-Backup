@@ -6,7 +6,7 @@ authors = [
 ]
 requires-python = ">=3.12"
 dynamic = ["version"]
-dependencies = ["click", "attrs", "pixivpy3>=3.7.5,<4"]
+dependencies = ["click", "attrs", "pixivpy3>=3.7.5,<4", "tomlkit"]
 
 [project.scripts]
 pixiv-bookmark-backup = "pixiv_bookmark_backup.cli:cli"
@@ -33,6 +33,7 @@ python = ">=3.12"
 click = "*"
 attrs = "*"
 pillow = ">=12.2.0,<13"
+tomlkit = ">=0.15.0,<0.16"
 
 # Install this package itself (editable) so the console entry point exists in
 # the env. The `click`/`attrs` requirements above satisfy its metadata deps.
@@ -51,8 +52,16 @@ flake8-bugbear = "*"
 basedpyright = "*"
 bandit = "*"
 
+# Optional `login` feature: gppt drives the real interactive Pixiv login flow.
+# It is PyPI-only (not on conda-forge) and pulls in playwright; it stays off the
+# default env so a plain `backup` install stays lightweight. Use via
+# `pixi run -e login ...`. Add with `pixi add --pypi --feature login <pkg>`.
+[tool.pixi.feature.login.pypi-dependencies]
+gppt = ">=4.3.1, <5"
+
 [tool.pixi.environments]
 default = { features = ["dev"], solve-group = "default" }
+login = { features = ["login", "dev"], solve-group = "default" }
 
 [tool.pixi.tasks]
 fmt = "black ."

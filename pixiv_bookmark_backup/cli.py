@@ -12,19 +12,24 @@ from __future__ import annotations
 
 import datetime
 import json
+import sys
 from pathlib import Path
 
 import click
 
 from . import __version__
+from .auth_login import GpptLogin, LoginDriverError, LoginFailed, LoginFlow
 from .backup import MANIFEST_NAME, BackupUsageError
 from .backup import run as run_backup
 from .config import (
     ConfigError,
+    ConfigWriteError,
     NoTokenError,
+    _token_from_config,
     default_config_path,
     is_insecure_config,
     resolve_auth,
+    write_refresh_token,
 )
 from .core import VISIBILITIES, BackupConfig, ExitCode, RunSummary, decide_exit_code
 from .pixiv_client import ApiError, AuthRejected, Pixivpy3Client
@@ -32,6 +37,16 @@ from .pixiv_client import ApiError, AuthRejected, Pixivpy3Client
 #: Version stamped as the first key of the ``--json`` summary object, so a
 #: scripting consumer can detect the payload shape and adapt across releases.
 JSON_SUMMARY_SCHEMA = 1
+
+#: Version stamped as the first key of the ``login --json`` result object, so a
+#: scripting consumer can detect the payload shape and adapt across releases.
+JSON_LOGIN_SCHEMA = 1
+
+
+def _build_login() -> LoginFlow:
+    """Construct the default interactive login flow (overridable in tests)."""
+
+    return GpptLogin()  # pragma: no cover - real optional driver, not exercised offline
 
 
 def _exit_error(message: str, exit_code: int) -> click.ClickException:
@@ -332,3 +347,285 @@ def _emit_summary(
         f"({summary.works_failed} failed), {summary.files_downloaded} files "
         f"to {config.output_dir}"
     )
+
+
+@cli.command()
+@click.option(
+    "--config",
+    type=click.Path(dir_okay=False, path_type=Path),
+    envvar="PIXIV_BOOKMARK_BACKUP_CONFIG",
+    default=None,
+    help="Path to the TOML config file to write [auth].refresh_token into.",
+)
+@click.option(
+    "--headless/--no-headless",
+    default=False,
+    help="Drive the browser headlessly (no visible window).",
+)
+@click.option(
+    "--username",
+    type=str,
+    envvar="PIXIV_USERNAME",
+    default=None,
+    help="Pixiv email/ID for non-interactive headless login (prefer the env var).",
+)
+@click.option(
+    "--password",
+    type=str,
+    envvar="PIXIV_PASSWORD",
+    default=None,
+    help="Pixiv password for headless login (prefer the env var; argv is visible "
+    "via ps).",
+)
+@click.option(
+    "--timeout",
+    type=click.IntRange(min=1),
+    default=120,
+    show_default=True,
+    help="Seconds to wait for login to complete before giving up.",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Overwrite an existing [auth].refresh_token without prompting.",
+)
+@click.option(
+    "--print-token/--no-print-token",
+    default=False,
+    help="Also print the refresh token to stdout (insecure: it lands in "
+    "scrollback).",
+)
+@click.option(
+    "--stdout-only",
+    is_flag=True,
+    help="Print ONLY the bare token to stdout and write no file (for "
+    "export PIXIV_REFRESH_TOKEN=$(... --stdout-only)).",
+)
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    help="Print a machine-readable result object to stdout.",
+)
+@click.option(
+    "--yes",
+    "-y",
+    is_flag=True,
+    help='Assume "yes" for prompts (e.g. overwrite an existing token).',
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Run the login flow but do not write or modify the config file.",
+)
+@click.option(
+    "--quiet",
+    "-q",
+    is_flag=True,
+    help="Suppress progress output on stderr.",
+)
+@click.option(
+    "--verbose",
+    "-v",
+    count=True,
+    help="Increase progress detail on stderr; repeat for more.",
+)
+@click.pass_context
+def login(
+    ctx: click.Context,
+    config: Path | None,
+    headless: bool,
+    username: str | None,
+    password: str | None,
+    timeout: int,
+    force: bool,
+    print_token: bool,
+    stdout_only: bool,
+    json_output: bool,
+    yes: bool,
+    dry_run: bool,
+    quiet: bool,
+    verbose: int,
+) -> None:
+    """Log in to Pixiv and save a refresh token to the config file.
+
+    Opens a Pixiv login in a browser (headed by default; pass --headless to run
+    without a visible window), completes the OAuth flow, and writes the resulting
+    token to [auth].refresh_token in the config file at mode 0o600 so a later
+    'backup' run picks it up automatically.
+
+    For non-interactive headless login, supply both --username and --password
+    (preferably via the PIXIV_USERNAME / PIXIV_PASSWORD environment variables, so
+    the password is not exposed to other processes via ps).
+
+    \b
+    Exit codes:
+      0 success    2 usage/auth-input error   3 token rejected
+      4 network    7 login driver/browser unavailable
+      8 login failed/timeout                  9 config write failed
+      130 interrupted
+
+    \b
+    Examples:
+      # Open a browser and log in interactively, saving to the default config
+      pixiv-bookmark-backup login
+
+    \b
+      # Non-interactive headless login using environment credentials
+      PIXIV_USERNAME=me@example.com PIXIV_PASSWORD=... \\
+          pixiv-bookmark-backup login --headless
+
+    \b
+      # Print only the token and export it without writing any file
+      export PIXIV_REFRESH_TOKEN=$(pixiv-bookmark-backup login --stdout-only)
+    """
+
+    if quiet and verbose:
+        raise click.UsageError("--quiet and --verbose are mutually exclusive")
+    if stdout_only and force:
+        raise click.UsageError("--stdout-only and --force are mutually exclusive")
+    if (
+        stdout_only
+        and ctx.get_parameter_source("config") is click.core.ParameterSource.COMMANDLINE
+    ):
+        raise click.UsageError(
+            "--stdout-only does not write a file, so --config has no effect; "
+            "pass one or the other"
+        )
+    if (username is None) != (password is None):
+        raise click.UsageError("provide both --username and --password, or neither")
+
+    # A password passed as a CLI flag is visible to other processes (ps, /proc).
+    # Warn (always, even when quiet -- it is a security warning) without ever
+    # printing the password itself. Env-var-sourced passwords do not trip this.
+    if ctx.get_parameter_source("password") is click.core.ParameterSource.COMMANDLINE:
+        click.echo(
+            "Warning: --password is visible to other processes (e.g. ps); "
+            "prefer the PIXIV_PASSWORD environment variable.",
+            err=True,
+        )
+
+    # click already applied the PIXIV_BOOKMARK_BACKUP_CONFIG envvar fallback.
+    target = config if config is not None else default_config_path()
+
+    # Decide whether we are overwriting a pre-existing token. This gate is
+    # irrelevant when not writing a file (--stdout-only) or not modifying it
+    # (--dry-run), so skip it entirely in those modes.
+    overwrote_existing = False
+    if not stdout_only and not dry_run:
+        try:
+            existing = _token_from_config(target)
+        except ConfigError as exc:
+            raise _exit_error(
+                f"{exc}; fix the file or re-run with --stdout-only.",
+                int(ExitCode.CONFIG_WRITE),
+            ) from exc
+        if existing:
+            if force or yes:
+                overwrote_existing = True
+            elif sys.stdin.isatty():
+                if not click.confirm(
+                    f"A refresh token already exists in {target}. Overwrite it?"
+                ):
+                    click.echo("Aborted; existing token unchanged.", err=True)
+                    ctx.exit(int(ExitCode.SUCCESS))
+                overwrote_existing = True
+            else:
+                raise click.UsageError(
+                    f"a refresh token already exists in {target}; pass --force "
+                    "or --yes to overwrite"
+                )
+
+    flow = _build_login()
+
+    if not quiet:
+        if headless:
+            click.echo("Logging in to Pixiv...", err=True)
+        else:
+            click.echo(
+                "Opening Pixiv login in your browser; complete the login there...",
+                err=True,
+            )
+
+    try:
+        result = flow.login(
+            headless=headless,
+            username=username,
+            password=password,
+            timeout=timeout,
+        )
+    except LoginDriverError as exc:
+        raise _exit_error(str(exc), int(ExitCode.LOGIN_DRIVER)) from exc
+    except LoginFailed as exc:
+        raise _exit_error(str(exc), int(ExitCode.LOGIN_FAILED)) from exc
+    except AuthRejected as exc:
+        raise _exit_error(str(exc), int(ExitCode.AUTH)) from exc
+    except ApiError as exc:
+        raise _exit_error(f"Pixiv API error: {exc}", int(ExitCode.NETWORK)) from exc
+    except KeyboardInterrupt:
+        click.echo("interrupted; no token saved", err=True)
+        ctx.exit(int(ExitCode.INTERRUPTED))
+
+    wrote_config = False
+    if not dry_run and not stdout_only:
+        try:
+            write_refresh_token(target, result.refresh_token)
+        except ConfigWriteError as exc:
+            # Never print the token here -- only the failure and a recovery hint.
+            raise _exit_error(
+                f"{exc}; re-run with --stdout-only to print the token instead.",
+                int(ExitCode.CONFIG_WRITE),
+            ) from exc
+        wrote_config = True
+
+    # --stdout-only wins even when --json is also passed: the "pipeable token"
+    # contract (export VAR=$(... --stdout-only)) takes precedence so only the
+    # bare token reaches stdout.
+    if stdout_only:
+        click.echo(result.refresh_token)
+        ctx.exit(int(ExitCode.SUCCESS))
+
+    if json_output:
+        _emit_login_result(
+            target=target,
+            wrote_config=wrote_config,
+            overwrote_existing=overwrote_existing,
+            dry_run=dry_run,
+            token=result.refresh_token if print_token else None,
+        )
+        ctx.exit(int(ExitCode.SUCCESS))
+
+    if dry_run:
+        click.echo(f"Would save refresh token to {target}")
+    else:
+        click.echo(f"Saved refresh token to {target}")
+    if print_token:
+        click.echo(f"refresh_token: {result.refresh_token}")
+
+    ctx.exit(int(ExitCode.SUCCESS))
+
+
+def _emit_login_result(
+    *,
+    target: Path,
+    wrote_config: bool,
+    overwrote_existing: bool,
+    dry_run: bool,
+    token: str | None,
+) -> None:
+    """Write the ``login --json`` result object to **stdout**.
+
+    ``token`` is included only when the user opted in (``--print-token``);
+    otherwise it is ``None`` so the secret never lands in scrollback.
+    """
+
+    payload = {
+        "schema": JSON_LOGIN_SCHEMA,
+        "config_path": str(target),
+        "wrote_config": wrote_config,
+        "overwrote_existing": overwrote_existing,
+        "dry_run": dry_run,
+        "refresh_token": token,
+        "exit_code": int(ExitCode.SUCCESS),
+    }
+    click.echo(json.dumps(payload))

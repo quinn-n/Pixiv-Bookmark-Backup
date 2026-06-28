@@ -66,6 +66,16 @@ class ExitCode(IntEnum):
 
     The numeric values are part of the CLI contract -- scripts depend on them,
     so they must not change without an approved plan.
+
+    Codes 7, 8, and 9 are specific to the interactive ``login`` command:
+
+    * :attr:`LOGIN_DRIVER` (7) -- the interactive-login browser/driver is
+      unavailable (e.g. gppt not installed, or the Playwright browser binary
+      is missing).
+    * :attr:`LOGIN_FAILED` (8) -- the login flow ran but did not yield a token
+      (login failed, timed out, or credentials were rejected).
+    * :attr:`CONFIG_WRITE` (9) -- a token was obtained but writing it to the
+      config file failed.
     """
 
     SUCCESS = 0
@@ -74,6 +84,9 @@ class ExitCode(IntEnum):
     NETWORK = 4
     NO_BOOKMARKS = 5
     PARTIAL = 6
+    LOGIN_DRIVER = 7
+    LOGIN_FAILED = 8
+    CONFIG_WRITE = 9
     INTERRUPTED = 130
 
 

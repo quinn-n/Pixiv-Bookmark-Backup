@@ -17,11 +17,15 @@ and the token is never logged or printed by this module.
 from __future__ import annotations
 
 import os
+import tempfile
 import tomllib
 from collections.abc import Mapping
 from pathlib import Path
 
+import tomlkit
+import tomlkit.exceptions
 from attrs import field, frozen
+from tomlkit.items import Table
 
 #: Environment variable consulted for the refresh token.
 ENV_VAR = "PIXIV_REFRESH_TOKEN"
@@ -36,6 +40,15 @@ class ConfigError(Exception):
 
 class NoTokenError(ConfigError):
     """Raised when no refresh token can be resolved from any source."""
+
+
+class ConfigWriteError(ConfigError):
+    """Raised when the config file cannot be written/updated.
+
+    Covers malformed existing TOML that cannot be safely edited and filesystem
+    failures during the atomic write. The CLI maps this to exit code 9. The
+    refresh token is never included in the error message.
+    """
 
 
 @frozen
@@ -156,7 +169,81 @@ def resolve_auth(
         raise NoTokenError(
             "No Pixiv refresh token found. Provide one by setting the "
             f"{ENV_VAR} environment variable, passing --refresh-token, or adding "
-            f"a [auth] refresh_token entry to the config file at {config_path}."
+            f"a [auth] refresh_token entry to the config file at {config_path}. "
+            "Or run 'pixiv-bookmark-backup login' to log in and save one "
+            "automatically."
         )
 
     return ResolvedAuth(refresh_token=token)
+
+
+def write_refresh_token(config_path: Path, token: str) -> None:
+    """Write ``token`` into ``[auth].refresh_token`` at ``config_path``.
+
+    The update is surgical: an existing file is parsed with :mod:`tomlkit` so
+    that comments, formatting, and unrelated keys/tables are preserved; only the
+    ``[auth].refresh_token`` value is set (the ``[auth]`` table is created if
+    absent). A missing file (and any missing parent directories) is created.
+
+    The write is atomic and owner-only: the new contents are written to a
+    temporary file in the same directory (created ``0o600`` by
+    :func:`tempfile.mkstemp`), flushed, then :func:`os.replace`-d over the
+    destination, after which the mode is re-asserted to ``0o600`` to cover the
+    case of overwriting a previously group/other-readable file.
+
+    Args:
+        config_path: Path to the TOML config file to create or update.
+        token: The refresh token to store. Never appears in error messages.
+
+    Raises:
+        ConfigWriteError: If the existing file is not valid TOML, or a
+            filesystem error occurs while writing or replacing the file.
+    """
+
+    # Create the parent owner-only (0o700): it holds a 0o600 secret file. ``mode``
+    # applies only to directories actually created here, so an existing dir such as
+    # ``~/.config`` keeps its own permissions.
+    config_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    if config_path.exists():
+        text = config_path.read_text(encoding="utf-8")
+        try:
+            doc = tomlkit.parse(text)
+        except tomlkit.exceptions.ParseError as exc:
+            raise ConfigWriteError(
+                f"Config file {config_path} is not valid TOML and cannot be "
+                f"updated: {exc}"
+            ) from exc
+    else:
+        doc = tomlkit.document()
+
+    existing = doc.get("auth")
+    if isinstance(existing, Table):
+        auth = existing
+    else:
+        auth = tomlkit.table()
+        doc["auth"] = auth
+    auth["refresh_token"] = token
+
+    serialized = tomlkit.dumps(doc).encode("utf-8")
+
+    try:
+        fd, tmp_name = tempfile.mkstemp(dir=str(config_path.parent))
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(serialized)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_name, config_path)
+        except OSError:
+            # Clean up the stray temp file on any failure before the replace.
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+        os.chmod(config_path, 0o600)
+    except OSError as exc:
+        raise ConfigWriteError(
+            f"Could not write config file {config_path}: {exc}"
+        ) from exc

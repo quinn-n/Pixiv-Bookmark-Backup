@@ -1,3 +1,9 @@
+# backed-up files
+backup/
+
+# VSCode
+.vscode/
+
 # Claude
 .claude/settings.local.json
 

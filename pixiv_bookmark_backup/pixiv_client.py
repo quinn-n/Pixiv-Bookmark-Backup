@@ -18,6 +18,8 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, Protocol, cast, runtime_checkable
 
+from attrs import field, frozen
+from attrs.validators import instance_of
 from pixivpy3 import AppPixivAPI, PixivError
 
 from pixiv_bookmark_backup.models import (
@@ -38,6 +40,21 @@ PIXIV_REFERER = "https://www.pixiv.net/"
 #: ``AppPixivAPI`` bounds both connect and read so a hung server cannot block the
 #: run forever.
 DEFAULT_TIMEOUT: tuple[float, float] = (10.0, 60.0)
+
+
+@frozen
+class FollowedUser:
+    """A Pixiv user followed by the authenticated account.
+
+    ``id`` is validated as an ``int`` at the boundary: it is later stringified
+    into the per-author output subdirectory (``output_dir / str(id)``), so
+    enforcing the integer type guarantees the path component is purely numeric
+    and can never carry a separator or ``..``.
+    """
+
+    id: int = field(validator=instance_of(int))
+    name: str = field(validator=instance_of(str))
+    account: str = field(validator=instance_of(str))
 
 
 class AuthRejected(Exception):
@@ -73,6 +90,14 @@ class PixivClient(Protocol):
         """Yield every bookmarked work for ``user_id`` at the given visibility."""
         ...
 
+    def iter_following(self, user_id: str, restrict: str) -> Iterator[FollowedUser]:
+        """Yield every user ``user_id`` follows at the given visibility."""
+        ...
+
+    def iter_user_works(self, user_id: str) -> Iterator[BookmarkWork]:
+        """Yield every work (illust, manga, and ugoira) posted by ``user_id``."""
+        ...
+
     def ugoira_metadata(self, work_id: int) -> UgoiraInfo:
         """Return ugoira frame metadata and the frames-zip URL for ``work_id``."""
         ...
@@ -96,6 +121,10 @@ class _AppApi(Protocol):
     def auth(self, *, refresh_token: str) -> Any: ...
 
     def user_bookmarks_illust(self, user_id: int | str, restrict: str) -> Any: ...
+
+    def user_following(self, user_id: int | str, restrict: str) -> Any: ...
+
+    def user_illusts(self, user_id: int | str, type: str) -> Any: ...
 
     def parse_qs(self, next_url: str | None) -> dict[str, Any] | None: ...
 
@@ -187,6 +216,66 @@ class Pixivpy3Client:
                 result = self._api.user_bookmarks_illust(**qs)
         except PixivError as exc:
             raise ApiError(f"Failed to list bookmarks: {exc}") from exc
+
+    def iter_following(self, user_id: str, restrict: str) -> Iterator[FollowedUser]:
+        """Yield each :class:`FollowedUser` that ``user_id`` follows.
+
+        Pages are fetched lazily; the injected ``sleep`` is invoked for
+        ``delay`` seconds between successive pages. ``restrict`` selects the
+        visibility of the follow list (``"public"`` or ``"private"``).
+
+        Raises:
+            ApiError: If listing the follow list fails.
+        """
+
+        try:
+            result = self._api.user_following(user_id, restrict)
+            while True:
+                for preview in result.user_previews or []:
+                    yield FollowedUser(
+                        id=preview.user.id,
+                        name=preview.user.name,
+                        account=preview.user.account,
+                    )
+                next_url = result.next_url
+                if not next_url:
+                    return
+                qs = self._api.parse_qs(next_url)
+                if not qs:
+                    return
+                self._sleep(self._delay)
+                result = self._api.user_following(**qs)
+        except PixivError as exc:
+            raise ApiError(f"Failed to list following: {exc}") from exc
+
+    def iter_user_works(self, user_id: str) -> Iterator[BookmarkWork]:
+        """Yield each :class:`BookmarkWork` posted by ``user_id``.
+
+        A single empty-string ``type`` pass returns every kind of work
+        (illust, manga, and ugoira) in one listing. Pages are fetched lazily;
+        the injected ``sleep`` is invoked for ``delay`` seconds between
+        successive pages. Personal bookmark tags are never fetched here -- these
+        are another user's works, not the caller's bookmarks.
+
+        Raises:
+            ApiError: If listing the user's works fails.
+        """
+
+        try:
+            result = self._api.user_illusts(user_id, "")
+            while True:
+                for illust in result.illusts or []:
+                    yield self._to_work(illust, fetch_bookmark_tags=False)
+                next_url = result.next_url
+                if not next_url:
+                    return
+                qs = self._api.parse_qs(next_url)
+                if not qs:
+                    return
+                self._sleep(self._delay)
+                result = self._api.user_illusts(**qs)
+        except PixivError as exc:
+            raise ApiError(f"Failed to list works for {user_id}: {exc}") from exc
 
     def ugoira_metadata(self, work_id: int) -> UgoiraInfo:
         """Return :class:`UgoiraInfo` for the ugoira work ``work_id``.

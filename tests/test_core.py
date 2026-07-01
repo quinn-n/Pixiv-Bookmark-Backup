@@ -10,6 +10,8 @@ import pytest
 from pixiv_bookmark_backup.core import (
     BackupConfig,
     ExitCode,
+    FollowingConfig,
+    FollowingRunSummary,
     RunSummary,
     decide_exit_code,
     describe_plan,
@@ -121,6 +123,112 @@ def test_run_summary_defaults_are_zero() -> None:
     ],
 )
 def test_decide_exit_code_table(summary: RunSummary, expected: ExitCode) -> None:
+    assert decide_exit_code(summary) == expected
+
+
+def test_following_run_summary_defaults() -> None:
+    summary = FollowingRunSummary()
+    assert summary.works_total == 0
+    assert summary.works_succeeded == 0
+    assert summary.works_failed == 0
+    assert summary.files_downloaded == 0
+    assert summary.files_skipped == 0
+    assert summary.files_failed == 0
+    assert summary.bytes_downloaded == 0
+    assert summary.users_total == 0
+    assert summary.users_with_works == 0
+    assert summary.following_of is None
+
+
+def test_following_config_defaults(tmp_path: Path) -> None:
+    config = FollowingConfig(output_dir=tmp_path)
+    assert config.follows == "public"
+    assert config.dry_run is False
+    assert config.limit is None
+    assert config.since is None
+    assert config.skip_existing is True
+    assert config.metadata_only is False
+    assert config.json_output is False
+    assert config.verbosity == 0
+    assert config.quiet is False
+    assert config.max_retries == 3
+    assert config.per_user_limit is None
+    assert config.max_users is None
+    assert config.only == ()
+    assert config.exclude == ()
+
+
+def test_following_config_output_dir_is_coerced_to_path() -> None:
+    config = FollowingConfig(output_dir="some/dir")
+    assert config.output_dir == Path("some/dir")
+
+
+def test_following_config_all_fields_construct_and_validate(tmp_path: Path) -> None:
+    config = FollowingConfig(
+        output_dir=tmp_path,
+        follows="private",
+        dry_run=True,
+        limit=10,
+        since=date(2024, 1, 1),
+        skip_existing=False,
+        metadata_only=True,
+        json_output=True,
+        verbosity=2,
+        quiet=True,
+        max_retries=5,
+        per_user_limit=4,
+        max_users=20,
+        only=("illust",),
+        exclude=("manga",),
+    )
+    assert config.follows == "private"
+    assert config.per_user_limit == 4
+    assert config.max_users == 20
+    assert config.only == ("illust",)
+    assert config.exclude == ("manga",)
+
+
+def test_following_config_invalid_follows_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        FollowingConfig(output_dir=tmp_path, follows="bogus")
+
+
+def test_following_config_limit_zero_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        FollowingConfig(output_dir=tmp_path, limit=0)
+
+
+def test_following_config_per_user_limit_zero_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        FollowingConfig(output_dir=tmp_path, per_user_limit=0)
+
+
+def test_following_config_max_users_zero_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        FollowingConfig(output_dir=tmp_path, max_users=0)
+
+
+@pytest.mark.parametrize(
+    "summary, expected",
+    [
+        (FollowingRunSummary(works_total=0), ExitCode.NO_BOOKMARKS),
+        (
+            FollowingRunSummary(works_total=2, works_succeeded=2, files_downloaded=2),
+            ExitCode.SUCCESS,
+        ),
+        (
+            FollowingRunSummary(works_total=2, works_succeeded=1, works_failed=1),
+            ExitCode.PARTIAL,
+        ),
+        (
+            FollowingRunSummary(works_total=2, works_succeeded=2, files_failed=1),
+            ExitCode.PARTIAL,
+        ),
+    ],
+)
+def test_decide_exit_code_following_table(
+    summary: FollowingRunSummary, expected: ExitCode
+) -> None:
     assert decide_exit_code(summary) == expected
 
 

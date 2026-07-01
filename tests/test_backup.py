@@ -31,7 +31,11 @@ from pixiv_bookmark_backup.models import (
     UgoiraInfo,
     WorkImage,
 )
-from pixiv_bookmark_backup.pixiv_client import ApiError, PixivClient
+from pixiv_bookmark_backup.pixiv_client import (
+    ApiError,
+    FollowedUser,
+    PixivClient,
+)
 from pixiv_bookmark_backup.ugoira import UgoiraResult
 
 FIXED_CLOCK = "2026-06-24T00:00:00+00:00"
@@ -126,6 +130,16 @@ class FakePixivClient:
         if exc is not None:
             raise exc()
         raise ApiError("listing failed")
+
+    def iter_following(  # pragma: no cover
+        self, user_id: str, restrict: str
+    ) -> Iterator[FollowedUser]:
+        raise NotImplementedError
+
+    def iter_user_works(  # pragma: no cover
+        self, user_id: str
+    ) -> Iterator[BookmarkWork]:
+        raise NotImplementedError
 
     def ugoira_metadata(self, work_id: int) -> UgoiraInfo:  # pragma: no cover
         raise NotImplementedError

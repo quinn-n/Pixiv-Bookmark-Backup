@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import date
 from enum import IntEnum
 from pathlib import Path
+from typing import Protocol
 
 from attrs import field, frozen
 from attrs.validators import ge, in_, instance_of, le, optional
@@ -61,6 +62,68 @@ class RunSummary:
     bytes_downloaded: int = 0
 
 
+@frozen
+class FollowingConfig:
+    """Parameters controlling a single follow-backup run.
+
+    A frozen ``attrs`` value object: validated once at construction, then
+    safe to pass around. ``output_dir`` is coerced to a :class:`~pathlib.Path`
+    so callers may pass a plain string. The refresh token is intentionally
+    *not* stored here -- it is handled separately from run parameters.
+
+    Unlike :class:`BackupConfig`, this has no ``user_id`` or ``visibility``:
+    the works backed up are those of the authenticated user's followed
+    creators, selected via ``follows``.
+    """
+
+    output_dir: Path = field(converter=Path)
+    follows: str = field(default="public", validator=in_(("public", "private", "all")))
+    dry_run: bool = field(default=False, validator=instance_of(bool))
+    limit: int | None = field(
+        default=None, validator=optional([instance_of(int), ge(1)])
+    )
+    since: date | None = field(default=None, validator=optional(instance_of(date)))
+    skip_existing: bool = field(default=True, validator=instance_of(bool))
+    metadata_only: bool = field(default=False, validator=instance_of(bool))
+    json_output: bool = field(default=False, validator=instance_of(bool))
+    verbosity: int = field(default=0, validator=instance_of(int))
+    quiet: bool = field(default=False, validator=instance_of(bool))
+    max_retries: int = field(default=3, validator=[instance_of(int), ge(0), le(10)])
+    per_user_limit: int | None = field(
+        default=None, validator=optional([instance_of(int), ge(1)])
+    )
+    max_users: int | None = field(
+        default=None, validator=optional([instance_of(int), ge(1)])
+    )
+    only: tuple[str, ...] = field(factory=tuple)
+    exclude: tuple[str, ...] = field(factory=tuple)
+
+
+@frozen
+class FollowingRunSummary:
+    """Tallies collected over a follow-backup run.
+
+    A plain frozen value object: every counter defaults to ``0`` so a fresh
+    summary represents "nothing happened yet". The orchestrator accumulates
+    these counts and hands the final summary to :func:`decide_exit_code`.
+
+    Extends the per-work counters of :class:`RunSummary` with per-user tallies.
+    ``following_of`` is not a counter: it records the authenticated self id so
+    the CLI can include it in the JSON summary.
+    """
+
+    works_total: int = 0
+    works_succeeded: int = 0
+    works_failed: int = 0
+    files_downloaded: int = 0
+    files_skipped: int = 0
+    files_failed: int = 0
+    bytes_downloaded: int = 0
+    users_total: int = 0
+    users_with_works: int = 0
+    following_of: str | None = None
+
+
 class ExitCode(IntEnum):
     """Process exit codes for the CLI.
 
@@ -90,8 +153,27 @@ class ExitCode(IntEnum):
     INTERRUPTED = 130
 
 
-def decide_exit_code(summary: RunSummary) -> ExitCode:
-    """Map a completed run's :class:`RunSummary` to an :class:`ExitCode`.
+class _ExitDecidable(Protocol):
+    """Structural type for summaries that :func:`decide_exit_code` can rank.
+
+    Both :class:`RunSummary` and :class:`FollowingRunSummary` satisfy it.
+    The members are read-only so that ``@frozen`` value objects match.
+    """
+
+    @property
+    def works_total(self) -> int: ...
+
+    @property
+    def works_failed(self) -> int: ...
+
+    @property
+    def files_failed(self) -> int: ...
+
+
+def decide_exit_code(summary: _ExitDecidable) -> ExitCode:
+    """Map a completed run's summary to an :class:`ExitCode`.
+
+    Accepts either a :class:`RunSummary` or a :class:`FollowingRunSummary`.
 
     This is a pure, count-based decision for runs that reached completion:
 

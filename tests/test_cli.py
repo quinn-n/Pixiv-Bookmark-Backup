@@ -38,7 +38,12 @@ from pixiv_bookmark_backup.models import (
     UgoiraInfo,
     WorkImage,
 )
-from pixiv_bookmark_backup.pixiv_client import ApiError, AuthRejected, PixivClient
+from pixiv_bookmark_backup.pixiv_client import (
+    ApiError,
+    AuthRejected,
+    FollowedUser,
+    PixivClient,
+)
 
 # A deliberately fake, non-secret placeholder: any non-empty string lets
 # resolve_auth() succeed so the offline tests can run without real credentials.
@@ -105,6 +110,16 @@ class FakePixivClient:
 
     def iter_bookmarks(self, user_id: str, restrict: str) -> Iterator[BookmarkWork]:
         yield from self._works_by_restrict.get(restrict, [])
+
+    def iter_following(  # pragma: no cover
+        self, user_id: str, restrict: str
+    ) -> Iterator[FollowedUser]:
+        raise NotImplementedError
+
+    def iter_user_works(  # pragma: no cover
+        self, user_id: str
+    ) -> Iterator[BookmarkWork]:
+        raise NotImplementedError
 
     def ugoira_metadata(self, work_id: int) -> UgoiraInfo:  # pragma: no cover
         raise NotImplementedError

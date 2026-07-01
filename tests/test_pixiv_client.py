@@ -21,6 +21,7 @@ from pixiv_bookmark_backup.pixiv_client import (
     DEFAULT_TIMEOUT,
     ApiError,
     AuthRejected,
+    FollowedUser,
     Pixivpy3Client,
 )
 
@@ -71,12 +72,25 @@ def _make_illust(
     )
 
 
+def _make_user_preview(
+    user_id: int,
+    *,
+    name: str = "Followed",
+    account: str = "followed_acct",
+) -> SimpleNamespace:
+    """Build a ``user_previews`` entry as returned by ``user_following``."""
+
+    return SimpleNamespace(user=SimpleNamespace(id=user_id, name=name, account=account))
+
+
 class FakeApi:
     """Minimal stand-in for ``pixivpy3.AppPixivAPI`` used in tests.
 
     Records calls and returns canned attribute-bag responses. Individual tests
     tweak the public attributes (``pages``, ``bookmark_detail_response``, etc.)
-    to drive specific behaviours.
+    to drive specific behaviours. The ``user_following`` and ``user_illusts``
+    endpoints keep their own pagination state, independent of the bookmark
+    pagination, so tests for one never cross-contaminate another.
     """
 
     def __init__(self, *, user_id: str = SELF_ID) -> None:
@@ -88,6 +102,16 @@ class FakeApi:
         self.pages: list[tuple[list[SimpleNamespace], str | None]] = []
         self._page_index = 0
         self.bookmark_calls: list[dict[str, Any]] = []
+        # Follow-list pagination: (user_previews, next_url) tuples consumed in
+        # order as ``user_following`` is re-invoked.
+        self.following_pages: list[tuple[list[SimpleNamespace], str | None]] = []
+        self._following_index = 0
+        self.following_calls: list[dict[str, Any]] = []
+        # User-works pagination: (illusts, next_url) tuples consumed in order
+        # as ``user_illusts`` is re-invoked.
+        self.works_pages: list[tuple[list[SimpleNamespace], str | None]] = []
+        self._works_index = 0
+        self.works_calls: list[dict[str, Any]] = []
         # illust_bookmark_detail behaviour.
         self.bookmark_detail_tags: list[tuple[str, bool]] = []
         self.bookmark_detail_should_raise = False
@@ -121,6 +145,22 @@ class FakeApi:
         if not next_url:
             return None
         return {"user_id": SELF_ID, "restrict": "public", "max_bookmark_id": "1000"}
+
+    # -- following ------------------------------------------------------
+
+    def user_following(self, *args: Any, **kwargs: Any) -> SimpleNamespace:
+        self.following_calls.append({"args": args, "kwargs": kwargs})
+        previews, next_url = self.following_pages[self._following_index]
+        self._following_index += 1
+        return SimpleNamespace(user_previews=previews, next_url=next_url)
+
+    # -- user works -----------------------------------------------------
+
+    def user_illusts(self, *args: Any, **kwargs: Any) -> SimpleNamespace:
+        self.works_calls.append({"args": args, "kwargs": kwargs})
+        illusts, next_url = self.works_pages[self._works_index]
+        self._works_index += 1
+        return SimpleNamespace(illusts=illusts, next_url=next_url)
 
     def illust_bookmark_detail(self, illust_id: int) -> SimpleNamespace:
         self.bookmark_detail_calls.append(illust_id)
@@ -244,6 +284,199 @@ def test_iter_bookmarks_wraps_pixiverror_in_apierror() -> None:
     client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0)
     with pytest.raises(ApiError):
         list(client.iter_bookmarks(SELF_ID, "public"))
+
+
+# -- iter_following -----------------------------------------------------
+
+
+def test_followed_user_rejects_non_int_id() -> None:
+    # The int validator on `id` is load-bearing: `str(id)` becomes a per-author
+    # output subdirectory, so a non-int (e.g. a string) must be rejected at
+    # construction rather than risk a path component carrying a separator.
+    with pytest.raises(TypeError):
+        FollowedUser(id="x", name="n", account="a")  # type: ignore[arg-type]
+
+
+def test_iter_following_yields_followed_users() -> None:
+    api = FakeApi(user_id=SELF_ID)
+    api.following_pages = [
+        (
+            [
+                _make_user_preview(11, name="Alice", account="alice"),
+                _make_user_preview(22, name="Bob", account="bob"),
+            ],
+            None,
+        )
+    ]
+    client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0)
+    followed = list(client.iter_following(SELF_ID, "public"))
+    assert all(isinstance(user, FollowedUser) for user in followed)
+    assert [(u.id, u.name, u.account) for u in followed] == [
+        (11, "Alice", "alice"),
+        (22, "Bob", "bob"),
+    ]
+
+
+def test_iter_following_paginates_and_sleeps_between_pages() -> None:
+    naps: list[float] = []
+    api = FakeApi(user_id=SELF_ID)
+    api.following_pages = [
+        ([_make_user_preview(11)], "https://next?page=2"),
+        ([_make_user_preview(22)], None),
+    ]
+    client = Pixivpy3Client(api=api, sleep=naps.append, delay=0.25)
+    followed = list(client.iter_following(SELF_ID, "public"))
+    assert [u.id for u in followed] == [11, 22]
+    # Two pages fetched; second via parsed query-string kwargs.
+    assert len(api.following_calls) == 2
+    assert api.following_calls[1]["kwargs"].get("user_id") == SELF_ID
+    # Exactly one inter-page pause for two pages.
+    assert naps == [0.25]
+
+
+def test_iter_following_forwards_restrict() -> None:
+    api = FakeApi(user_id=SELF_ID)
+    api.following_pages = [([], None)]
+    client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0)
+    list(client.iter_following(SELF_ID, "private"))
+    assert api.following_calls[0]["args"] == (SELF_ID, "private")
+
+
+def test_iter_following_forwards_public_restrict() -> None:
+    api = FakeApi(user_id=SELF_ID)
+    api.following_pages = [([], None)]
+    client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0)
+    list(client.iter_following(SELF_ID, "public"))
+    assert api.following_calls[0]["args"] == (SELF_ID, "public")
+
+
+def test_iter_following_empty_yields_nothing() -> None:
+    for previews in ([], None):
+        api = FakeApi(user_id=SELF_ID)
+        # None models Pixiv returning no `user_previews`; exercises the `or []` guard.
+        api.following_pages = [(previews, None)]  # type: ignore[list-item]
+        client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0)
+        assert list(client.iter_following(SELF_ID, "public")) == []
+
+
+def test_iter_following_stops_when_parse_qs_returns_none() -> None:
+    # A truthy next_url whose query string cannot be parsed ends pagination
+    # rather than looping forever.
+    class UnparsableApi(FakeApi):
+        def parse_qs(self, next_url: str | None) -> dict[str, Any] | None:
+            return None
+
+    api = UnparsableApi(user_id=SELF_ID)
+    api.following_pages = [([_make_user_preview(11)], "https://next?page=2")]
+    client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0)
+    followed = list(client.iter_following(SELF_ID, "public"))
+    assert [u.id for u in followed] == [11]
+    assert len(api.following_calls) == 1
+
+
+def test_iter_following_wraps_pixiverror_in_apierror() -> None:
+    class BoomApi(FakeApi):
+        def user_following(self, *args: Any, **kwargs: Any) -> SimpleNamespace:
+            raise PixivError("following exploded")
+
+    api = BoomApi(user_id=SELF_ID)
+    client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0)
+    with pytest.raises(ApiError):
+        list(client.iter_following(SELF_ID, "public"))
+
+
+# -- iter_user_works ----------------------------------------------------
+
+
+def test_iter_user_works_returns_all_kinds_from_single_pass() -> None:
+    api = FakeApi(user_id=SELF_ID)
+    api.works_pages = [
+        (
+            [
+                _make_illust(1, work_type="illust", single_url="https://x/1.png"),
+                _make_illust(2, work_type="manga", single_url="https://x/2.png"),
+                _make_illust(3, work_type="ugoira", single_url="https://x/3.png"),
+            ],
+            None,
+        )
+    ]
+    client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0)
+    works = list(client.iter_user_works(OTHER_ID))
+    assert all(isinstance(work, BookmarkWork) for work in works)
+    assert [w.type for w in works] == ["illust", "manga", "ugoira"]
+    assert [w.id for w in works] == [1, 2, 3]
+
+
+def test_iter_user_works_forwards_empty_string_type() -> None:
+    api = FakeApi(user_id=SELF_ID)
+    api.works_pages = [([], None)]
+    client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0)
+    list(client.iter_user_works(OTHER_ID))
+    assert api.works_calls[0]["args"] == (OTHER_ID, "")
+
+
+def test_iter_user_works_maps_ugoira_type() -> None:
+    api = FakeApi(user_id=SELF_ID)
+    api.works_pages = [
+        ([_make_illust(9, work_type="ugoira", single_url="https://x/9.png")], None)
+    ]
+    client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0)
+    work = next(iter(client.iter_user_works(OTHER_ID)))
+    assert work.type == "ugoira"
+
+
+def test_iter_user_works_does_not_fetch_bookmark_tags() -> None:
+    # Even when listing the authenticated user's own works, these are not the
+    # caller's bookmarks: bookmark_tags stays None and the detail endpoint is
+    # never consulted.
+    api = FakeApi(user_id=SELF_ID)
+    api.bookmark_detail_tags = [("favorite", True)]
+    api.works_pages = [([_make_illust(40, single_url="https://x/40.png")], None)]
+    client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0)
+    work = next(iter(client.iter_user_works(SELF_ID)))
+    assert work.bookmark_tags is None
+    assert api.bookmark_detail_calls == []
+
+
+def test_iter_user_works_paginates_and_sleeps_between_pages() -> None:
+    naps: list[float] = []
+    api = FakeApi(user_id=SELF_ID)
+    api.works_pages = [
+        ([_make_illust(1, single_url="https://x/1.png")], "https://next?page=2"),
+        ([_make_illust(2, single_url="https://x/2.png")], None),
+    ]
+    client = Pixivpy3Client(api=api, sleep=naps.append, delay=0.25)
+    works = list(client.iter_user_works(OTHER_ID))
+    assert [w.id for w in works] == [1, 2]
+    assert len(api.works_calls) == 2
+    assert api.works_calls[1]["kwargs"].get("user_id") == SELF_ID
+    assert naps == [0.25]
+
+
+def test_iter_user_works_stops_when_parse_qs_returns_none() -> None:
+    class UnparsableApi(FakeApi):
+        def parse_qs(self, next_url: str | None) -> dict[str, Any] | None:
+            return None
+
+    api = UnparsableApi(user_id=SELF_ID)
+    api.works_pages = [
+        ([_make_illust(1, single_url="https://x/1.png")], "https://next?page=2")
+    ]
+    client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0)
+    works = list(client.iter_user_works(OTHER_ID))
+    assert [w.id for w in works] == [1]
+    assert len(api.works_calls) == 1
+
+
+def test_iter_user_works_wraps_pixiverror_in_apierror() -> None:
+    class BoomApi(FakeApi):
+        def user_illusts(self, *args: Any, **kwargs: Any) -> SimpleNamespace:
+            raise PixivError("works exploded")
+
+    api = BoomApi(user_id=SELF_ID)
+    client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0)
+    with pytest.raises(ApiError):
+        list(client.iter_user_works(OTHER_ID))
 
 
 # -- original-URL extraction -------------------------------------------

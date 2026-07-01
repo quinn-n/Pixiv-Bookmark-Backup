@@ -21,6 +21,7 @@ from . import __version__
 from .auth_login import GpptLogin, LoginDriverError, LoginFailed, LoginFlow
 from .backup import MANIFEST_NAME, BackupUsageError
 from .backup import run as run_backup
+from .backup import run_following
 from .config import (
     ConfigError,
     ConfigWriteError,
@@ -31,12 +32,26 @@ from .config import (
     resolve_auth,
     write_refresh_token,
 )
-from .core import VISIBILITIES, BackupConfig, ExitCode, RunSummary, decide_exit_code
+from .core import (
+    VISIBILITIES,
+    BackupConfig,
+    ExitCode,
+    FollowingConfig,
+    FollowingRunSummary,
+    RunSummary,
+    decide_exit_code,
+)
 from .pixiv_client import ApiError, AuthRejected, Pixivpy3Client
 
 #: Version stamped as the first key of the ``--json`` summary object, so a
 #: scripting consumer can detect the payload shape and adapt across releases.
 JSON_SUMMARY_SCHEMA = 1
+
+#: Version stamped as the first key of the ``backup-following --json`` summary
+#: object, so a scripting consumer can detect the payload shape and adapt across
+#: releases. Separate from :data:`JSON_SUMMARY_SCHEMA` because the field set
+#: differs (per-user tallies, follow visibility).
+JSON_FOLLOWING_SUMMARY_SCHEMA = 1
 
 #: Version stamped as the first key of the ``login --json`` result object, so a
 #: scripting consumer can detect the payload shape and adapt across releases.
@@ -346,6 +361,298 @@ def _emit_summary(
         f"{verb} {summary.works_succeeded}/{summary.works_total} works "
         f"({summary.works_failed} failed), {summary.files_downloaded} files "
         f"to {config.output_dir}"
+    )
+
+
+@cli.command(name="backup-following")
+@click.option(
+    "--output-dir",
+    "-o",
+    default="./backup-following",
+    show_default=True,
+    type=click.Path(file_okay=False, path_type=Path),
+    help="Directory to write the backup into (one subdirectory per author).",
+)
+@click.option(
+    "--follows",
+    type=click.Choice(VISIBILITIES),
+    default="public",
+    show_default=True,
+    help="Which of your follows to back up, by the privacy of the follow itself: "
+    "your public (visible) follows, your private (secret) follows, or all of them.",
+)
+@click.option(
+    "--refresh-token",
+    type=str,
+    envvar="PIXIV_REFRESH_TOKEN",
+    default=None,
+    help=(
+        "Pixiv refresh token. Prefer the PIXIV_REFRESH_TOKEN environment "
+        "variable so the secret stays out of your shell history and process "
+        "list."
+    ),
+)
+@click.option(
+    "--config",
+    type=click.Path(dir_okay=False, path_type=Path),
+    envvar="PIXIV_BOOKMARK_BACKUP_CONFIG",
+    default=None,
+    help="Path to a TOML config file providing [auth].refresh_token.",
+)
+@click.option(
+    "--limit",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Stop after backing up this many works in total across all users.",
+)
+@click.option(
+    "--per-user-limit",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Back up at most this many works per followed user (newest first).",
+)
+@click.option(
+    "--max-users",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Stop after processing this many followed users (a quick sample).",
+)
+@click.option(
+    "--only",
+    multiple=True,
+    metavar="USER_ID",
+    help="Only back up these followed user IDs (repeatable).",
+)
+@click.option(
+    "--exclude",
+    multiple=True,
+    metavar="USER_ID",
+    help="Skip these followed user IDs (repeatable).",
+)
+@click.option(
+    "--since",
+    type=str,
+    callback=_parse_since,
+    default=None,
+    metavar="YYYY-MM-DD",
+    help="Only back up works posted on or after this date (the work's post date).",
+)
+@click.option(
+    "--skip-existing/--no-skip-existing",
+    default=True,
+    show_default=True,
+    help="Skip files already present on disk (re-run safe), or re-download them.",
+)
+@click.option(
+    "--metadata-only",
+    is_flag=True,
+    help=(
+        "Record metadata in details.json without downloading any image bytes "
+        "(writes details.json but no image files; --dry-run writes nothing)."
+    ),
+)
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    help="Print a machine-readable run summary to stdout.",
+)
+@click.option(
+    "--quiet",
+    "-q",
+    is_flag=True,
+    help="Suppress progress output on stderr (the summary is still printed).",
+)
+@click.option(
+    "--verbose",
+    "-v",
+    count=True,
+    help="Increase progress detail on stderr; repeat for more (-vv).",
+)
+@click.option(
+    "--max-retries",
+    type=click.IntRange(0, 10),
+    default=3,
+    show_default=True,
+    help="Number of retries per image after the first attempt fails.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Print what would be backed up without downloading or writing anything.",
+)
+@click.pass_context
+def backup_following(
+    ctx: click.Context,
+    output_dir: Path,
+    follows: str,
+    refresh_token: str | None,
+    config: Path | None,
+    limit: int | None,
+    per_user_limit: int | None,
+    max_users: int | None,
+    only: tuple[str, ...],
+    exclude: tuple[str, ...],
+    since: datetime.date | None,
+    skip_existing: bool,
+    metadata_only: bool,
+    json_output: bool,
+    quiet: bool,
+    verbose: int,
+    max_retries: int,
+    dry_run: bool,
+) -> None:
+    """Back up works from the Pixiv users you follow.
+
+    Lists every creator your account follows and backs up each of their works
+    (illustrations, manga, and ugoira) into a per-author subdirectory of the
+    output directory (default ./backup-following), alongside a single
+    details.json manifest at the output root recording every work and per-image
+    status. Re-runs are safe: existing files are skipped and the manifest is
+    merged.
+
+    The refresh token is read from --refresh-token, the PIXIV_REFRESH_TOKEN
+    environment variable, or the config file, in that order. See
+    https://github.com/upbit/pixivpy for how to obtain a refresh token.
+
+    \b
+    Exit codes:
+      0 success    2 usage/auth-input error   3 token rejected
+      4 network    5 no follows/works found   6 partial (some images failed)
+      130 interrupted
+
+    \b
+    Examples:
+      # Preview what would be backed up from your public follows
+      pixiv-bookmark-backup backup-following --dry-run
+
+    \b
+      # Back up everyone you follow (public + private), 20 newest works each
+      pixiv-bookmark-backup backup-following --follows all --per-user-limit 20
+
+    \b
+      # Back up just two creators you follow, into ./out
+      pixiv-bookmark-backup backup-following -o ./out --only 123 --only 456
+    """
+
+    if quiet and verbose:
+        raise click.UsageError("--quiet and --verbose are mutually exclusive")
+    if only and exclude:
+        raise click.UsageError("--only and --exclude are mutually exclusive")
+
+    # A token passed as a CLI flag is visible to other processes (ps, /proc).
+    # Warn (always, even when quiet -- it is a security warning) without ever
+    # printing the token itself. Env-var-sourced tokens do not trip this.
+    if (
+        ctx.get_parameter_source("refresh_token")
+        is click.core.ParameterSource.COMMANDLINE
+    ):
+        click.echo(
+            "Warning: --refresh-token is visible to other processes (e.g. ps); "
+            "prefer the PIXIV_REFRESH_TOKEN environment variable.",
+            err=True,
+        )
+
+    try:
+        auth = resolve_auth(refresh_token, config_path=config)
+    except (NoTokenError, ConfigError) as exc:
+        raise click.UsageError(str(exc)) from exc
+
+    # Warn if the effective config file is readable by other users -- the token
+    # it carries should be owner-only. The path is the explicit --config flag if
+    # given, otherwise the default location.
+    config_file = config if config is not None else default_config_path()
+    if is_insecure_config(config_file):
+        click.echo(
+            f"Warning: {config_file} is readable by other users; run "
+            f"'chmod 600 {config_file}' to protect your token.",
+            err=True,
+        )
+
+    run_config = FollowingConfig(
+        output_dir=output_dir,
+        follows=follows,
+        dry_run=dry_run,
+        limit=limit,
+        per_user_limit=per_user_limit,
+        max_users=max_users,
+        only=only,
+        exclude=exclude,
+        since=since,
+        skip_existing=skip_existing,
+        metadata_only=metadata_only,
+        json_output=json_output,
+        verbosity=verbose,
+        quiet=quiet,
+        max_retries=max_retries,
+    )
+
+    def progress(message: str) -> None:
+        if not quiet:
+            click.echo(message, err=True)
+
+    if not quiet:
+        verb = "Would back up" if dry_run else "Backing up"
+        click.echo(
+            f"{verb} works from your {follows} follows into {output_dir}",
+            err=True,
+        )
+
+    client = Pixivpy3Client()
+
+    try:
+        summary = run_following(run_config, auth, client, progress=progress)
+    except AuthRejected as exc:
+        raise _exit_error(str(exc), int(ExitCode.AUTH)) from exc
+    except ApiError as exc:
+        raise _exit_error(f"Pixiv API error: {exc}", int(ExitCode.NETWORK)) from exc
+    except KeyboardInterrupt:
+        click.echo("interrupted; partial backup saved", err=True)
+        ctx.exit(int(ExitCode.INTERRUPTED))
+
+    code = decide_exit_code(summary)
+    _emit_following_summary(run_config, summary, code)
+    ctx.exit(int(code))
+
+
+def _emit_following_summary(
+    config: FollowingConfig,
+    summary: FollowingRunSummary,
+    code: ExitCode,
+) -> None:
+    """Write the follow-backup summary to **stdout** (JSON or one human line)."""
+
+    details_json = None if config.dry_run else str(config.output_dir / MANIFEST_NAME)
+
+    if config.json_output:
+        payload = {
+            "schema": JSON_FOLLOWING_SUMMARY_SCHEMA,
+            "mode": "following",
+            "following_of": summary.following_of,
+            "follow_visibility": config.follows,
+            "output_dir": str(config.output_dir),
+            "users_total": summary.users_total,
+            "users_with_works": summary.users_with_works,
+            "works_total": summary.works_total,
+            "works_succeeded": summary.works_succeeded,
+            "works_failed": summary.works_failed,
+            "files_downloaded": summary.files_downloaded,
+            "files_skipped": summary.files_skipped,
+            "files_failed": summary.files_failed,
+            "bytes_downloaded": summary.bytes_downloaded,
+            "details_json": details_json,
+            "dry_run": config.dry_run,
+            "exit_code": int(code),
+        }
+        click.echo(json.dumps(payload))
+        return
+
+    verb = "Would back up" if config.dry_run else "Backed up"
+    click.echo(
+        f"{verb} {summary.works_succeeded}/{summary.works_total} works "
+        f"({summary.works_failed} failed) from "
+        f"{summary.users_with_works}/{summary.users_total} users, "
+        f"{summary.files_downloaded} files to {config.output_dir}"
     )
 
 

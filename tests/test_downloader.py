@@ -18,7 +18,7 @@ from pixiv_bookmark_backup.downloader import (
     should_skip,
 )
 from pixiv_bookmark_backup.models import BookmarkWork, ImageStatus, UgoiraInfo
-from pixiv_bookmark_backup.pixiv_client import ApiError
+from pixiv_bookmark_backup.pixiv_client import ApiError, FollowedUser
 
 
 class FakeClient:
@@ -48,6 +48,12 @@ class FakeClient:
         raise NotImplementedError
 
     def iter_bookmarks(self, user_id: str, restrict: str) -> Iterator[BookmarkWork]:
+        raise NotImplementedError
+
+    def iter_following(self, user_id: str, restrict: str) -> Iterator[FollowedUser]:
+        raise NotImplementedError
+
+    def iter_user_works(self, user_id: str) -> Iterator[BookmarkWork]:
         raise NotImplementedError
 
     def ugoira_metadata(self, work_id: int) -> UgoiraInfo:

@@ -267,6 +267,39 @@ def new_manifest(
     )
 
 
+def new_following_manifest(
+    following_of: str | None,
+    follow_visibility: str,
+    generated_at: str,
+    works: list[WorkEntry],
+    errors: list[dict[str, Any]],
+) -> Manifest:
+    """Build a :class:`Manifest` for a ``backup-following`` run.
+
+    Identical to :func:`new_manifest` -- same :data:`SCHEMA_VERSION`, and the
+    same ``generated_at``/``works``/``errors`` wiring -- except the ``source``
+    block is *following*-shaped (``{"mode": "following", "following_of": ...,
+    "follow_visibility": ...}``) instead of bookmark-shaped, so a following
+    backup's ``details.json`` records which followed-user feed it came from.
+
+    ``generated_at`` is supplied by the caller (the orchestrator injects the
+    timestamp) rather than read from the clock here, which keeps the result
+    deterministic and easy to test.
+    """
+
+    return Manifest(
+        schema_version=SCHEMA_VERSION,
+        generated_at=generated_at,
+        source={
+            "mode": "following",
+            "following_of": following_of,
+            "follow_visibility": follow_visibility,
+        },
+        works=list(works),
+        errors=list(errors),
+    )
+
+
 def merge(existing: Manifest, new: Manifest) -> Manifest:
     """Merge a fresh run's ``new`` manifest over the ``existing`` one for resume.
 

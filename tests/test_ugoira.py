@@ -25,7 +25,12 @@ from pixiv_bookmark_backup.models import (
     UgoiraFrame,
     UgoiraInfo,
 )
-from pixiv_bookmark_backup.pixiv_client import PIXIV_REFERER, ApiError, PixivClient
+from pixiv_bookmark_backup.pixiv_client import (
+    PIXIV_REFERER,
+    ApiError,
+    FollowedUser,
+    PixivClient,
+)
 from pixiv_bookmark_backup.ugoira import (
     _read_frame_capped,
     assemble_gif,
@@ -120,6 +125,16 @@ class FakeClient:
 
     def iter_bookmarks(
         self, user_id: str, restrict: str
+    ) -> Iterator[BookmarkWork]:  # pragma: no cover
+        raise NotImplementedError
+
+    def iter_following(
+        self, user_id: str, restrict: str
+    ) -> Iterator[FollowedUser]:  # pragma: no cover
+        raise NotImplementedError
+
+    def iter_user_works(
+        self, user_id: str
     ) -> Iterator[BookmarkWork]:  # pragma: no cover
         raise NotImplementedError
 

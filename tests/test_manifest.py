@@ -20,6 +20,7 @@ from pixiv_bookmark_backup.manifest import (
     load_or_init,
     make_image_entry,
     merge,
+    new_following_manifest,
     new_manifest,
     write_atomic,
 )
@@ -330,6 +331,121 @@ def test_merge_errors_union_by_work_id() -> None:
     result = merge(existing, incoming)
 
     assert {"work_id": 2, "message": "kept"} in result.errors
+    assert {"work_id": 1, "message": "refreshed"} in result.errors
+    assert {"work_id": 1, "message": "old"} not in result.errors
+    assert {"work_id": 3, "message": "brand new"} in result.errors
+
+
+# --------------------------------------------------------------------------- #
+# new_following_manifest
+# --------------------------------------------------------------------------- #
+
+
+def test_new_following_manifest_source_block() -> None:
+    manifest = new_following_manifest(
+        following_of="42",
+        follow_visibility="public",
+        generated_at="2026-06-24T00:00:00+00:00",
+        works=[],
+        errors=[],
+    )
+    assert manifest.source == {
+        "mode": "following",
+        "following_of": "42",
+        "follow_visibility": "public",
+    }
+    assert manifest.schema_version == SCHEMA_VERSION
+    assert SCHEMA_VERSION == 1
+
+
+def test_new_following_manifest_carries_through_fields() -> None:
+    entry = build_work_entry(
+        _make_work(work_id=7),
+        [_image(bytes_=2048, status=ImageStatus.DOWNLOADED.value)],
+    )
+    manifest = new_following_manifest(
+        following_of="99",
+        follow_visibility="private",
+        generated_at="2026-06-24T00:00:00+00:00",
+        works=[entry],
+        errors=[{"work_id": 999, "message": "gone"}],
+    )
+
+    assert manifest.generated_at == "2026-06-24T00:00:00+00:00"
+    assert manifest.works == [entry]
+    assert manifest.errors == [{"work_id": 999, "message": "gone"}]
+    assert manifest.source == {
+        "mode": "following",
+        "following_of": "99",
+        "follow_visibility": "private",
+    }
+
+
+def test_new_following_manifest_accepts_none_following_of() -> None:
+    manifest = new_following_manifest(
+        following_of=None,
+        follow_visibility="public",
+        generated_at="2026-06-24T00:00:00+00:00",
+        works=[],
+        errors=[],
+    )
+    assert manifest.source == {
+        "mode": "following",
+        "following_of": None,
+        "follow_visibility": "public",
+    }
+
+
+def test_merge_following_manifests_keeps_new_source_and_dedups() -> None:
+    old_work = build_work_entry(
+        _make_work(work_id=1),
+        [_image(status=ImageStatus.DOWNLOADED.value, bytes_=1024)],
+    )
+    refreshed_work = build_work_entry(
+        _make_work(work_id=1),
+        [_image(status=ImageStatus.SKIPPED.value, bytes_=None)],
+    )
+    new_work = build_work_entry(_make_work(work_id=2), [_image()])
+
+    existing = new_following_manifest(
+        following_of="old",
+        follow_visibility="private",
+        generated_at="2020-01-01T00:00:00+00:00",
+        works=[old_work],
+        errors=[
+            {"work_id": 1, "message": "old"},
+            {"work_id": 9, "message": "kept"},
+        ],
+    )
+    incoming = new_following_manifest(
+        following_of="new",
+        follow_visibility="public",
+        generated_at="2026-06-24T00:00:00+00:00",
+        works=[refreshed_work, new_work],
+        errors=[
+            {"work_id": 1, "message": "refreshed"},
+            {"work_id": 3, "message": "brand new"},
+        ],
+    )
+
+    result = merge(existing, incoming)
+
+    # The new following-shaped source wins.
+    assert result.source == {
+        "mode": "following",
+        "following_of": "new",
+        "follow_visibility": "public",
+    }
+    assert result.generated_at == "2026-06-24T00:00:00+00:00"
+
+    # Works are deduped by id; the refreshed record replaces the old one.
+    ids = [work.id for work in result.works]
+    assert ids == [1, 2]
+    by_id = {work.id: work for work in result.works}
+    assert by_id[1].images[0].status == "skipped"
+
+    # Errors are unioned by work_id.
+    assert {"work_id": 9, "message": "kept"} in result.errors
     assert {"work_id": 1, "message": "refreshed"} in result.errors
     assert {"work_id": 1, "message": "old"} not in result.errors
     assert {"work_id": 3, "message": "brand new"} in result.errors

@@ -38,7 +38,12 @@ from pathlib import Path
 from typing import Any
 
 from pixiv_bookmark_backup.config import ResolvedAuth
-from pixiv_bookmark_backup.core import BackupConfig, RunSummary
+from pixiv_bookmark_backup.core import (
+    BackupConfig,
+    FollowingConfig,
+    FollowingRunSummary,
+    RunSummary,
+)
 from pixiv_bookmark_backup.downloader import download_image
 from pixiv_bookmark_backup.manifest import (
     ImageEntry,
@@ -47,6 +52,7 @@ from pixiv_bookmark_backup.manifest import (
     load_or_init,
     make_image_entry,
     merge,
+    new_following_manifest,
     new_manifest,
     write_atomic,
 )
@@ -92,6 +98,19 @@ def _restrict_passes(visibility: str) -> list[str]:
     if visibility == "all":
         return ["public", "private"]
     return [visibility]
+
+
+def _follow_passes(follows: str) -> list[str]:
+    """Return the Pixiv follow-list ``restrict`` passes for ``follows``.
+
+    Mirrors :func:`_restrict_passes`: ``"all"`` is expanded into the two
+    concrete passes (your public follows then your private follows); ``"public"``
+    / ``"private"`` map to a single pass.
+    """
+
+    if follows == "all":
+        return ["public", "private"]
+    return [follows]
 
 
 def _passes_since(work: BookmarkWork, since: date | None) -> bool:
@@ -189,11 +208,52 @@ class _Counters:
         )
 
 
+class _FollowingCounters(_Counters):
+    """Mutable accumulator for a follow-backup run's tallies.
+
+    Extends :class:`_Counters` with the per-user tallies a following run also
+    tracks, so it can be passed wherever a :class:`_Counters` is expected (e.g.
+    :func:`_image_entries_for_work`). The summary builder is named distinctly
+    (:meth:`to_following_summary`) rather than overriding ``to_summary`` so the
+    base ``-> RunSummary`` contract is not violated.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.users_total = 0
+        self.users_with_works = 0
+
+    def to_following_summary(self, following_of: str | None) -> FollowingRunSummary:
+        """Freeze the running totals into a :class:`FollowingRunSummary`."""
+
+        return FollowingRunSummary(
+            works_total=self.works_total,
+            works_succeeded=self.works_succeeded,
+            works_failed=self.works_failed,
+            files_downloaded=self.files_downloaded,
+            files_skipped=self.files_skipped,
+            files_failed=self.files_failed,
+            bytes_downloaded=self.bytes_downloaded,
+            users_total=self.users_total,
+            users_with_works=self.users_with_works,
+            following_of=following_of,
+        )
+
+
+#: The configs :func:`_image_entries_for_work` accepts. Both share the
+#: ``output_dir`` / ``metadata_only`` / ``max_retries`` / ``skip_existing``
+#: fields it reads; a union (rather than a structural ``Protocol``) is used
+#: because ``output_dir``'s ``field(converter=Path)`` is not structurally
+#: assignable to a plain ``Path`` protocol member under Pyright.
+_ImageConfig = BackupConfig | FollowingConfig
+
+
 def _image_entries_for_work(
-    config: BackupConfig,
+    config: _ImageConfig,
     client: PixivClient,
     work: BookmarkWork,
     counters: _Counters,
+    image_dir: Path | None = None,
 ) -> list[ImageEntry]:
     """Download (or account for) ``work``'s images and return their entries.
 
@@ -202,11 +262,18 @@ def _image_entries_for_work(
     recorded as :attr:`~pixiv_bookmark_backup.models.ImageStatus.METADATA_ONLY`.
     Each outcome is folded into ``counters`` (and the work is marked failed by
     the caller if any entry failed).
+
+    Files are written under ``image_dir`` (defaulting to ``config.output_dir``
+    for the flat bookmark layout); the per-author follow layout passes
+    ``config.output_dir / <author_id>`` so works land in author subdirectories.
+    Either way the recorded manifest path stays *relative to the output root*
+    (``config.output_dir``), so a per-author entry reads ``<author_id>/<file>``.
     """
 
-    output_dir = config.output_dir
+    root_dir = config.output_dir
+    write_dir = image_dir if image_dir is not None else root_dir
     if work.type == "ugoira":
-        dest = output_dir / ugoira_filename(work.id)
+        dest = write_dir / ugoira_filename(work.id)
         source_url = work.images[0].source_url if work.images else ""
         if config.metadata_only:
             status: ImageStatus | str = ImageStatus.METADATA_ONLY
@@ -220,7 +287,7 @@ def _image_entries_for_work(
             make_image_entry(
                 0,
                 source_url,
-                relative_to_output(dest, output_dir),
+                relative_to_output(dest, root_dir),
                 status,
                 entry_bytes,
                 error,
@@ -230,7 +297,7 @@ def _image_entries_for_work(
     entries: list[ImageEntry] = []
     for img in work.images:
         ext = ext_from_url(img.source_url)
-        dest = output_dir / image_filename(work.id, img.page, ext)
+        dest = write_dir / image_filename(work.id, img.page, ext)
         if config.metadata_only:
             status = ImageStatus.METADATA_ONLY
             entry_bytes = None
@@ -249,7 +316,7 @@ def _image_entries_for_work(
             make_image_entry(
                 img.page,
                 img.source_url,
-                relative_to_output(dest, output_dir),
+                relative_to_output(dest, root_dir),
                 status,
                 entry_bytes,
                 error,
@@ -438,3 +505,245 @@ def _iterate_and_process(
             else:
                 counters.works_succeeded += 1
             works.append(build_work_entry(work, entries))
+
+
+def run_following(
+    config: FollowingConfig,
+    auth: ResolvedAuth,
+    client: PixivClient,
+    *,
+    progress: Callable[[str], None] = lambda _msg: None,
+    clock: Callable[[], str] = _utcnow,
+) -> FollowingRunSummary:
+    """Back up the works of every followed user and return a summary.
+
+    Authenticates, then iterates the authenticated user's follow list across the
+    requested :attr:`~pixiv_bookmark_backup.core.FollowingConfig.follows` passes,
+    backing up each followed user's works into a per-author subdirectory
+    (``<output_dir>/<author_id>/``). A single aggregate ``details.json`` is
+    written at the output root (unless ``dry_run``).
+
+    The error contract mirrors :func:`run`:
+
+    * :class:`~pixiv_bookmark_backup.pixiv_client.AuthRejected` from
+      authentication propagates (CLI -> 3).
+    * An :class:`~pixiv_bookmark_backup.pixiv_client.ApiError` raised *before any
+      work has been processed* -- whether listing the follow list or the first
+      user's works -- propagates (CLI -> 4). Once some works are recorded a
+      listing failure is caught, noted as a partial-run error, and the manifest
+      is still flushed (CLI -> 6).
+    * ``KeyboardInterrupt`` flushes a partial manifest and re-raises (CLI -> 130).
+
+    Args:
+        config: The validated run parameters.
+        auth: Resolved credentials (only the refresh token is read here).
+        client: The Pixiv surface (authenticate, list following, list works,
+            download, ugoira).
+        progress: Sink for human-readable progress lines; defaults to a no-op.
+        clock: Source of the manifest's ``generated_at`` timestamp; injectable
+            for deterministic tests.
+
+    Returns:
+        The accumulated :class:`~pixiv_bookmark_backup.core.FollowingRunSummary`.
+    """
+
+    self_id = client.authenticate(auth.refresh_token)
+
+    counters = _FollowingCounters()
+    works: list[Any] = []
+    errors: list[dict[str, Any]] = []
+    only_set = set(config.only)
+    exclude_set = set(config.exclude)
+    seen_users: set[str] = set()
+
+    try:
+        _iterate_following(
+            config,
+            client,
+            self_id,
+            only_set,
+            exclude_set,
+            seen_users,
+            counters,
+            works,
+            errors,
+            progress,
+        )
+    except ApiError as err:
+        if counters.works_total == 0:
+            # Nothing recorded yet -> a clean network failure; let the CLI map
+            # it to exit 4.
+            raise
+        # Some works are already recorded -> degrade to a partial run.
+        errors.append({"reason": f"listing interrupted: {err}"})
+        counters.works_failed += 1
+    except KeyboardInterrupt:
+        if not config.dry_run:
+            _flush_following_manifest(config, self_id, works, errors, clock)
+        raise
+
+    if not config.dry_run:
+        _flush_following_manifest(config, self_id, works, errors, clock)
+
+    return counters.to_following_summary(self_id)
+
+
+def _iterate_following(
+    config: FollowingConfig,
+    client: PixivClient,
+    self_id: str,
+    only_set: set[str],
+    exclude_set: set[str],
+    seen_users: set[str],
+    counters: _FollowingCounters,
+    works: list[Any],
+    errors: list[dict[str, Any]],
+    progress: Callable[[str], None],
+) -> None:
+    """Iterate followed users across the follow passes and process each.
+
+    Applies ``--only``/``--exclude`` (compared by ``str(user.id)``), dedups users
+    across passes (so a user followed both publicly and privately is processed
+    once under ``follows="all"``), and stops the whole run once ``--max-users``
+    users have been processed. Per-user work processing -- and the ``--limit``
+    stop signal -- is delegated to :func:`_process_following_user`.
+    ``ApiError`` from the follow-list listing and ``KeyboardInterrupt`` propagate
+    to :func:`run_following`, which owns recovery.
+    """
+
+    for restrict in _follow_passes(config.follows):
+        for user in client.iter_following(self_id, restrict):
+            uid = str(user.id)
+            if uid in seen_users:
+                continue
+            if exclude_set and uid in exclude_set:
+                continue
+            if only_set and uid not in only_set:
+                continue
+            if (
+                config.max_users is not None
+                and counters.users_total >= config.max_users
+            ):
+                return
+            if config.limit is not None and counters.works_total >= config.limit:
+                # The global work budget is already spent -> don't list (or even
+                # count) any further users.
+                return
+
+            seen_users.add(uid)
+            counters.users_total += 1
+            progress(f"user {uid} ({user.name})")
+
+            if _process_following_user(
+                config, client, uid, counters, works, errors, progress
+            ):
+                return
+
+
+def _process_following_user(
+    config: FollowingConfig,
+    client: PixivClient,
+    uid: str,
+    counters: _FollowingCounters,
+    works: list[Any],
+    errors: list[dict[str, Any]],
+    progress: Callable[[str], None],
+) -> bool:
+    """Back up one followed user's works; return whether to stop the whole run.
+
+    Works land in the per-author subdirectory ``<output_dir>/<uid>/``. Returns
+    ``True`` only when the global ``--limit`` has been reached (so the caller
+    stops every remaining user); ``False`` otherwise. ``--per-user-limit`` caps
+    this user's works (counted *after* the ``--since`` filter) and merely moves
+    on to the next user. An :class:`~pixiv_bookmark_backup.pixiv_client.ApiError`
+    from this user's listing is skip-and-continue once some works exist; while
+    nothing has been recorded yet it propagates (so the run fails cleanly with
+    exit 4 rather than silently backing up nothing).
+    """
+
+    image_dir = config.output_dir / uid
+    per_user = 0
+    contributed = False
+
+    try:
+        for work in client.iter_user_works(uid):
+            if config.limit is not None and counters.works_total >= config.limit:
+                return True
+            if config.per_user_limit is not None and per_user >= config.per_user_limit:
+                break
+            if not _passes_since(work, config.since):
+                continue
+
+            progress(f"  {work.id} {work.title!r} — {work.page_count} page(s)")
+
+            if work.type != "ugoira" and not work.images:
+                # No downloadable pages (deleted / restricted / limited work):
+                # record a work-level error keyed on "work_id" (so manifest.merge
+                # dedups across resume runs) and skip it -- it is not counted as a
+                # processed work and does not consume the per-user budget.
+                errors.append(
+                    {
+                        "work_id": work.id,
+                        "reason": "work unavailable (no downloadable pages)",
+                    }
+                )
+                continue
+
+            if config.dry_run:
+                planned = _planned_filenames(work)
+                counters.works_total += 1
+                counters.works_succeeded += 1
+                counters.files_downloaded += len(planned)
+                progress(f"    would create: {', '.join(planned)}")
+            else:
+                entries = _image_entries_for_work(
+                    config, client, work, counters, image_dir=image_dir
+                )
+                counters.works_total += 1
+                if any(entry.status == ImageStatus.FAILED.value for entry in entries):
+                    counters.works_failed += 1
+                else:
+                    counters.works_succeeded += 1
+                works.append(build_work_entry(work, entries))
+
+            per_user += 1
+            if not contributed:
+                counters.users_with_works += 1
+                contributed = True
+    except ApiError as err:
+        if counters.works_total == 0:
+            # Nothing recorded anywhere yet -> a clean network failure; propagate
+            # so run_following maps it to exit 4 rather than silently skipping.
+            raise
+        # Some works already recorded -> note this user's failure and continue.
+        errors.append({"reason": f"user {uid} listing interrupted: {err}"})
+        counters.works_failed += 1
+
+    return False
+
+
+def _flush_following_manifest(
+    config: FollowingConfig,
+    following_of: str | None,
+    works: list[Any],
+    errors: list[dict[str, Any]],
+    clock: Callable[[], str],
+) -> None:
+    """Merge a following run's ``works``/``errors`` into ``details.json``.
+
+    Identical to :func:`_flush_manifest` except the manifest is built with
+    :func:`~pixiv_bookmark_backup.manifest.new_following_manifest` so its
+    ``source`` block is following-shaped. The manifest stays at the output root
+    (not in any per-author subdirectory).
+    """
+
+    details_path = config.output_dir / MANIFEST_NAME
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+
+    existing, schema_mismatch = _load_existing_manifest(details_path)
+    if schema_mismatch and details_path.exists():
+        os.replace(details_path, details_path.with_name(MANIFEST_BACKUP_NAME))
+
+    new = new_following_manifest(following_of, config.follows, clock(), works, errors)
+    final = merge(existing, new)
+    write_atomic(details_path, final)

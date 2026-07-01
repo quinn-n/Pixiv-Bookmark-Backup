@@ -1,5 +1,6 @@
 # backed-up files
 backup/
+backup-*/
 
 # VSCode
 .vscode/

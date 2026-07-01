@@ -1041,10 +1041,13 @@ def _emit_login_result(
     "can be browsed in a file browser (created if missing).",
 )
 @click.option(
-    "--all-pages",
-    is_flag=True,
-    help="With --symlink-dir, link every downloaded page of each work instead of "
-    "only page 0.",
+    "--all-pages/--first-page-only",
+    "all_pages",
+    default=True,
+    show_default=False,
+    help="With --symlink-dir, link every existing page of each work "
+    "(--all-pages, the default) or only the first existing page "
+    "(--first-page-only).",
 )
 @click.option(
     "--dry-run",
@@ -1131,8 +1134,12 @@ def search(
       pixiv-bookmark-backup search touhou original
 
     \b
-      # Symlink matches into ./review to browse them in a file manager
+      # Symlink matches into ./review (all pages of each work, by default)
       pixiv-bookmark-backup search touhou --symlink-dir ./review
+
+    \b
+      # Link only the first existing page of each work
+      pixiv-bookmark-backup search touhou --symlink-dir ./review --first-page-only
 
     \b
       # Require both tags (AND) and match them as whole tags
@@ -1152,8 +1159,11 @@ def search(
         raise click.UsageError("--quiet and --verbose are mutually exclusive")
     if count and json_output:
         raise click.UsageError("--count and --json are mutually exclusive")
-    if all_pages and symlink_dir is None:
-        raise click.UsageError("--all-pages requires --symlink-dir")
+    if (
+        ctx.get_parameter_source("all_pages") is click.core.ParameterSource.COMMANDLINE
+        and symlink_dir is None
+    ):
+        raise click.UsageError("--all-pages/--first-page-only requires --symlink-dir")
     if dry_run and symlink_dir is None:
         raise click.UsageError("--dry-run requires --symlink-dir")
     if force and symlink_dir is None:

@@ -58,12 +58,14 @@ class SymlinkConfig:
     to a :class:`~pathlib.Path` so callers may pass a plain string.
 
     ``all_pages`` links every page of a multi-page work rather than only the
-    lowest-numbered one; ``dry_run`` previews without touching the filesystem;
-    ``force`` re-points an existing symlink that aims at a different target.
+    lowest-numbered one; it defaults to ``True`` so ``--symlink-dir`` links
+    every downloaded page unless ``--first-page-only`` is given. ``dry_run``
+    previews without touching the filesystem; ``force`` re-points an existing
+    symlink that aims at a different target.
     """
 
     dir: Path = field(converter=Path)
-    all_pages: bool = field(default=False, validator=instance_of(bool))
+    all_pages: bool = field(default=True, validator=instance_of(bool))
     dry_run: bool = field(default=False, validator=instance_of(bool))
     force: bool = field(default=False, validator=instance_of(bool))
 

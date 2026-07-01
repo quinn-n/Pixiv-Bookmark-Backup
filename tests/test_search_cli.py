@@ -595,7 +595,7 @@ def _write_linkable(backup: Path, data: dict[str, Any] | None = None) -> Path:
     return backup
 
 
-@pytest.mark.parametrize("flag", ["--all-pages", "--dry-run", "--force"])
+@pytest.mark.parametrize("flag", ["--dry-run", "--force"])
 def test_symlink_flags_require_symlink_dir(
     runner: CliRunner, tmp_path: Path, flag: str
 ) -> None:
@@ -603,6 +603,17 @@ def test_symlink_flags_require_symlink_dir(
     result = runner.invoke(cli, ["search", "touhou", "-i", str(backup), flag])
     assert result.exit_code == 2
     assert f"{flag} requires --symlink-dir" in result.stderr
+    assert result.stdout == ""
+
+
+@pytest.mark.parametrize("flag", ["--all-pages", "--first-page-only"])
+def test_page_flags_require_symlink_dir(
+    runner: CliRunner, tmp_path: Path, flag: str
+) -> None:
+    backup = _write_linkable(tmp_path / "backup")
+    result = runner.invoke(cli, ["search", "touhou", "-i", str(backup), flag])
+    assert result.exit_code == 2
+    assert "--all-pages/--first-page-only requires --symlink-dir" in result.stderr
     assert result.stdout == ""
 
 
@@ -666,7 +677,7 @@ def test_symlink_json_sub_object(runner: CliRunner, tmp_path: Path) -> None:
     assert "symlink" in payload
     sym = payload["symlink"]
     assert sym["dir"] == str(links.resolve())
-    assert sym["all_pages"] is False
+    assert sym["all_pages"] is True
     assert sym["dry_run"] is False
     assert sym["force"] is False
     assert sym["links_created"] == 2
@@ -785,8 +796,10 @@ def test_symlink_count_prints_integer_and_links(
     assert "Linked 2 files (2 new, 0 reused) for 2 works into" in result.stderr
 
 
-def test_symlink_all_pages_links_every_page(runner: CliRunner, tmp_path: Path) -> None:
-    data = {
+def _multipage_manifest() -> dict[str, Any]:
+    """One work (id 101, tag "touhou") with three downloaded pages on disk."""
+
+    return {
         "schema_version": SCHEMA_VERSION,
         "generated_at": "2023-01-02T03:04:05+09:00",
         "source": {"user_id": "42", "visibility": "public"},
@@ -810,7 +823,10 @@ def test_symlink_all_pages_links_every_page(runner: CliRunner, tmp_path: Path) -
         ],
         "errors": [],
     }
-    backup = _write_linkable(tmp_path / "backup", data)
+
+
+def test_symlink_all_pages_links_every_page(runner: CliRunner, tmp_path: Path) -> None:
+    backup = _write_linkable(tmp_path / "backup", _multipage_manifest())
     links = tmp_path / "links"
     result = runner.invoke(
         cli,
@@ -830,6 +846,70 @@ def test_symlink_all_pages_links_every_page(runner: CliRunner, tmp_path: Path) -
         assert link.is_symlink()
         assert link.resolve() == (backup / f"101_p{page}.png").resolve()
     assert "Linked 3 files (3 new, 0 reused) for 1 work into" in result.stderr
+
+
+def test_symlink_default_links_all_pages(runner: CliRunner, tmp_path: Path) -> None:
+    backup = _write_linkable(tmp_path / "backup", _multipage_manifest())
+    links = tmp_path / "links"
+    result = runner.invoke(
+        cli,
+        ["search", "touhou", "-i", str(backup), "--symlink-dir", str(links)],
+    )
+    assert result.exit_code == 0, result.output
+    for page in range(3):
+        link = links / f"101_p{page}.png"
+        assert link.is_symlink()
+        assert link.resolve() == (backup / f"101_p{page}.png").resolve()
+    assert "Linked 3 files (3 new, 0 reused) for 1 work into" in result.stderr
+
+
+def test_symlink_first_page_only_links_one_page(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    backup = _write_linkable(tmp_path / "backup", _multipage_manifest())
+    links = tmp_path / "links"
+    result = runner.invoke(
+        cli,
+        [
+            "search",
+            "touhou",
+            "-i",
+            str(backup),
+            "--symlink-dir",
+            str(links),
+            "--first-page-only",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert (links / "101_p0.png").is_symlink()
+    assert not (links / "101_p1.png").exists()
+    assert not (links / "101_p2.png").exists()
+    assert "Linked 1 file (1 new, 0 reused) for 1 work into" in result.stderr
+
+
+def test_symlink_first_page_only_json(runner: CliRunner, tmp_path: Path) -> None:
+    backup = _write_linkable(tmp_path / "backup", _multipage_manifest())
+    links = tmp_path / "links"
+    result = runner.invoke(
+        cli,
+        [
+            "search",
+            "touhou",
+            "-i",
+            str(backup),
+            "--symlink-dir",
+            str(links),
+            "--first-page-only",
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    sym = payload["symlink"]
+    assert sym["all_pages"] is False
+    assert sym["links_created"] == 1
+    assert sym["links_total"] == 1
+    assert sym["works_linked"] == 1
 
 
 def _manifest_with_a_missing_file() -> dict[str, Any]:

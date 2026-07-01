@@ -83,7 +83,7 @@ def _touch(directory: Path, name: str) -> Path:
 def test_config_defaults_and_path_coercion(tmp_path: Path) -> None:
     config = SymlinkConfig(dir=str(tmp_path))
     assert config.dir == tmp_path
-    assert config.all_pages is False
+    assert config.all_pages is True
     assert config.dry_run is False
     assert config.force is False
 
@@ -127,7 +127,7 @@ def test_created_link_resolves_to_target(tmp_path: Path) -> None:
     assert result.linked == (("1_p0.jpg", str((manifest_dir / "1_p0.jpg").resolve())),)
 
 
-def test_default_links_only_lowest_page(tmp_path: Path) -> None:
+def test_first_page_only_links_only_lowest_page(tmp_path: Path) -> None:
     manifest_dir, manifest_path = _manifest_dir(tmp_path)
     _touch(manifest_dir, "1_p0.jpg")
     _touch(manifest_dir, "1_p1.jpg")
@@ -140,7 +140,7 @@ def test_default_links_only_lowest_page(tmp_path: Path) -> None:
     result = plan_and_link(
         [SearchMatch(work=_work(images=images), matched_fields=[])],
         manifest_path,
-        SymlinkConfig(dir=link_dir),
+        SymlinkConfig(dir=link_dir, all_pages=False),
     )
 
     assert (link_dir / "1_p0.jpg").is_symlink()
@@ -148,7 +148,7 @@ def test_default_links_only_lowest_page(tmp_path: Path) -> None:
     assert result.links_created == 1
 
 
-def test_default_links_lowest_existing_page(tmp_path: Path) -> None:
+def test_first_page_only_links_lowest_existing_page(tmp_path: Path) -> None:
     manifest_dir, manifest_path = _manifest_dir(tmp_path)
     # p0's file is absent; only p1 exists on disk.
     _touch(manifest_dir, "1_p1.jpg")
@@ -161,7 +161,7 @@ def test_default_links_lowest_existing_page(tmp_path: Path) -> None:
     result = plan_and_link(
         [SearchMatch(work=_work(images=images), matched_fields=[])],
         manifest_path,
-        SymlinkConfig(dir=link_dir),
+        SymlinkConfig(dir=link_dir, all_pages=False),
     )
 
     assert not (link_dir / "1_p0.jpg").exists()

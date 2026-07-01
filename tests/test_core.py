@@ -18,40 +18,7 @@ from pixiv_bookmark_backup.core import (
     describe_plan,
 )
 
-
-class _FakeClock:
-    """Deterministic ``monotonic`` replacement.
-
-    Pops scripted values in sequence on each call and counts how many times it
-    was called, so tests can both drive pacing arithmetic and assert that a
-    disabled pacer never reads the clock at all.
-    """
-
-    def __init__(self, values: list[float]) -> None:
-        self._values = list(values)
-        self.calls = 0
-
-    def __call__(self) -> float:
-        self.calls += 1
-        return self._values.pop(0)
-
-
-class _SpySleep:
-    """Recording ``sleep`` replacement.
-
-    Records every requested duration into ``durations``; when ``raises`` is set,
-    it raises that exception instead of recording (used to prove interrupts
-    propagate out of ``tick()``).
-    """
-
-    def __init__(self, raises: BaseException | None = None) -> None:
-        self.durations: list[float] = []
-        self._raises = raises
-
-    def __call__(self, duration: float) -> None:
-        if self._raises is not None:
-            raise self._raises
-        self.durations.append(duration)
+from conftest import ScriptedMonotonic, SpySleep
 
 
 def test_output_dir_is_coerced_to_path() -> None:
@@ -303,8 +270,8 @@ def test_login_exit_codes_are_distinct_members() -> None:
 def test_request_pacer_period_zero_is_strict_no_op() -> None:
     # period == 0 must disable pacing entirely: no clock reads, no sleeps,
     # preserving un-paced behavior byte-for-byte.
-    clock = _FakeClock([])
-    sleep = _SpySleep()
+    clock = ScriptedMonotonic([])
+    sleep = SpySleep()
     pacer = RequestPacer(0, monotonic=clock, sleep=sleep)
 
     pacer.tick()
@@ -318,8 +285,8 @@ def test_request_pacer_period_zero_is_strict_no_op() -> None:
 def test_request_pacer_first_tick_only_records_start() -> None:
     # The very first tick has no previous start, so it must not sleep -- it just
     # records the baseline by reading the clock exactly once.
-    clock = _FakeClock([100.0])
-    sleep = _SpySleep()
+    clock = ScriptedMonotonic([100.0])
+    sleep = SpySleep()
     pacer = RequestPacer(0.5, monotonic=clock, sleep=sleep)
 
     pacer.tick()
@@ -331,8 +298,8 @@ def test_request_pacer_first_tick_only_records_start() -> None:
 def test_request_pacer_sleeps_remaining_when_elapsed_below_period() -> None:
     # First tick reads once (start = 100.0). Second tick reads once before
     # sleeping (100.2 -> elapsed 0.2, remaining 0.3) and once after sleeping.
-    clock = _FakeClock([100.0, 100.2, 100.5])
-    sleep = _SpySleep()
+    clock = ScriptedMonotonic([100.0, 100.2, 100.5])
+    sleep = SpySleep()
     pacer = RequestPacer(0.5, monotonic=clock, sleep=sleep)
 
     pacer.tick()
@@ -344,8 +311,8 @@ def test_request_pacer_sleeps_remaining_when_elapsed_below_period() -> None:
 def test_request_pacer_does_not_sleep_when_elapsed_meets_period() -> None:
     # Second tick's elapsed is 1.3 >= period 0.5, so remaining is negative and
     # no sleep occurs; the clock is read once per tick.
-    clock = _FakeClock([100.0, 101.3])
-    sleep = _SpySleep()
+    clock = ScriptedMonotonic([100.0, 101.3])
+    sleep = SpySleep()
     pacer = RequestPacer(0.5, monotonic=clock, sleep=sleep)
 
     pacer.tick()
@@ -368,8 +335,8 @@ def test_request_pacer_baseline_uses_post_sleep_read() -> None:
     # If tick 2 had (incorrectly) kept the pre-sleep 100.2 as the baseline, then
     # tick 3's elapsed would be 101.0 - 100.2 = 0.8 >= 0.5 and it would NOT
     # sleep. The correct post-sleep baseline (100.9) makes tick 3 sleep 0.4.
-    clock = _FakeClock([100.0, 100.2, 100.9, 101.0, 101.4])
-    sleep = _SpySleep()
+    clock = ScriptedMonotonic([100.0, 100.2, 100.9, 101.0, 101.4])
+    sleep = SpySleep()
     pacer = RequestPacer(0.5, monotonic=clock, sleep=sleep)
 
     pacer.tick()
@@ -391,8 +358,8 @@ def test_request_pacer_negative_period_is_rejected() -> None:
 
 def test_request_pacer_keyboard_interrupt_from_sleep_propagates() -> None:
     # A KeyboardInterrupt raised by sleep must not be swallowed by tick().
-    clock = _FakeClock([100.0, 100.2])
-    sleep = _SpySleep(raises=KeyboardInterrupt())
+    clock = ScriptedMonotonic([100.0, 100.2])
+    sleep = SpySleep(raise_on_first=True)
     pacer = RequestPacer(0.5, monotonic=clock, sleep=sleep)
 
     pacer.tick()  # records baseline, no sleep
@@ -411,8 +378,8 @@ def test_request_pacer_keyboard_interrupt_from_sleep_propagates() -> None:
 def test_request_pacer_arithmetic_branches(
     elapsed: float, expected_sleep: float | None
 ) -> None:
-    clock = _FakeClock([100.0, 100.0 + elapsed, 200.0])
-    sleep = _SpySleep()
+    clock = ScriptedMonotonic([100.0, 100.0 + elapsed, 200.0])
+    sleep = SpySleep()
     pacer = RequestPacer(0.5, monotonic=clock, sleep=sleep)
 
     pacer.tick()

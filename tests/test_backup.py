@@ -38,6 +38,8 @@ from pixiv_bookmark_backup.pixiv_client import (
 )
 from pixiv_bookmark_backup.ugoira import UgoiraResult
 
+from conftest import ScriptedMonotonic, SpySleep
+
 FIXED_CLOCK = "2026-06-24T00:00:00+00:00"
 SELF_ID = "555"
 TOKEN = "refresh-token-value"
@@ -232,43 +234,6 @@ def _run(config: BackupConfig, client: FakePixivClient) -> backup.RunSummary:
 # -- pacing test infra --------------------------------------------------
 
 
-class _ScriptedMonotonic:
-    """A ``monotonic()`` stand-in that pops scripted values in sequence.
-
-    ``RequestPacer.tick()`` reads the clock once per tick when it does not sleep
-    and twice when it does (once to measure elapsed, once after sleeping), so a
-    test scripts exactly as many values as the tick pattern under test consumes.
-    Exhausting the script is a bug in the test's accounting and raises loudly.
-    """
-
-    def __init__(self, values: list[float]) -> None:
-        self._values = list(values)
-        self.calls = 0
-
-    def __call__(self) -> float:
-        self.calls += 1
-        if not self._values:  # pragma: no cover - guards test mis-scripting
-            raise AssertionError("scripted monotonic exhausted")
-        return self._values.pop(0)
-
-
-class _SpySleep:
-    """A ``sleep()`` stand-in that records each requested duration.
-
-    With ``raise_on_first=True`` the first call raises ``KeyboardInterrupt``
-    (after recording the duration) to drive the interrupt-during-sleep path.
-    """
-
-    def __init__(self, *, raise_on_first: bool = False) -> None:
-        self.durations: list[float] = []
-        self._raise_on_first = raise_on_first
-
-    def __call__(self, seconds: float) -> None:
-        self.durations.append(seconds)
-        if self._raise_on_first and len(self.durations) == 1:
-            raise KeyboardInterrupt
-
-
 def _run_paced(
     config: BackupConfig,
     client: FakePixivClient,
@@ -308,11 +273,11 @@ def test_zero_time_per_request_never_sleeps_and_is_identical(
     baseline = _run(_config(tmp_path / "base"), FakePixivClient(works))
     baseline_manifest = _read_manifest(tmp_path / "base")
 
-    sleep = _SpySleep()
+    sleep = SpySleep()
     paced = _run_paced(
         _config(tmp_path / "paced", time_per_request=0.0),
         FakePixivClient(works),
-        monotonic=_ScriptedMonotonic([]),  # never read at period 0
+        monotonic=ScriptedMonotonic([]),  # never read at period 0
         sleep=sleep,
     )
 
@@ -340,8 +305,8 @@ def test_pacing_sleeps_start_to_start_once_per_processed_work(
     works = {
         "public": [_make_work(wid, pages=1) for wid in (100, 200, 300)],
     }
-    monotonic = _ScriptedMonotonic([0.0, 0.2, 0.5, 1.1])
-    sleep = _SpySleep()
+    monotonic = ScriptedMonotonic([0.0, 0.2, 0.5, 1.1])
+    sleep = SpySleep()
 
     summary = _run_paced(
         _config(tmp_path, time_per_request=0.5),
@@ -386,8 +351,8 @@ def test_pacing_only_fires_for_processed_works(
     }
     # Three processed works -> two inter-work ticks sleep; script never-sleep
     # first tick then two deficit sleeps.
-    monotonic = _ScriptedMonotonic([0.0, 0.0, 0.5, 0.5, 1.0])
-    sleep = _SpySleep()
+    monotonic = ScriptedMonotonic([0.0, 0.0, 0.5, 0.5, 1.0])
+    sleep = SpySleep()
 
     summary = _run_paced(
         _config(tmp_path, time_per_request=0.5, since=date(2010, 1, 1), limit=3),
@@ -411,8 +376,8 @@ def test_dry_run_still_paces(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     """dry-run accounts for works and still paces them, writing no manifest."""
     _patch_downloads(monkeypatch)
     works = {"public": [_make_work(100, pages=1), _make_work(200, pages=1)]}
-    monotonic = _ScriptedMonotonic([0.0, 0.0, 0.5])
-    sleep = _SpySleep()
+    monotonic = ScriptedMonotonic([0.0, 0.0, 0.5])
+    sleep = SpySleep()
 
     summary = _run_paced(
         _config(tmp_path, dry_run=True, time_per_request=0.5),
@@ -444,8 +409,8 @@ def test_metadata_only_still_paces(
         image_result=ImageResult(ImageStatus.SKIPPED, 10, None),
     )
     works = {"public": [_make_work(100, pages=1), _make_work(200, pages=1)]}
-    monotonic = _ScriptedMonotonic([0.0, 0.0, 0.5])
-    sleep = _SpySleep()
+    monotonic = ScriptedMonotonic([0.0, 0.0, 0.5])
+    sleep = SpySleep()
 
     summary = _run_paced(
         _config(tmp_path, metadata_only=True, time_per_request=0.5),
@@ -472,8 +437,8 @@ def test_keyboard_interrupt_during_sleep_flushes_partial_and_reraises(
     """
     _patch_downloads(monkeypatch)
     works = {"public": [_make_work(100, pages=1), _make_work(200, pages=1)]}
-    monotonic = _ScriptedMonotonic([0.0, 0.0])  # first tick, then second reads once
-    sleep = _SpySleep(raise_on_first=True)
+    monotonic = ScriptedMonotonic([0.0, 0.0])  # first tick, then second reads once
+    sleep = SpySleep(raise_on_first=True)
 
     with pytest.raises(KeyboardInterrupt):
         _run_paced(

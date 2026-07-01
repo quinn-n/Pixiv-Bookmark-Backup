@@ -152,8 +152,13 @@ def _install_run(
     *,
     summary: RunSummary | None = None,
     raises: BaseException | None = None,
+    captured: dict[str, Any] | None = None,
 ) -> None:
-    """Patch ``cli.run_backup`` to return ``summary`` or raise ``raises``."""
+    """Patch ``cli.run_backup`` to return ``summary`` or raise ``raises``.
+
+    When ``captured`` is provided, the received :class:`BackupConfig` is stored
+    under ``captured["config"]`` so tests can assert on option plumbing.
+    """
 
     def fake_run(
         config: Any,
@@ -163,6 +168,8 @@ def _install_run(
         progress: Any = None,
         **_kw: Any,
     ) -> RunSummary:
+        if captured is not None:
+            captured["config"] = config
         if raises is not None:
             raise raises
         assert summary is not None
@@ -575,6 +582,112 @@ def test_metadata_only_records_without_downloading(
     manifest = json.loads((out / "details.json").read_text(encoding="utf-8"))
     statuses = {img["status"] for work in manifest["works"] for img in work["images"]}
     assert statuses == {"metadata-only"}
+
+
+# -- --time-per-request -------------------------------------------------
+
+
+def test_time_per_request_help_lists_option_and_default(runner: CliRunner) -> None:
+    result = runner.invoke(cli, ["backup", "--help"])
+    assert result.exit_code == 0
+    out = result.output
+    assert "--time-per-request" in out
+    assert "SECONDS" in out
+    # click renders "[default: 0.0; x>=0]"; match the safe substring.
+    assert "default: 0.0" in out
+
+
+def test_time_per_request_negative_is_exit_2(runner: CliRunner, tmp_path: Path) -> None:
+    # click's FloatRange rejects the value before the command body runs, so no
+    # valid token is required to reach the error.
+    result = runner.invoke(
+        cli,
+        [
+            "backup",
+            "--time-per-request",
+            "-1",
+            "--config",
+            _missing_config(tmp_path),
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 2
+    assert "range" in result.stderr
+
+
+def test_time_per_request_fractional_reaches_config(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, Any] = {}
+    _install_run(
+        monkeypatch,
+        summary=RunSummary(works_total=1, works_succeeded=1),
+        captured=captured,
+    )
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup",
+            "--time-per-request",
+            "0.5",
+            "--config",
+            _missing_config(tmp_path),
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["config"].time_per_request == 0.5
+
+
+def test_time_per_request_defaults_to_zero_in_config(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, Any] = {}
+    _install_run(
+        monkeypatch,
+        summary=RunSummary(works_total=1, works_succeeded=1),
+        captured=captured,
+    )
+
+    result = runner.invoke(
+        cli,
+        ["backup", "--config", _missing_config(tmp_path)],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["config"].time_per_request == 0.0
+
+
+def test_time_per_request_absent_from_json_payload(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_run(
+        monkeypatch,
+        summary=RunSummary(works_total=1, works_succeeded=1),
+    )
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup",
+            "--json",
+            "--time-per-request",
+            "0",
+            "--config",
+            _missing_config(tmp_path),
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    # The summary schema is unchanged: the pacing knob is not a JSON field.
+    assert payload["schema"] == 1
+    assert "time_per_request" not in payload
 
 
 # -- security warnings (token visibility, insecure config) --------------

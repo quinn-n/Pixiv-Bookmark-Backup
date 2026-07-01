@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from collections.abc import Callable
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -42,6 +43,7 @@ from pixiv_bookmark_backup.core import (
     BackupConfig,
     FollowingConfig,
     FollowingRunSummary,
+    RequestPacer,
     RunSummary,
 )
 from pixiv_bookmark_backup.downloader import download_image
@@ -376,6 +378,8 @@ def run(
     *,
     progress: Callable[[str], None] = lambda _msg: None,
     clock: Callable[[], str] = _utcnow,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> RunSummary:
     """Run a single bookmark backup and return its :class:`RunSummary`.
 
@@ -394,6 +398,10 @@ def run(
             the orchestrator stays silent unless the CLI wires up output.
         clock: Source of the manifest's ``generated_at`` timestamp; injectable
             for deterministic tests.
+        monotonic: Monotonic clock backing the request-pacer; injectable for
+            deterministic pacing tests.
+        sleep: Sleep callable the request-pacer uses to space out processed
+            works; injectable for deterministic pacing tests.
 
     Returns:
         The accumulated :class:`RunSummary` for a run that reached completion
@@ -420,9 +428,12 @@ def run(
     counters = _Counters()
     works: list[Any] = []
     errors: list[dict[str, Any]] = []
+    pacer = RequestPacer(config.time_per_request, monotonic, sleep)
 
     try:
-        _iterate_and_process(config, client, target, counters, works, errors, progress)
+        _iterate_and_process(
+            config, client, target, counters, works, errors, progress, pacer
+        )
     except ApiError as err:
         if counters.works_total == 0:
             # Nothing recorded yet -> a clean network failure; let the CLI map
@@ -452,6 +463,7 @@ def _iterate_and_process(
     works: list[Any],
     errors: list[dict[str, Any]],
     progress: Callable[[str], None],
+    pacer: RequestPacer,
 ) -> None:
     """Iterate bookmarks across the visibility passes and process each work.
 
@@ -490,6 +502,8 @@ def _iterate_and_process(
                 )
                 continue
 
+            pacer.tick()
+
             if config.dry_run:
                 planned = _planned_filenames(work)
                 counters.works_total += 1
@@ -514,6 +528,8 @@ def run_following(
     *,
     progress: Callable[[str], None] = lambda _msg: None,
     clock: Callable[[], str] = _utcnow,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> FollowingRunSummary:
     """Back up the works of every followed user and return a summary.
 
@@ -542,6 +558,10 @@ def run_following(
         progress: Sink for human-readable progress lines; defaults to a no-op.
         clock: Source of the manifest's ``generated_at`` timestamp; injectable
             for deterministic tests.
+        monotonic: Monotonic clock backing the request-pacer; injectable for
+            deterministic pacing tests.
+        sleep: Sleep callable the request-pacer uses to space out processed
+            works; injectable for deterministic pacing tests.
 
     Returns:
         The accumulated :class:`~pixiv_bookmark_backup.core.FollowingRunSummary`.
@@ -555,6 +575,7 @@ def run_following(
     only_set = set(config.only)
     exclude_set = set(config.exclude)
     seen_users: set[str] = set()
+    pacer = RequestPacer(config.time_per_request, monotonic, sleep)
 
     try:
         _iterate_following(
@@ -568,6 +589,7 @@ def run_following(
             works,
             errors,
             progress,
+            pacer,
         )
     except ApiError as err:
         if counters.works_total == 0:
@@ -599,6 +621,7 @@ def _iterate_following(
     works: list[Any],
     errors: list[dict[str, Any]],
     progress: Callable[[str], None],
+    pacer: RequestPacer,
 ) -> None:
     """Iterate followed users across the follow passes and process each.
 
@@ -635,7 +658,7 @@ def _iterate_following(
             progress(f"user {uid} ({user.name})")
 
             if _process_following_user(
-                config, client, uid, counters, works, errors, progress
+                config, client, uid, counters, works, errors, progress, pacer
             ):
                 return
 
@@ -648,6 +671,7 @@ def _process_following_user(
     works: list[Any],
     errors: list[dict[str, Any]],
     progress: Callable[[str], None],
+    pacer: RequestPacer,
 ) -> bool:
     """Back up one followed user's works; return whether to stop the whole run.
 
@@ -688,6 +712,8 @@ def _process_following_user(
                     }
                 )
                 continue
+
+            pacer.tick()
 
             if config.dry_run:
                 planned = _planned_filenames(work)

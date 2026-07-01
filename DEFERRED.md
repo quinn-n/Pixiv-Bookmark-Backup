@@ -43,3 +43,29 @@ and the `--follows` / `--visibility` click options already use. Switching to
 consistent. Left as-is originally on the argument that follow-visibility is a
 conceptually distinct axis from bookmark-visibility; revisit if the values ever
 need to diverge.
+
+## Entry point
+
+### 4. `python -m pixiv_bookmark_backup` bypasses the click group
+*Source: cli-tester (during the `--time-per-request` feature). Pre-existing bug, unrelated to that feature. Behavior fix.*
+
+`pixiv_bookmark_backup/__main__.py` does `from .cli import backup` / `backup()`,
+so running `python -m pixiv_bookmark_backup ...` always invokes the standalone
+`backup` command instead of the `cli` group. Any subcommand name typed after the
+module (e.g. `backup-following`, `login`) is silently swallowed as `backup`'s
+optional `USER_ID` positional — so `python -m pixiv_bookmark_backup backup-following`
+tries to back up a user literally named `backup-following`, and `login` is
+unreachable this way. Confirmed repro:
+
+    pixi run python -m pixiv_bookmark_backup backup-following --dry-run --json \
+        --refresh-token x
+    # -> "Would back up public bookmarks for user backup-following into backup"
+
+The installed console script (`pixiv-bookmark-backup`, entry point
+`pixiv_bookmark_backup.cli:cli` in `pyproject.toml`) is unaffected — it correctly
+dispatches to the group.
+
+Fix: change `__main__.py` to `from .cli import cli` / `cli()` so the module
+invocation matches the console script. Add a regression test invoking
+`python -m pixiv_bookmark_backup backup-following --help` (or via `runpy`) and
+asserting the subcommand dispatches rather than binding to `USER_ID`.

@@ -1091,3 +1091,324 @@ def test_symlink_traversal_escape_is_skipped_end_to_end(
     assert not (links / "escape.jpg").exists()
     if links.exists():
         assert list(links.iterdir()) == []
+
+
+# -- --layout -----------------------------------------------------------
+#
+# by-author nests each link under "<account>_<author_id>/"; titled prefixes the
+# link name with the sanitized work title. The linkable fixture's authors are
+# Alice (account "alice_art", id 1) and Bob (account "bob_draws", id 2), so the
+# by-author subdirectories are "alice_art_1" and "bob_draws_2".
+
+
+def test_layout_help_shows_choices_and_default(runner: CliRunner) -> None:
+    result = runner.invoke(cli, ["search", "--help"])
+    assert result.exit_code == 0
+    out = result.output
+    assert "--layout" in out
+    assert "[flat|by-author|titled]" in out
+    assert "[default: flat]" in out
+
+
+def test_layout_by_author_nests_under_author_subdirs(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    backup = _write_linkable(tmp_path / "backup")
+    links = tmp_path / "links"
+    result = runner.invoke(
+        cli,
+        [
+            "search",
+            "touhou",
+            "-i",
+            str(backup),
+            "--symlink-dir",
+            str(links),
+            "--layout",
+            "by-author",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    # Works 101 and 202 are both Alice's (account alice_art, id 1): one subdir.
+    for basename in ("101_p0.png", "202_p0.png"):
+        link = links / "alice_art_1" / basename
+        assert link.is_symlink()
+        assert link.resolve() == (backup / basename).resolve()
+    # A single per-author directory holds both of Alice's links.
+    assert sorted(p.name for p in (links / "alice_art_1").iterdir()) == [
+        "101_p0.png",
+        "202_p0.png",
+    ]
+    assert "(layout: by-author)" in result.stderr
+
+
+def test_layout_by_author_multiple_authors_get_own_subdir(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    # Browse mode (no keyword) links every work, so both authors appear.
+    backup = _write_linkable(tmp_path / "backup")
+    links = tmp_path / "links"
+    result = runner.invoke(
+        cli,
+        [
+            "search",
+            "-i",
+            str(backup),
+            "--symlink-dir",
+            str(links),
+            "--layout",
+            "by-author",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert (links / "alice_art_1" / "101_p0.png").is_symlink()
+    assert (links / "alice_art_1" / "202_p0.png").is_symlink()
+    assert (links / "bob_draws_2" / "303_p0.png").is_symlink()
+    assert sorted(p.name for p in links.iterdir()) == ["alice_art_1", "bob_draws_2"]
+
+
+def test_layout_titled_prefixes_link_name(runner: CliRunner, tmp_path: Path) -> None:
+    backup = _write_linkable(tmp_path / "backup")
+    links = tmp_path / "links"
+    result = runner.invoke(
+        cli,
+        [
+            "search",
+            "touhou",
+            "-i",
+            str(backup),
+            "--symlink-dir",
+            str(links),
+            "--layout",
+            "titled",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    # Work 101 is titled "Sunrise" -> "Sunrise_101_p0.png"; 202 -> "Moonlight_...".
+    for title, basename in [("Sunrise", "101_p0.png"), ("Moonlight", "202_p0.png")]:
+        link = links / f"{title}_{basename}"
+        assert link.is_symlink()
+        assert link.resolve() == (backup / basename).resolve()
+    # Titled stays flat: no subdirectories are created.
+    assert all(p.is_symlink() for p in links.iterdir())
+    assert "(layout: titled)" in result.stderr
+
+
+@pytest.mark.parametrize("layout_args", [[], ["--layout", "flat"]])
+def test_layout_flat_is_byte_identical(
+    runner: CliRunner, tmp_path: Path, layout_args: list[str]
+) -> None:
+    # Both the omitted layout and an explicit --layout flat produce bare
+    # basenames directly under the link dir, with no (layout: ...) suffix.
+    backup = _write_linkable(tmp_path / "backup")
+    links = tmp_path / "links"
+    result = runner.invoke(
+        cli,
+        ["search", "touhou", "-i", str(backup), "--symlink-dir", str(links)]
+        + layout_args,
+    )
+    assert result.exit_code == 0, result.output
+    for basename in ("101_p0.png", "202_p0.png"):
+        link = links / basename
+        assert link.is_symlink()
+        assert link.resolve() == (backup / basename).resolve()
+    # No nested directories under flat.
+    assert all(p.is_symlink() for p in links.iterdir())
+    assert "Linked 2 files (2 new, 0 reused) for 2 works into" in result.stderr
+    assert "(layout:" not in result.stderr  # flat output stays suffix-free
+
+
+@pytest.mark.parametrize("layout", ["flat", "by-author", "titled"])
+def test_layout_requires_symlink_dir(
+    runner: CliRunner, tmp_path: Path, layout: str
+) -> None:
+    # Even an explicit --layout flat (which still sources as COMMANDLINE) errors
+    # without --symlink-dir, mirroring the page-flag guard exactly.
+    backup = _write_linkable(tmp_path / "backup")
+    result = runner.invoke(
+        cli, ["search", "touhou", "-i", str(backup), "--layout", layout]
+    )
+    assert result.exit_code == 2
+    assert "--layout requires --symlink-dir" in result.stderr
+    assert result.stdout == ""
+
+
+def test_layout_by_author_json_reports_nested_names(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    backup = _write_linkable(tmp_path / "backup")
+    links = tmp_path / "links"
+    result = runner.invoke(
+        cli,
+        [
+            "search",
+            "touhou",
+            "-i",
+            str(backup),
+            "--symlink-dir",
+            str(links),
+            "--layout",
+            "by-author",
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["schema"] == 1  # unchanged by the layout addition
+    sym = payload["symlink"]
+    assert sym["layout"] == "by-author"
+    # linked entries are link-dir-relative and NESTED under the author subdir.
+    names = sorted(pair[0] for pair in sym["linked"])
+    assert names == ["alice_art_1/101_p0.png", "alice_art_1/202_p0.png"]
+    for name, target in sym["linked"]:
+        basename = Path(name).name
+        assert target == str((backup / basename).resolve())
+
+
+def test_layout_flat_json_names_stay_bare(runner: CliRunner, tmp_path: Path) -> None:
+    # Back-compat: with flat (explicit or default) the linked names are bare.
+    backup = _write_linkable(tmp_path / "backup")
+    links = tmp_path / "links"
+    result = runner.invoke(
+        cli,
+        ["search", "touhou", "-i", str(backup), "--symlink-dir", str(links), "--json"],
+    )
+    assert result.exit_code == 0, result.output
+    sym = json.loads(result.stdout)["symlink"]
+    assert sym["layout"] == "flat"
+    assert sorted(pair[0] for pair in sym["linked"]) == ["101_p0.png", "202_p0.png"]
+
+
+def test_layout_titled_dry_run_reports_without_writing(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    backup = _write_linkable(tmp_path / "backup")
+    links = tmp_path / "links"
+    result = runner.invoke(
+        cli,
+        [
+            "search",
+            "touhou",
+            "-i",
+            str(backup),
+            "--symlink-dir",
+            str(links),
+            "--layout",
+            "titled",
+            "--dry-run",
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert not links.exists()  # dry-run writes nothing
+    sym = json.loads(result.stdout)["symlink"]
+    assert sym["layout"] == "titled"
+    assert sym["dry_run"] is True
+    # Names still reflect the titled layout even though nothing was written.
+    assert sorted(pair[0] for pair in sym["linked"]) == [
+        "Moonlight_202_p0.png",
+        "Sunrise_101_p0.png",
+    ]
+
+
+def test_layout_by_author_dry_run_summary_reports_layout(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    backup = _write_linkable(tmp_path / "backup")
+    links = tmp_path / "links"
+    result = runner.invoke(
+        cli,
+        [
+            "search",
+            "touhou",
+            "-i",
+            str(backup),
+            "--symlink-dir",
+            str(links),
+            "--layout",
+            "by-author",
+            "--dry-run",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert not links.exists()  # dry-run creates no subdirs or links
+    assert "Would link 2 files (2 new, 0 reused) for 2 works into" in result.stderr
+    assert "(layout: by-author)" in result.stderr
+
+
+def test_layout_by_author_first_page_only(runner: CliRunner, tmp_path: Path) -> None:
+    backup = _write_linkable(tmp_path / "backup", _multipage_manifest())
+    links = tmp_path / "links"
+    result = runner.invoke(
+        cli,
+        [
+            "search",
+            "touhou",
+            "-i",
+            str(backup),
+            "--symlink-dir",
+            str(links),
+            "--layout",
+            "by-author",
+            "--first-page-only",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    # Only the first page is linked, under the author subdir.
+    assert (links / "alice_art_1" / "101_p0.png").is_symlink()
+    assert not (links / "alice_art_1" / "101_p1.png").exists()
+    assert "Linked 1 file (1 new, 0 reused) for 1 work into" in result.stderr
+    assert "(layout: by-author)" in result.stderr
+
+
+def test_layout_suffix_precedes_skipped_clause(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    # A non-flat layout with a skipped (no-local-file) work interleaves the two
+    # parentheticals as "... into <dir> (layout: by-author) (1 work skipped...)".
+    data = _manifest_with_a_missing_file()
+    backup = _write_manifest(tmp_path / "backup", data)
+    (backup / "101_p0.png").write_bytes(b"fake-image-bytes")  # 202's file stays gone
+    links = tmp_path / "links"
+    result = runner.invoke(
+        cli,
+        [
+            "search",
+            "touhou",
+            "-i",
+            str(backup),
+            "--symlink-dir",
+            str(links),
+            "--layout",
+            "by-author",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert (
+        "into "
+        + str(links.resolve())
+        + " (layout: by-author) (1 work skipped: no local file)"
+    ) in result.stderr
+
+
+def test_layout_by_author_with_count(runner: CliRunner, tmp_path: Path) -> None:
+    backup = _write_linkable(tmp_path / "backup")
+    links = tmp_path / "links"
+    result = runner.invoke(
+        cli,
+        [
+            "search",
+            "touhou",
+            "-i",
+            str(backup),
+            "--symlink-dir",
+            str(links),
+            "--layout",
+            "by-author",
+            "--count",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert result.stdout.strip() == "2"  # only the integer on stdout
+    assert (links / "alice_art_1" / "101_p0.png").is_symlink()  # links still made
+    assert "(layout: by-author)" in result.stderr

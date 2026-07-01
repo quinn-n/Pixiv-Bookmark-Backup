@@ -1050,6 +1050,16 @@ def _emit_login_result(
     "(--first-page-only).",
 )
 @click.option(
+    "--layout",
+    type=click.Choice(["flat", "by-author", "titled"]),
+    default="flat",
+    show_default=True,
+    help="With --symlink-dir, how links are named/placed: flat (bare "
+    "<id>_p<n>.<ext>), by-author (per-author subdir <account>_<id>/), or "
+    "titled (<title>_<id>_p<n>.<ext>). Non-flat layouts sanitize Pixiv "
+    "metadata into filesystem-safe names.",
+)
+@click.option(
     "--dry-run",
     is_flag=True,
     help="With --symlink-dir, report what would be linked without creating "
@@ -1100,6 +1110,7 @@ def search(
     limit: int | None,
     symlink_dir: Path | None,
     all_pages: bool,
+    layout: str,
     dry_run: bool,
     force: bool,
     count: bool,
@@ -1142,6 +1153,14 @@ def search(
       pixiv-bookmark-backup search touhou --symlink-dir ./review --first-page-only
 
     \b
+      # Group symlinks into per-author subdirectories
+      pixiv-bookmark-backup search touhou --symlink-dir ./review --layout by-author
+
+    \b
+      # Prefix each link with the work title (metadata is sanitized)
+      pixiv-bookmark-backup search touhou --symlink-dir ./review --layout titled
+
+    \b
       # Require both tags (AND) and match them as whole tags
       pixiv-bookmark-backup search touhou original --match-all --exact
 
@@ -1168,6 +1187,11 @@ def search(
         raise click.UsageError("--dry-run requires --symlink-dir")
     if force and symlink_dir is None:
         raise click.UsageError("--force requires --symlink-dir")
+    if (
+        ctx.get_parameter_source("layout") is click.core.ParameterSource.COMMANDLINE
+        and symlink_dir is None
+    ):
+        raise click.UsageError("--layout requires --symlink-dir")
 
     effective_fields = normalize_fields(field)
     manifest_path = resolve_manifest_path(input_path)
@@ -1211,7 +1235,11 @@ def search(
     link_result: SymlinkResult | None = None
     if symlink_dir is not None:
         symlink_config = SymlinkConfig(
-            dir=symlink_dir, all_pages=all_pages, dry_run=dry_run, force=force
+            dir=symlink_dir,
+            all_pages=all_pages,
+            dry_run=dry_run,
+            force=force,
+            layout=layout,
         )
         try:
             link_result = plan_and_link(emitted, manifest_path, symlink_config)
@@ -1249,7 +1277,9 @@ def _emit_link_summary(link_result: SymlinkResult, verbose: int) -> None:
 
     A single human-readable line reporting how many files were linked -- broken
     down into new / reused (and replaced under ``--force``) so a re-run's reuses
-    are visible -- for how many works and where. Works skipped because they had
+    are visible -- for how many works and where. A non-``"flat"`` ``layout`` is
+    reported as a ``(layout: ...)`` suffix right after the directory (flat output
+    stays byte-identical to before the feature). Works skipped because they had
     no local file are appended in parentheses. Under ``-v`` each skipped work id
     is echoed; under ``-vv`` each ``link_name -> target`` pair is echoed as well,
     mirroring the command's existing verbose diagnostics.
@@ -1263,6 +1293,11 @@ def _emit_link_summary(link_result: SymlinkResult, verbose: int) -> None:
         f"{verb} {_plural(link_result.links_total, 'file')} ({breakdown}) for "
         f"{_plural(link_result.works_linked, 'work')} into {link_result.dir}"
     )
+    # Report a non-flat layout right after the directory; flat stays byte-
+    # identical to the pre-layout summary (no suffix), so existing consumers
+    # and tests see no change.
+    if link_result.layout != "flat":
+        summary += f" (layout: {link_result.layout})"
     if link_result.works_without_files:
         summary += (
             f" ({_plural(link_result.works_without_files, 'work')} "
@@ -1293,10 +1328,13 @@ def _emit_search_result(
     ``emitted`` slice actually shown to the user.
 
     When ``symlink`` is given (a ``--symlink-dir`` run), a top-level ``"symlink"``
-    key carrying the run's directory, flags, and per-category link tallies is
-    added to the payload. It is absent entirely otherwise, so ``JSON_SEARCH_SCHEMA``
-    stays ``1`` (the default output is byte-identical to before this feature; the
-    sub-object appears only with ``--symlink-dir``).
+    key carrying the run's directory, flags (including the ``"layout"``), and
+    per-category link tallies is added to the payload; its ``"linked"`` entries
+    are link-dir-relative POSIX names (nested ``subdir/basename`` under the
+    ``"by-author"`` layout, bare basenames otherwise). It is absent entirely
+    otherwise, so ``JSON_SEARCH_SCHEMA`` stays ``1`` (the default output is
+    byte-identical to before this feature; the sub-object appears only with
+    ``--symlink-dir``).
     """
 
     payload = {
@@ -1342,6 +1380,7 @@ def _emit_search_result(
             "all_pages": symlink.all_pages,
             "dry_run": symlink.dry_run,
             "force": symlink.force,
+            "layout": symlink.layout,
             "links_created": symlink.links_created,
             "links_reused": symlink.links_reused,
             "links_replaced": symlink.links_replaced,

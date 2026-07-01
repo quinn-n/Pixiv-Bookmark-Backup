@@ -73,23 +73,15 @@ the planner rather than fixing inline.
 
 ## `search` command
 
-### 5. Add a `--layout` option for `search --symlink-dir`
-*Source: design of the `--symlink-dir` feature (deferred to keep v1 scope tight). Additive.*
+### 5. Add a `--layout` option for `search --symlink-dir` — DONE
 
-`search --symlink-dir` v1 names each symlink with the image's own flat, unique
-basename (`<id>_p<n>.<ext>`) — no metadata sanitization needed, idempotent, safe.
-A later `--layout {flat|by-author|titled}` option could make the browse directory
-friendlier:
-
-- `by-author` — group links into per-author subdirectories.
-- `titled` — prefix link names with the work title.
-
-Both non-flat layouts require sanitizing untrusted Pixiv metadata before it hits
-the filesystem: strip ASCII control chars (reuse `naming._strip_control` /
-`core`'s control-stripping) **and** path separators, cap component length for
-filesystem limits, and resolve duplicate names deterministically. Keep the flat
-layout as the default. Because it introduces metadata-on-disk naming, run it
-through the normal design → plan → security-review pipeline rather than inline.
+Implemented: `search --symlink-dir --layout {flat|by-author|titled}` (default
+`flat`). `by-author` groups links into per-author subdirs `<account>_<id>/`;
+`titled` prefixes link names with the sanitized work title. Untrusted metadata is
+sanitized in `naming.sanitize_component`/`author_dir_name`/`titled_link_name`/
+`safe_basename` (control chars stripped, separators/`.`/`..`/empty neutralized,
+byte-capped on a codepoint boundary), with a parent-dir containment backstop in
+`linking.plan_and_link`. Kept here for history.
 
 ### 6. Handle cross-work link-name collisions in `search --symlink-dir`
 *Source: quality/security review of the `--symlink-dir` feature (noted, out of scope). Robustness.*
@@ -106,6 +98,22 @@ name, the second would be misclassified as a conflict/replace of the first rathe
 than a distinct image. Only worth addressing if/when naming stops guaranteeing
 uniqueness: options are a deterministic de-dup suffix, or per-work subdirectories.
 No action needed while the flat ID-prefixed scheme is the only one.
+
+### 8. Surface a clean error for a structurally malformed manifest in `--layout by-author`
+*Source: security review of the `--layout` feature (out of scope, robustness/UX not security). Low priority.*
+
+`naming.author_dir_name` reads `work.author["id"]` by direct subscript (matching
+the `data["..."]` convention throughout `manifest.py`'s `from_dict` methods). A
+`details.json` missing the `author.id` key therefore raises a raw `KeyError` →
+unhandled traceback and a non-zero exit, rather than a clean `SymlinkError`/
+`ManifestLoadError` with a teaching message. This is a robustness/UX gap, not a
+security hole (a missing required field crashes loudly; it never yields an unsafe
+path or data loss), and it only arises from a hand-edited/corrupted manifest.
+Fix by validating required author fields at manifest-load time, or mapping the
+`KeyError` to a teaching error at the `--symlink-dir` call site. Note the strict
+loader `load_manifest_strict` does **not** catch this: `WorkEntry.from_dict`
+copies the `author` dict wholesale without reading `author["id"]`, so a manifest
+missing that key loads cleanly and only crashes later, at link time.
 
 ## Tooling
 

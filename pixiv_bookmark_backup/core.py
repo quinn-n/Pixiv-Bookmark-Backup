@@ -15,6 +15,7 @@ from attrs import field, frozen
 from attrs.validators import ge, in_, instance_of, le, optional
 
 from pixiv_bookmark_backup.manifest import WorkEntry
+from pixiv_bookmark_backup.naming import strip_control
 
 #: Bookmark visibilities the tool understands.
 VISIBILITIES = ("public", "private", "all")
@@ -512,24 +513,6 @@ def run_search(
     return matches, len(works)
 
 
-#: Translation table dropping ASCII control characters (C0 range ``\x00``-``\x1f``
-#: and DEL ``\x7f``). These fields come from arbitrary Pixiv metadata, so ANSI
-#: escape / control bytes could otherwise manipulate the user's terminal.
-_CONTROL_CHARS = {code: None for code in range(0x20)} | {0x7F: None}
-
-
-def _strip_control(text: str) -> str:
-    """Return ``text`` with ASCII control characters removed.
-
-    Drops the C0 range (``\\x00``-``\\x1f``) and DEL (``\\x7f``) so untrusted
-    title/author/tag metadata cannot inject terminal escape sequences into the
-    human-readable output. Printable text (including any residue left after an
-    escape byte is stripped) is preserved.
-    """
-
-    return text.translate(_CONTROL_CHARS)
-
-
 def format_work_line(match: SearchMatch) -> str:
     """Return a one-line, human-readable summary of a matched work.
 
@@ -538,7 +521,8 @@ def format_work_line(match: SearchMatch) -> str:
     (``(none)`` when the work has no tags).
 
     Untrusted text fields (title, author name/account, tag names) are stripped
-    of ASCII control characters via :func:`_strip_control` before interpolation
+    of ASCII control characters via
+    :func:`~pixiv_bookmark_backup.naming.strip_control` before interpolation
     so hostile metadata cannot manipulate the terminal. Blank fields render
     identifiable placeholders: an empty title becomes ``"(untitled)"``, and a
     work whose author name *and* account are both empty renders
@@ -547,12 +531,12 @@ def format_work_line(match: SearchMatch) -> str:
 
     work = match.work
     rating = "NSFW" if bool(work.nsfw.get("is_nsfw")) else "SFW"
-    names = [_strip_control(tag["name"]) for tag in work.work_tags]
+    names = [strip_control(tag["name"]) for tag in work.work_tags]
     tags = ", ".join(names) if names else "(none)"
 
-    title = _strip_control(work.title).strip() or "(untitled)"
-    name = _strip_control(str(work.author.get("name", ""))).strip()
-    account = _strip_control(str(work.author.get("account", ""))).strip()
+    title = strip_control(work.title).strip() or "(untitled)"
+    name = strip_control(str(work.author.get("name", ""))).strip()
+    account = strip_control(str(work.author.get("account", ""))).strip()
     if not name and not account:
         author = f"(unknown, id {work.author['id']})"
     else:

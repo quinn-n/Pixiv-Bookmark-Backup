@@ -13,7 +13,7 @@ files are byte-stable.
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -44,6 +44,8 @@ from pixiv_bookmark_backup.pixiv_client import (
     PixivClient,
 )
 from pixiv_bookmark_backup.ugoira import UgoiraResult
+
+from conftest import ScriptedMonotonic, SpySleep
 
 FIXED_CLOCK = "2026-06-24T00:00:00+00:00"
 SELF_ID = "555"
@@ -258,6 +260,268 @@ def _read_manifest(output_dir: Path) -> Any:
 
 def _run(config: FollowingConfig, client: FakeFollowingClient) -> FollowingRunSummary:
     return run_following(config, _auth(), client, clock=lambda: FIXED_CLOCK)
+
+
+# -- pacing test infra --------------------------------------------------
+
+
+def _run_paced(
+    config: FollowingConfig,
+    client: FakeFollowingClient,
+    *,
+    monotonic: Callable[[], float],
+    sleep: Callable[[float], None],
+) -> FollowingRunSummary:
+    """Drive ``run_following`` with injected pacing clocks for pacing tests."""
+
+    return run_following(
+        config,
+        _auth(),
+        client,
+        clock=lambda: FIXED_CLOCK,
+        monotonic=monotonic,
+        sleep=sleep,
+    )
+
+
+# -- pacing: zero disables ----------------------------------------------
+
+
+def test_zero_time_per_request_never_sleeps_and_is_identical(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``time_per_request=0`` never sleeps and matches an un-paced run exactly."""
+    _patch_downloads(monkeypatch)
+    following = {"public": [_make_user(10), _make_user(20)]}
+    works = {
+        "10": [_make_work(1, author_id=10, pages=2)],
+        "20": [_make_work(2, author_id=20)],
+    }
+
+    baseline = _run(_config(tmp_path / "base"), FakeFollowingClient(following, works))
+    baseline_manifest = _read_manifest(tmp_path / "base")
+
+    sleep = SpySleep()
+    paced = _run_paced(
+        _config(tmp_path / "paced", time_per_request=0.0),
+        FakeFollowingClient(following, works),
+        monotonic=ScriptedMonotonic([]),  # never read at period 0
+        sleep=sleep,
+    )
+
+    assert sleep.durations == []
+    assert paced == baseline
+    assert _read_manifest(tmp_path / "paced") == baseline_manifest
+
+
+# -- pacing: fires once per processed work, start-to-start --------------
+
+
+def test_pacing_sleeps_start_to_start_once_per_processed_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Three processed works (one user) pace start-to-start; only deficit slept.
+
+    Scripted monotonic (period 0.5):
+      * work 1 tick (first): reads 0.0, no sleep, last_start=0.0.
+      * work 1 took 0.2 -> work 2 tick reads 0.2, remaining 0.3 -> sleep(0.3),
+        re-reads 0.5, last_start=0.5.
+      * work 2 took 0.6 -> work 3 tick reads 1.1, remaining -0.1 -> no sleep.
+    """
+    _patch_downloads(monkeypatch)
+    following = {"public": [_make_user(10)]}
+    works = {
+        "10": [_make_work(wid, author_id=10) for wid in (1, 2, 3)],
+    }
+    monotonic = ScriptedMonotonic([0.0, 0.2, 0.5, 1.1])
+    sleep = SpySleep()
+
+    summary = _run_paced(
+        _config(tmp_path, time_per_request=0.5),
+        FakeFollowingClient(following, works),
+        monotonic=monotonic,
+        sleep=sleep,
+    )
+
+    assert summary.works_total == 3
+    assert sleep.durations == [pytest.approx(0.3)]
+    assert monotonic.calls == 4
+
+
+# -- pacing: filtered / budget-exhausted works do NOT pace (placement guard) --
+
+
+def test_pacing_only_fires_for_processed_works(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Placement regression guard: only actually-processed works pace.
+
+    User 10's listing mixes a ``--since``-excluded work, an unavailable (no
+    pages) work, two processable works, and a per-user-limit-exhausted work;
+    a second user 30 is never reached because ``--max-users=1`` stops the run.
+    Only the two processed works reach ``pacer.tick()``, so exactly one
+    inter-work sleep fires. Moving ``tick()`` above the filters (or dropping it)
+    would change this count -- pinning the tick's placement.
+    """
+    _patch_downloads(monkeypatch)
+    following = {"public": [_make_user(10), _make_user(30)]}
+    works = {
+        "10": [
+            # Dropped by --since: must not pace.
+            _make_work(1, author_id=10, posted_at="2000-01-01T00:00:00+09:00"),
+            _make_work(100, author_id=10),  # processed
+            # Unavailable: illust with no images -> error entry, must not pace.
+            _make_work(2, author_id=10, pages=0),
+            _make_work(200, author_id=10),  # processed
+            # Beyond --per-user-limit=2 (counted after --since): never processed.
+            _make_work(300, author_id=10),
+        ],
+        "30": [_make_work(400, author_id=30)],  # never reached (--max-users=1)
+    }
+    monotonic = ScriptedMonotonic([0.0, 0.0, 0.5])
+    sleep = SpySleep()
+
+    summary = _run_paced(
+        _config(
+            tmp_path,
+            time_per_request=0.5,
+            since=date(2010, 1, 1),
+            per_user_limit=2,
+            max_users=1,
+        ),
+        FakeFollowingClient(following, works),
+        monotonic=monotonic,
+        sleep=sleep,
+    )
+
+    assert summary.works_total == 2
+    manifest = _read_manifest(tmp_path)
+    assert {work["id"] for work in manifest["works"]} == {100, 200}
+    # Exactly (processed - 1) sleeps.
+    assert sleep.durations == [pytest.approx(0.5)]
+
+
+# -- pacing: single pacer instance is continuous across users ----------
+
+
+def test_pacing_is_continuous_across_user_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pacer is one per-run instance, not reset per followed user.
+
+    User 10 has two works, user 20 has one. The gap between user 10's last work
+    and user 20's first work is paced like any other inter-work gap: if the
+    pacer reset per user, that first work of user 20 would be treated as a
+    "first tick" and skip its sleep. Scripted monotonic (period 0.5):
+      * 10/w1 (first): reads 0.0, no sleep, last_start=0.0.
+      * 10/w2: reads 0.2, remaining 0.3 -> sleep(0.3), re-reads 0.5.
+      * 20/w1: reads 0.6, remaining 0.4 -> sleep(0.4), re-reads 1.0.
+    Two sleeps, the second spanning the user boundary -> no per-user reset.
+    """
+    _patch_downloads(monkeypatch)
+    following = {"public": [_make_user(10), _make_user(20)]}
+    works = {
+        "10": [_make_work(1, author_id=10), _make_work(2, author_id=10)],
+        "20": [_make_work(3, author_id=20)],
+    }
+    monotonic = ScriptedMonotonic([0.0, 0.2, 0.5, 0.6, 1.0])
+    sleep = SpySleep()
+
+    summary = _run_paced(
+        _config(tmp_path, time_per_request=0.5),
+        FakeFollowingClient(following, works),
+        monotonic=monotonic,
+        sleep=sleep,
+    )
+
+    assert summary.works_total == 3
+    # The second sleep spans the user boundary: the pacer did not reset.
+    assert sleep.durations == [pytest.approx(0.3), pytest.approx(0.4)]
+
+
+# -- pacing: dry-run still paces ----------------------------------------
+
+
+def test_dry_run_still_paces(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """dry-run accounts for works and still paces them, writing no manifest."""
+    _patch_downloads(monkeypatch)
+    following = {"public": [_make_user(10)]}
+    works = {"10": [_make_work(1, author_id=10), _make_work(2, author_id=10)]}
+    monotonic = ScriptedMonotonic([0.0, 0.0, 0.5])
+    sleep = SpySleep()
+
+    summary = _run_paced(
+        _config(tmp_path, dry_run=True, time_per_request=0.5),
+        FakeFollowingClient(following, works),
+        monotonic=monotonic,
+        sleep=sleep,
+    )
+
+    assert summary.works_total == 2
+    assert sleep.durations == [pytest.approx(0.5)]
+    assert not (tmp_path / "details.json").exists()
+
+
+# -- pacing: metadata-only still paces ----------------------------------
+
+
+def test_metadata_only_still_paces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """metadata-only records entries without downloading yet still paces works.
+
+    One work returns a SKIPPED image outcome (skip-existing) to show that a
+    work whose files are not freshly downloaded still counts as processed and
+    is paced.
+    """
+    _patch_downloads(
+        monkeypatch,
+        image_result=ImageResult(ImageStatus.SKIPPED, 10, None),
+    )
+    following = {"public": [_make_user(10)]}
+    works = {"10": [_make_work(1, author_id=10), _make_work(2, author_id=10)]}
+    monotonic = ScriptedMonotonic([0.0, 0.0, 0.5])
+    sleep = SpySleep()
+
+    summary = _run_paced(
+        _config(tmp_path, metadata_only=True, time_per_request=0.5),
+        FakeFollowingClient(following, works),
+        monotonic=monotonic,
+        sleep=sleep,
+    )
+
+    assert summary.works_total == 2
+    assert sleep.durations == [pytest.approx(0.5)]
+
+
+# -- pacing: KeyboardInterrupt during sleep flushes partial + reraises ---
+
+
+def test_keyboard_interrupt_during_sleep_flushes_partial_and_reraises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Ctrl-C landing inside the pacer's sleep still flushes and re-raises.
+
+    The spy sleep raises ``KeyboardInterrupt`` on its first call (the pace
+    before the second work). ``run_following`` must re-raise it and still flush
+    the partial manifest holding the first processed work -- exit-130 semantics.
+    """
+    _patch_downloads(monkeypatch)
+    following = {"public": [_make_user(10)]}
+    works = {"10": [_make_work(1, author_id=10), _make_work(2, author_id=10)]}
+    monotonic = ScriptedMonotonic([0.0, 0.0])
+    sleep = SpySleep(raise_on_first=True)
+
+    with pytest.raises(KeyboardInterrupt):
+        _run_paced(
+            _config(tmp_path, time_per_request=0.5),
+            FakeFollowingClient(following, works),
+            monotonic=monotonic,
+            sleep=sleep,
+        )
+
+    manifest = _read_manifest(tmp_path)
+    assert {work["id"] for work in manifest["works"]} == {1}
 
 
 # -- success / layout ---------------------------------------------------

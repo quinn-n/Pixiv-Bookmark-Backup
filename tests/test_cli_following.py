@@ -526,6 +526,100 @@ def test_partial_exit_6(
     assert "1 failed" in result.stdout
 
 
+# -- --time-per-request -------------------------------------------------
+
+
+def test_time_per_request_help_lists_option_and_default(runner: CliRunner) -> None:
+    result = runner.invoke(cli, ["backup-following", "--help"])
+    assert result.exit_code == 0
+    out = result.output
+    assert "--time-per-request" in out
+    assert "SECONDS" in out
+    # click renders "[default: 0.0; x>=0]"; match the safe substring.
+    assert "default: 0.0" in out
+
+
+def test_time_per_request_negative_is_exit_2(runner: CliRunner, tmp_path: Path) -> None:
+    # click's FloatRange rejects the value before the command body runs.
+    result = runner.invoke(
+        cli,
+        [
+            "backup-following",
+            "--time-per-request",
+            "-1",
+            "--config",
+            _missing_config(tmp_path),
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 2
+    assert "range" in result.stderr
+
+
+def test_time_per_request_fractional_reaches_config(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, Any] = {}
+    _install_run_following(monkeypatch, captured=captured)
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup-following",
+            "--time-per-request",
+            "0.5",
+            "--config",
+            _missing_config(tmp_path),
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["config"].time_per_request == 0.5
+
+
+def test_time_per_request_defaults_to_zero_in_config(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, Any] = {}
+    _install_run_following(monkeypatch, captured=captured)
+
+    result = runner.invoke(
+        cli,
+        ["backup-following", "--config", _missing_config(tmp_path)],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["config"].time_per_request == 0.0
+
+
+def test_time_per_request_absent_from_json_payload(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_run_following(monkeypatch)
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup-following",
+            "--json",
+            "--time-per-request",
+            "0",
+            "--config",
+            _missing_config(tmp_path),
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    # The summary schema is unchanged: the pacing knob is not a JSON field.
+    assert payload["schema"] == 1
+    assert "time_per_request" not in payload
+
+
 # -- security warning ---------------------------------------------------
 
 

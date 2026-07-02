@@ -6,12 +6,14 @@ Pure, testable functions and value objects live here; the click layer in
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from datetime import date, datetime
 from enum import IntEnum
 from pathlib import Path
 from typing import NamedTuple, Protocol
 
-from attrs import field, frozen
+from attrs import define, field, frozen
 from attrs.validators import ge, in_, instance_of, le, optional
 
 from pixiv_bookmark_backup.manifest import WorkEntry
@@ -74,6 +76,7 @@ class BackupConfig:
     verbosity: int = field(default=0, validator=instance_of(int))
     quiet: bool = field(default=False, validator=instance_of(bool))
     max_retries: int = field(default=3, validator=[instance_of(int), ge(0), le(10)])
+    time_per_request: float = field(default=0.0, converter=float, validator=ge(0))
 
 
 @frozen
@@ -121,6 +124,7 @@ class FollowingConfig:
     verbosity: int = field(default=0, validator=instance_of(int))
     quiet: bool = field(default=False, validator=instance_of(bool))
     max_retries: int = field(default=3, validator=[instance_of(int), ge(0), le(10)])
+    time_per_request: float = field(default=0.0, converter=float, validator=ge(0))
     per_user_limit: int | None = field(
         default=None, validator=optional([instance_of(int), ge(1)])
     )
@@ -208,6 +212,44 @@ class _ExitDecidable(Protocol):
 
     @property
     def files_failed(self) -> int: ...
+
+
+@define
+class RequestPacer:
+    """Enforce a minimum start-to-start interval between processed works.
+
+    Client-side rate limiter for Pixiv: constructed once per run from
+    ``config.time_per_request`` and ``tick()``-ed at the top of each processed
+    work. Measures wall-clock elapsed since the previous work *started* and
+    sleeps only the remainder of ``period`` (never a negative amount), so a
+    work that already took ``>= period`` incurs no delay. ``period == 0``
+    disables it (``tick()`` is a strict no-op -- no clock reads, no sleeps),
+    preserving un-paced behavior byte-for-byte.
+
+    ``monotonic`` and ``sleep`` are injectable (defaulting to the stdlib
+    real-time sources) so tests can drive pacing deterministically and offline.
+    A ``KeyboardInterrupt`` raised by ``sleep`` propagates untouched, so the
+    orchestrator's interrupt handling (flush partial manifest, exit 130) still
+    holds.
+    """
+
+    period: float = field(converter=float, validator=ge(0))
+    monotonic: Callable[[], float] = time.monotonic
+    sleep: Callable[[float], None] = time.sleep
+    _last_start: float | None = field(default=None, init=False)
+
+    def tick(self) -> None:
+        """Pace one processed work: sleep the remainder of ``period``, if any."""
+
+        if self.period == 0:
+            return
+        now = self.monotonic()
+        if self._last_start is not None:
+            remaining = self.period - (now - self._last_start)
+            if remaining > 0:
+                self.sleep(remaining)
+                now = self.monotonic()
+        self._last_start = now
 
 
 def decide_exit_code(summary: _ExitDecidable) -> ExitCode:

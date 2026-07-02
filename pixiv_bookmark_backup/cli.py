@@ -223,6 +223,19 @@ def cli() -> None:
     help="Number of retries per image after the first attempt fails.",
 )
 @click.option(
+    "--time-per-request",
+    type=click.FloatRange(min=0),
+    default=0.0,
+    show_default=True,
+    metavar="SECONDS",
+    help=(
+        "Client-side rate limit: minimum seconds from one work to the next, "
+        "measured start-to-start (a work is one post and its images, not a "
+        "single HTTP request). A work that already took longer is not "
+        "delayed. Default 0 disables pacing."
+    ),
+)
+@click.option(
     "--dry-run",
     is_flag=True,
     help="Print what would be backed up without downloading or writing anything.",
@@ -243,6 +256,7 @@ def backup(
     quiet: bool,
     verbose: int,
     max_retries: int,
+    time_per_request: float,
     dry_run: bool,
 ) -> None:
     """Back up Pixiv bookmarks for USER_ID (defaults to your own account).
@@ -320,6 +334,7 @@ def backup(
         verbosity=verbose,
         quiet=quiet,
         max_retries=max_retries,
+        time_per_request=time_per_request,
     )
 
     def progress(message: str) -> None:
@@ -503,6 +518,19 @@ def _emit_summary(
     help="Number of retries per image after the first attempt fails.",
 )
 @click.option(
+    "--time-per-request",
+    type=click.FloatRange(min=0),
+    default=0.0,
+    show_default=True,
+    metavar="SECONDS",
+    help=(
+        "Client-side rate limit: minimum seconds from one work to the next, "
+        "measured start-to-start (a work is one post and its images, not a "
+        "single HTTP request). A work that already took longer is not "
+        "delayed. Default 0 disables pacing."
+    ),
+)
+@click.option(
     "--dry-run",
     is_flag=True,
     help="Print what would be backed up without downloading or writing anything.",
@@ -526,6 +554,7 @@ def backup_following(
     quiet: bool,
     verbose: int,
     max_retries: int,
+    time_per_request: float,
     dry_run: bool,
 ) -> None:
     """Back up works from the Pixiv users you follow.
@@ -611,6 +640,7 @@ def backup_following(
         verbosity=verbose,
         quiet=quiet,
         max_retries=max_retries,
+        time_per_request=time_per_request,
     )
 
     def progress(message: str) -> None:

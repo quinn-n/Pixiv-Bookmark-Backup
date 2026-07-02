@@ -44,9 +44,35 @@ consistent. Left as-is originally on the argument that follow-visibility is a
 conceptually distinct axis from bookmark-visibility; revisit if the values ever
 need to diverge.
 
+## Entry point
+
+### 4. `python -m pixiv_bookmark_backup` bypasses the click group
+*Source: cli-tester (during the `--time-per-request` feature). Pre-existing bug, unrelated to that feature. Behavior fix.*
+
+`pixiv_bookmark_backup/__main__.py` does `from .cli import backup` / `backup()`,
+so running `python -m pixiv_bookmark_backup ...` always invokes the standalone
+`backup` command instead of the `cli` group. Any subcommand name typed after the
+module (e.g. `backup-following`, `login`) is silently swallowed as `backup`'s
+optional `USER_ID` positional — so `python -m pixiv_bookmark_backup backup-following`
+tries to back up a user literally named `backup-following`, and `login` is
+unreachable this way. Confirmed repro:
+
+    pixi run python -m pixiv_bookmark_backup backup-following --dry-run --json \
+        --refresh-token x
+    # -> "Would back up public bookmarks for user backup-following into backup"
+
+The installed console script (`pixiv-bookmark-backup`, entry point
+`pixiv_bookmark_backup.cli:cli` in `pyproject.toml`) is unaffected — it correctly
+dispatches to the group.
+
+Fix: change `__main__.py` to `from .cli import cli` / `cli()` so the module
+invocation matches the console script. Add a regression test invoking
+`python -m pixiv_bookmark_backup backup-following --help` (or via `runpy`) and
+asserting the subcommand dispatches rather than binding to `USER_ID`.
+
 ## Manifest loading
 
-### 4. Harden `load_or_init` against a corrupt or deeply-nested manifest
+### 5. Harden `load_or_init` against a corrupt or deeply-nested manifest
 *Source: security review of the `search` feature (out of scope there). Behavior change.*
 
 `load_or_init` in `manifest.py` (the resume-oriented loader used by `backup` /
@@ -73,7 +99,7 @@ the planner rather than fixing inline.
 
 ## `search` command
 
-### 5. Add a `--layout` option for `search --symlink-dir` — DONE
+### 6. Add a `--layout` option for `search --symlink-dir` — DONE
 
 Implemented: `search --symlink-dir --layout {flat|by-author|titled}` (default
 `flat`). `by-author` groups links into per-author subdirs `<account>_<id>/`;
@@ -83,7 +109,7 @@ sanitized in `naming.sanitize_component`/`author_dir_name`/`titled_link_name`/
 byte-capped on a codepoint boundary), with a parent-dir containment backstop in
 `linking.plan_and_link`. Kept here for history.
 
-### 6. Handle cross-work link-name collisions in `search --symlink-dir`
+### 7. Handle cross-work link-name collisions in `search --symlink-dir`
 *Source: quality/security review of the `--symlink-dir` feature (noted, out of scope). Robustness.*
 
 `plan_and_link` in `linking.py` names each symlink with the image's basename
@@ -92,7 +118,7 @@ resolved target as a conflict (fatal without `--force`, re-pointed with it). Thi
 relies on link names being unique across works — which holds today because the
 backup writer names every image `<id>_p<n>.<ext>` (ID-prefixed, globally unique),
 documented as an assumption in the `plan_and_link` docstring but **not enforced by
-the module**. If a future change (e.g. the `--layout` option in item 5, or a
+the module**. If a future change (e.g. the `--layout` option in item 6, or a
 different backup naming scheme) makes two matched works resolve to the same link
 name, the second would be misclassified as a conflict/replace of the first rather
 than a distinct image. Only worth addressing if/when naming stops guaranteeing
@@ -117,7 +143,7 @@ missing that key loads cleanly and only crashes later, at link time.
 
 ## Tooling
 
-### 7. Fix the `bandit` pixi task and the `pip-audit` environment
+### 9. Fix the `bandit` pixi task and the `pip-audit` environment
 *Source: security review of the `--symlink-dir` feature (environment defects, not code). Infra.*
 
 Two security-tooling gaps surfaced when scanners were run (neither affects any

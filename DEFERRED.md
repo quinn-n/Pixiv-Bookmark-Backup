@@ -43,3 +43,27 @@ and the `--follows` / `--visibility` click options already use. Switching to
 consistent. Left as-is originally on the argument that follow-visibility is a
 conceptually distinct axis from bookmark-visibility; revisit if the values ever
 need to diverge.
+
+## Progress indicator (`backup` / `backup-following`)
+
+### 4. Tighten `ProgressReporter.unit` to `Literal["works", "users"]`
+*Source: final quality review (Nit, cosmetic).*
+
+`ProgressReporter.unit` and the `unit` values computed in `cli.py` are plain
+`str`. Nothing currently constrains them, so Pyright can't catch a typo (e.g.
+`"work"` instead of `"works"`) at the type level. Switching to
+`Literal["works", "users"]` on the field and the call sites would close that
+gap. Low risk, low value — left as plain `str` since the two literal values
+are only ever produced by the two `cli.py` call sites, both already tested.
+
+### 5. Deduplicate reporter construction between `backup` and `backup_following`
+*Source: final quality review (Nit, refactor).*
+
+The block that resolves `stream`/`is_tty`/`ascii_only`, calls
+`_resolve_reporter_mode(...)`, and constructs `ProgressReporter(...)` is
+near-identical (~10 lines) in both `backup()` and `backup_following()` in
+`cli.py`, differing only in how `total`/`unit` are computed. A shared
+`_build_reporter(...)` helper taking the resolved `total`/`unit` would remove
+the duplication. Left inline since each command's `total`/`unit` logic differs
+enough that extracting the whole block felt like premature abstraction for two
+call sites; revisit if a third command needs the same wiring.

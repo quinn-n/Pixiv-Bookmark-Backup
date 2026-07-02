@@ -14,6 +14,7 @@ import datetime
 import json
 import sys
 from pathlib import Path
+from typing import TextIO
 
 import click
 
@@ -38,10 +39,13 @@ from .core import (
     ExitCode,
     FollowingConfig,
     FollowingRunSummary,
+    ProgressEvent,
+    ProgressKind,
     RunSummary,
     decide_exit_code,
 )
 from .pixiv_client import ApiError, AuthRejected, Pixivpy3Client
+from .progress_reporter import ProgressReporter, ReporterMode
 
 #: Version stamped as the first key of the ``--json`` summary object, so a
 #: scripting consumer can detect the payload shape and adapt across releases.
@@ -77,6 +81,59 @@ def _exit_error(message: str, exit_code: int) -> click.ClickException:
     error = click.ClickException(message)
     error.exit_code = exit_code
     return error
+
+
+def _resolve_reporter_mode(
+    *,
+    quiet: bool,
+    verbose: int,
+    dry_run: bool,
+    is_tty: bool,
+) -> tuple[ReporterMode, bool]:
+    """Resolve the progress ``(mode, show_planned)`` for a backup run.
+
+    Kept in the click layer (not in ``progress_reporter``) because it maps
+    user-facing flags and terminal state onto the environment-agnostic
+    reporter. The branch order encodes the precedence: an explicit ``--quiet``
+    or ``--verbose`` always wins over auto-detection; ``--dry-run`` at ``-v0``
+    stays verbose (preserving today's preview behaviour) and is exempt from the
+    bar; only an interactive stderr gets the in-place bar; everything else (a
+    redirected/piped run) falls back to periodic milestone lines.
+
+    ``show_planned`` (whether ``WORK_PLANNED`` "would create" lines print in
+    verbose mode) is only meaningful for the ``VERBOSE`` branches; the other
+    modes ignore it, so ``False`` is returned as a harmless default.
+    """
+
+    if quiet:
+        return ReporterMode.DISABLED, False
+    if verbose >= 1:
+        return ReporterMode.VERBOSE, dry_run or verbose >= 2
+    if dry_run:
+        return ReporterMode.VERBOSE, True
+    if is_tty:
+        return ReporterMode.BAR, False
+    return ReporterMode.MILESTONE, False
+
+
+def _stream_is_ascii_only(stream: TextIO) -> bool:
+    """Report whether ``stream`` cannot render the Unicode spinner glyphs.
+
+    The reporter never sniffs the terminal itself, so the caller decides which
+    spinner frames are safe. A stream with no ``encoding`` (or one whose
+    encoding cannot represent the Braille spinner char) forces the ASCII frames;
+    encoding the probe glyph is the definitive test rather than guessing from
+    the codec name.
+    """
+
+    encoding = getattr(stream, "encoding", None)
+    if not encoding:
+        return True
+    try:
+        "⠋".encode(encoding)
+    except (UnicodeEncodeError, LookupError):
+        return True
+    return False
 
 
 def _parse_since(
@@ -181,13 +238,15 @@ def cli() -> None:
     "--quiet",
     "-q",
     is_flag=True,
-    help="Suppress progress output on stderr (the summary is still printed).",
+    help="Suppress all stderr progress; the final summary line on stdout is "
+    "still printed.",
 )
 @click.option(
     "--verbose",
     "-v",
     count=True,
-    help="Increase progress detail on stderr; repeat for more (-vv).",
+    help="Show per-work lines on stderr instead of the default live summary; "
+    "repeat (-vv) for more.",
 )
 @click.option(
     "--max-retries",
@@ -296,10 +355,6 @@ def backup(
         max_retries=max_retries,
     )
 
-    def progress(message: str) -> None:
-        if not quiet:
-            click.echo(message, err=True)
-
     if not quiet:
         target = "your own" if user_id is None else f"user {user_id}"
         verb = "Would back up" if dry_run else "Backing up"
@@ -308,10 +363,42 @@ def backup(
             err=True,
         )
 
+    # Resolve terminal state at command-invocation time, never at import: under
+    # CliRunner sys.stderr is swapped per invocation, so a call-time lookup is
+    # what sees the active stream. is_tty selects BAR vs MILESTONE; ascii_only
+    # selects the spinner alphabet. --limit is the only determinate denominator
+    # for this command, so it is the bar's total (works).
+    stream = sys.stderr
+    mode, show_planned = _resolve_reporter_mode(
+        quiet=quiet, verbose=verbose, dry_run=dry_run, is_tty=stream.isatty()
+    )
+    reporter = ProgressReporter(
+        stream=stream,
+        mode=mode,
+        show_planned=show_planned,
+        total=limit,
+        unit="works",
+        ascii_only=_stream_is_ascii_only(stream),
+    )
+
     client = Pixivpy3Client()
 
+    # Anchor the bar's elapsed-time baseline at the actual run start (rather than
+    # at reporter construction). No-op in every mode but BAR, where it only
+    # records the start timestamp.
+    reporter.handle(ProgressEvent(kind=ProgressKind.RUN_START))
+
     try:
-        summary = run_backup(run_config, auth, client, progress=progress)
+        try:
+            summary = run_backup(run_config, auth, client, progress=reporter.handle)
+        finally:
+            # finish() lives in this INNER finally so it runs before any outer
+            # except body: on KeyboardInterrupt the dangling bar line is erased
+            # before "interrupted..." prints on its own clean line, and on the
+            # deferred click-exception paths before click prints the error.
+            # finish() is idempotent, so the normal-return path calling it here
+            # (and nowhere else) is safe.
+            reporter.finish()
     except BackupUsageError as exc:
         raise click.UsageError(str(exc)) from exc
     except AuthRejected as exc:
@@ -461,13 +548,15 @@ def _emit_summary(
     "--quiet",
     "-q",
     is_flag=True,
-    help="Suppress progress output on stderr (the summary is still printed).",
+    help="Suppress all stderr progress; the final summary line on stdout is "
+    "still printed.",
 )
 @click.option(
     "--verbose",
     "-v",
     count=True,
-    help="Increase progress detail on stderr; repeat for more (-vv).",
+    help="Show per-work lines on stderr instead of the default live summary; "
+    "repeat (-vv) for more.",
 )
 @click.option(
     "--max-retries",
@@ -587,10 +676,6 @@ def backup_following(
         max_retries=max_retries,
     )
 
-    def progress(message: str) -> None:
-        if not quiet:
-            click.echo(message, err=True)
-
     if not quiet:
         verb = "Would back up" if dry_run else "Backing up"
         click.echo(
@@ -598,10 +683,55 @@ def backup_following(
             err=True,
         )
 
+    # Pick the determinate bar denominator: an explicit total --limit counts
+    # works; otherwise --max-users bounds the run in users; with neither the bar
+    # is indeterminate (spinner + running counts).
+    total: int | None
+    if limit is not None:
+        total = limit
+        unit = "works"
+    elif max_users is not None:
+        total = max_users
+        unit = "users"
+    else:
+        total = None
+        unit = "works"
+
+    # Resolve terminal state at command-invocation time, never at import: under
+    # CliRunner sys.stderr is swapped per invocation, so a call-time lookup is
+    # what sees the active stream. is_tty selects BAR vs MILESTONE; ascii_only
+    # selects the spinner alphabet.
+    stream = sys.stderr
+    mode, show_planned = _resolve_reporter_mode(
+        quiet=quiet, verbose=verbose, dry_run=dry_run, is_tty=stream.isatty()
+    )
+    reporter = ProgressReporter(
+        stream=stream,
+        mode=mode,
+        show_planned=show_planned,
+        total=total,
+        unit=unit,
+        ascii_only=_stream_is_ascii_only(stream),
+    )
+
     client = Pixivpy3Client()
 
+    # Anchor the bar's elapsed-time baseline at the actual run start (rather than
+    # at reporter construction). No-op in every mode but BAR, where it only
+    # records the start timestamp.
+    reporter.handle(ProgressEvent(kind=ProgressKind.RUN_START))
+
     try:
-        summary = run_following(run_config, auth, client, progress=progress)
+        try:
+            summary = run_following(run_config, auth, client, progress=reporter.handle)
+        finally:
+            # finish() lives in this INNER finally so it runs before any outer
+            # except body: on KeyboardInterrupt the dangling bar line is erased
+            # before "interrupted..." prints on its own clean line, and on the
+            # deferred click-exception paths before click prints the error.
+            # finish() is idempotent, so the normal-return path calling it here
+            # (and nowhere else) is safe.
+            reporter.finish()
     except AuthRejected as exc:
         raise _exit_error(str(exc), int(ExitCode.AUTH)) from exc
     except ApiError as exc:

@@ -23,15 +23,16 @@ import os
 import sys
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, TextIO, cast
 
 import pytest
-from click.testing import CliRunner
+from click.testing import CliRunner, _NamedTextIOWrapper
 
 from pixiv_bookmark_backup import __version__, cli as cli_module
 from pixiv_bookmark_backup.backup import BackupUsageError
 from pixiv_bookmark_backup.cli import cli
-from pixiv_bookmark_backup.core import RunSummary
+from pixiv_bookmark_backup.core import ProgressEvent, ProgressKind, RunSummary
 from pixiv_bookmark_backup.models import (
     Author,
     BookmarkWork,
@@ -575,6 +576,292 @@ def test_metadata_only_records_without_downloading(
     manifest = json.loads((out / "details.json").read_text(encoding="utf-8"))
     statuses = {img["status"] for work in manifest["works"] for img in work["images"]}
     assert statuses == {"metadata-only"}
+
+
+# -- ascii-only stream detection (spinner alphabet) ---------------------
+
+
+def _stream_with_encoding(encoding: str | None) -> TextIO:
+    """A minimal stand-in stream exposing just an ``encoding`` attribute."""
+
+    return cast(TextIO, SimpleNamespace(encoding=encoding))
+
+
+def test_stream_is_ascii_only_utf8_stream() -> None:
+    assert cli_module._stream_is_ascii_only(_stream_with_encoding("utf-8")) is False
+
+
+def test_stream_is_ascii_only_missing_encoding() -> None:
+    # A stream with no usable encoding cannot promise Unicode, so play it safe.
+    assert cli_module._stream_is_ascii_only(_stream_with_encoding(None)) is True
+
+
+def test_stream_is_ascii_only_ascii_codec() -> None:
+    # An ASCII (or otherwise Braille-incapable) encoding forces ASCII frames.
+    assert cli_module._stream_is_ascii_only(_stream_with_encoding("ascii")) is True
+
+
+# -- progress reporting (verbosity / mode auto-detection) ---------------
+
+
+def _force_tty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the command see an interactive (TTY) stderr during ``invoke``.
+
+    ``CliRunner`` swaps the standard streams for ``_NamedTextIOWrapper``s whose
+    inherited ``isatty`` returns ``False``. Patching the class to report a TTY
+    drives the auto-detected ``BAR`` path that the no-tty default cannot reach.
+    """
+
+    monkeypatch.setattr(_NamedTextIOWrapper, "isatty", lambda self: True)
+
+
+def _install_run_emitting(
+    monkeypatch: pytest.MonkeyPatch,
+    events: list[ProgressEvent],
+    *,
+    summary: RunSummary | None = None,
+    raises: BaseException | None = None,
+) -> None:
+    """Patch ``cli.run_backup`` to emit ``events`` before returning/raising."""
+
+    def fake_run(
+        config: Any,
+        auth: Any,
+        client: Any,
+        *,
+        progress: Any = None,
+        **_kw: Any,
+    ) -> RunSummary:
+        for event in events:
+            progress(event)
+        if raises is not None:
+            raise raises
+        assert summary is not None
+        return summary
+
+    monkeypatch.setattr(cli_module, "run_backup", fake_run)
+
+
+def _work_events(count: int) -> list[ProgressEvent]:
+    """A run's worth of ``WORK`` events with cumulative ``works_total``."""
+
+    return [
+        ProgressEvent(
+            kind=ProgressKind.WORK,
+            works_total=i,
+            files_downloaded=i,
+            line=f"[{i}] {100 + i} 'A Work' — 1 page(s)",
+        )
+        for i in range(1, count + 1)
+    ]
+
+
+def test_default_v0_nontty_has_no_per_work_lines(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The CliRunner default stderr is not a TTY, so v0 auto-selects MILESTONE:
+    # the old per-work verbose lines must be gone (the key regression guard).
+    out = tmp_path / "out"
+    client = FakePixivClient(
+        {"public": [_make_work(100), _make_work(101), _make_work(102)]}
+    )
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        ["backup", "--output-dir", str(out), "--config", _missing_config(tmp_path)],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "page(s)" not in result.stderr
+    assert "[1]" not in result.stderr
+    # A milestone summary line is emitted instead of per-work lines.
+    assert "..." in result.stderr
+
+
+def test_verbose_shows_per_work_lines(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "out"
+    client = FakePixivClient({"public": [_make_work(100, pages=2)]})
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup",
+            "-v",
+            "--output-dir",
+            str(out),
+            "--config",
+            _missing_config(tmp_path),
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "page(s)" in result.stderr
+    assert "[1]" in result.stderr
+
+
+def test_dry_run_v0_still_shows_would_create(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The v0 dry-run exemption: a preview stays verbose (with planned lines)
+    # rather than collapsing to a bar/milestone.
+    out = tmp_path / "out"
+    client = FakePixivClient({"public": [_make_work(100, pages=2)]})
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup",
+            "--dry-run",
+            "--output-dir",
+            str(out),
+            "--config",
+            _missing_config(tmp_path),
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "would create" in result.stderr
+    assert "page(s)" in result.stderr
+
+
+def test_dry_run_on_tty_still_verbose_not_bar(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The dry-run BAR exemption is only observable on a *real* TTY: force one so
+    # the auto-detected BAR branch is reachable, then prove --dry-run overrides
+    # it (VERBOSE "would create" lines, never a \r-redrawn bar). On the default
+    # non-TTY stream both paths independently pick VERBOSE, so this can only be
+    # distinguished here.
+    _force_tty(monkeypatch)
+    out = tmp_path / "out"
+    client = FakePixivClient({"public": [_make_work(100, pages=2)]})
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup",
+            "--dry-run",
+            "--output-dir",
+            str(out),
+            "--config",
+            _missing_config(tmp_path),
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "would create" in result.stderr
+    assert "page(s)" in result.stderr
+    assert "\r" not in result.stderr  # no in-place bar redraw
+
+
+def test_vv_dry_run_shows_per_work_and_would_create(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "out"
+    client = FakePixivClient({"public": [_make_work(100, pages=2)]})
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup",
+            "-vv",
+            "--dry-run",
+            "--output-dir",
+            str(out),
+            "--config",
+            _missing_config(tmp_path),
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "page(s)" in result.stderr
+    assert "would create" in result.stderr
+
+
+def test_quiet_has_no_progress_content(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "out"
+    client = FakePixivClient({"public": [_make_work(100, pages=2)]})
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup",
+            "--quiet",
+            "--output-dir",
+            str(out),
+            "--config",
+            _missing_config(tmp_path),
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Backing up" not in result.stderr  # banner suppressed
+    assert "page(s)" not in result.stderr
+    assert "..." not in result.stderr
+    assert "\r" not in result.stderr
+    assert "Backed up 1/1 works" in result.stdout  # summary still printed
+
+
+def test_tty_draws_bar_and_finishes_cleanly(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A simulated TTY auto-selects BAR: a carriage-return-redrawn line appears,
+    # and finish() terminates it so stderr does not end on a bare, unfinished
+    # bar fragment. Four events guarantee the first-draw event threshold trips.
+    _force_tty(monkeypatch)
+    _install_run_emitting(
+        monkeypatch,
+        _work_events(4),
+        summary=RunSummary(works_total=4, works_succeeded=4, files_downloaded=4),
+    )
+
+    result = runner.invoke(
+        cli,
+        ["backup", "--config", _missing_config(tmp_path)],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "\r" in result.stderr  # an in-place bar line was drawn
+    # finish() erases with a trailing newline, so stderr ends cleanly.
+    assert result.stderr.endswith("\n")
+    assert not result.stderr.rstrip("\n").endswith("\r")
+
+
+def test_interrupt_message_on_clean_line_after_bar(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Ordering guard: finish() erases the bar before the interrupt message, so
+    # "interrupted..." lands on its own clean line, never glued to a bar
+    # fragment. Emit >=3 events first so a bar was actually drawn.
+    _force_tty(monkeypatch)
+    _install_run_emitting(monkeypatch, _work_events(4), raises=KeyboardInterrupt())
+
+    result = runner.invoke(
+        cli,
+        ["backup", "--config", _missing_config(tmp_path)],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 130
+    lines = result.stderr.splitlines()
+    assert "interrupted; partial backup saved" in lines
 
 
 # -- security warnings (token visibility, insecure config) --------------

@@ -23,11 +23,16 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from click.testing import CliRunner
+from click.testing import CliRunner, _NamedTextIOWrapper
 
 from pixiv_bookmark_backup import cli as cli_module
 from pixiv_bookmark_backup.cli import cli
-from pixiv_bookmark_backup.core import FollowingConfig, FollowingRunSummary
+from pixiv_bookmark_backup.core import (
+    FollowingConfig,
+    FollowingRunSummary,
+    ProgressEvent,
+    ProgressKind,
+)
 from pixiv_bookmark_backup.models import (
     Author,
     BookmarkWork,
@@ -524,6 +529,281 @@ def test_partial_exit_6(
     )
     assert result.exit_code == 6
     assert "1 failed" in result.stdout
+
+
+# -- progress reporting (verbosity / mode auto-detection) ---------------
+
+
+def _force_tty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the command see an interactive (TTY) stderr during ``invoke``."""
+
+    monkeypatch.setattr(_NamedTextIOWrapper, "isatty", lambda self: True)
+
+
+def _install_run_following_emitting(
+    monkeypatch: pytest.MonkeyPatch,
+    events: list[ProgressEvent],
+    *,
+    summary: FollowingRunSummary | None = None,
+    raises: BaseException | None = None,
+) -> None:
+    """Patch ``cli.run_following`` to emit ``events`` before returning/raising."""
+
+    def fake_run(
+        config: Any,
+        auth: Any,
+        client: Any,
+        *,
+        progress: Any = None,
+        **_kw: Any,
+    ) -> FollowingRunSummary:
+        for event in events:
+            progress(event)
+        if raises is not None:
+            raise raises
+        return summary if summary is not None else _summary()
+
+    monkeypatch.setattr(cli_module, "run_following", fake_run)
+
+
+def _work_events(count: int) -> list[ProgressEvent]:
+    """A run's worth of ``WORK`` events with cumulative ``works_total``."""
+
+    return [
+        ProgressEvent(
+            kind=ProgressKind.WORK,
+            works_total=i,
+            files_downloaded=i,
+            line=f"  {100 + i} 'A Work' — 1 page(s)",
+        )
+        for i in range(1, count + 1)
+    ]
+
+
+def test_default_v0_nontty_has_no_per_work_lines(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The CliRunner default stderr is not a TTY, so v0 auto-selects MILESTONE:
+    # the old per-work verbose lines must be gone (the key regression guard).
+    out = tmp_path / "out"
+    client = FakeFollowingClient(
+        {"public": [_make_user(10)]},
+        {
+            "10": [
+                _make_work(101, author_id=10),
+                _make_work(102, author_id=10),
+                _make_work(103, author_id=10),
+            ]
+        },
+    )
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup-following",
+            "--output-dir",
+            str(out),
+            "--config",
+            _missing_config(tmp_path),
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "page(s)" not in result.stderr
+    assert "..." in result.stderr  # milestone line emitted instead
+
+
+def test_verbose_shows_per_work_lines(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "out"
+    client = FakeFollowingClient(
+        {"public": [_make_user(10)]}, {"10": [_make_work(101, author_id=10, pages=2)]}
+    )
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup-following",
+            "-v",
+            "--output-dir",
+            str(out),
+            "--config",
+            _missing_config(tmp_path),
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "page(s)" in result.stderr
+
+
+def test_dry_run_v0_still_shows_would_create(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "out"
+    client = FakeFollowingClient(
+        {"public": [_make_user(10)]}, {"10": [_make_work(101, author_id=10, pages=2)]}
+    )
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup-following",
+            "--dry-run",
+            "--output-dir",
+            str(out),
+            "--config",
+            _missing_config(tmp_path),
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "would create" in result.stderr
+    assert "page(s)" in result.stderr
+
+
+def test_dry_run_on_tty_still_verbose_not_bar(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The dry-run BAR exemption is only observable on a *real* TTY: force one so
+    # the auto-detected BAR branch is reachable, then prove --dry-run overrides
+    # it (VERBOSE "would create" lines, never a \r-redrawn bar).
+    _force_tty(monkeypatch)
+    out = tmp_path / "out"
+    client = FakeFollowingClient(
+        {"public": [_make_user(10)]}, {"10": [_make_work(101, author_id=10, pages=2)]}
+    )
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup-following",
+            "--dry-run",
+            "--output-dir",
+            str(out),
+            "--config",
+            _missing_config(tmp_path),
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "would create" in result.stderr
+    assert "page(s)" in result.stderr
+    assert "\r" not in result.stderr  # no in-place bar redraw
+
+
+def test_quiet_has_no_progress_content(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "out"
+    client = FakeFollowingClient(
+        {"public": [_make_user(10)]}, {"10": [_make_work(101, author_id=10, pages=2)]}
+    )
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup-following",
+            "--quiet",
+            "--output-dir",
+            str(out),
+            "--config",
+            _missing_config(tmp_path),
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Backing up works" not in result.stderr  # banner suppressed
+    assert "page(s)" not in result.stderr
+    assert "..." not in result.stderr
+    assert "\r" not in result.stderr
+    assert "Backed up 1/1 works" in result.stdout  # summary still printed
+
+
+def test_tty_draws_bar_and_finishes_cleanly(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A simulated TTY auto-selects BAR: a carriage-return-redrawn line appears,
+    # and finish() terminates it cleanly. Four events trip the first-draw
+    # threshold.
+    _force_tty(monkeypatch)
+    _install_run_following_emitting(
+        monkeypatch,
+        _work_events(4),
+        summary=_summary(works_total=4, works_succeeded=4),
+    )
+
+    result = runner.invoke(
+        cli,
+        ["backup-following", "--config", _missing_config(tmp_path)],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "\r" in result.stderr
+    assert result.stderr.endswith("\n")
+    assert not result.stderr.rstrip("\n").endswith("\r")
+
+
+def test_tty_bar_counts_users_when_max_users_set(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # With --max-users (and no --limit) the determinate bar counts users, so a
+    # "N/2 users" fragment appears in the redrawn bar line.
+    _force_tty(monkeypatch)
+    events = [
+        ProgressEvent(kind=ProgressKind.USER, users_total=i, line=f"user {i}")
+        for i in range(1, 5)
+    ]
+    _install_run_following_emitting(
+        monkeypatch, events, summary=_summary(users_total=2)
+    )
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup-following",
+            "--max-users",
+            "2",
+            "--config",
+            _missing_config(tmp_path),
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "users" in result.stderr
+    assert "/2 users" in result.stderr
+
+
+def test_interrupt_message_on_clean_line_after_bar(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Ordering guard: finish() erases the bar before the interrupt message.
+    _force_tty(monkeypatch)
+    _install_run_following_emitting(
+        monkeypatch, _work_events(4), raises=KeyboardInterrupt()
+    )
+
+    result = runner.invoke(
+        cli,
+        ["backup-following", "--config", _missing_config(tmp_path)],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 130
+    lines = result.stderr.splitlines()
+    assert "interrupted; partial backup saved" in lines
 
 
 # -- security warning ---------------------------------------------------

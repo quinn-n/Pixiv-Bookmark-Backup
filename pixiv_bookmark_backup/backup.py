@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Callable
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -42,6 +43,8 @@ from pixiv_bookmark_backup.core import (
     BackupConfig,
     FollowingConfig,
     FollowingRunSummary,
+    ProgressEvent,
+    ProgressKind,
     RunSummary,
 )
 from pixiv_bookmark_backup.downloader import download_image
@@ -144,6 +147,87 @@ def _planned_filenames(work: BookmarkWork) -> list[str]:
         image_filename(work.id, img.page, ext_from_url(img.source_url))
         for img in work.images
     ]
+
+
+def _sanitize_display_text(s: str) -> str:
+    """Strip C0/C1 control characters from untrusted display text.
+
+    A Pixiv display name is attacker-controlled and may embed ANSI/OSC escape
+    sequences (terminal control chars) that would render unescaped when a
+    verbose/dry-run ``line`` is written straight to a real TTY. Removing the
+    control bytes neutralises that before the text reaches the terminal.
+    (``work.title`` is already protected by ``!r``/repr, which escapes these;
+    ``user.name`` is interpolated raw, so it is sanitised here.)
+    """
+
+    return re.sub(r"[\x00-\x1f\x7f-\x9f]", "", s)
+
+
+def _work_event(
+    counters: _Counters,
+    work: BookmarkWork,
+    *,
+    line: str,
+    index: int,
+    user_id: str | None = None,
+    users_total: int = 0,
+) -> ProgressEvent:
+    """Build a :attr:`ProgressKind.WORK` event with ``counters``' live totals.
+
+    ``line`` is the ready-made per-work text (printed verbatim in verbose mode);
+    the numeric fields snapshot ``counters`` *at the call site*, so the caller
+    controls whether they reflect state before or after this work was tallied.
+
+    ``users_total`` is threaded through explicitly (rather than read off
+    ``counters``, whose base :class:`_Counters` type has no such field) so a
+    following run's WORK events carry the running user count -- otherwise a
+    ``unit="users"`` bar/milestone would render ``0`` for every WORK event. It
+    defaults to ``0`` for the plain bookmark backup, where it is meaningless.
+    """
+
+    return ProgressEvent(
+        kind=ProgressKind.WORK,
+        works_total=counters.works_total,
+        files_downloaded=counters.files_downloaded,
+        files_skipped=counters.files_skipped,
+        files_failed=counters.files_failed,
+        bytes_downloaded=counters.bytes_downloaded,
+        users_total=users_total,
+        index=index,
+        work_id=work.id,
+        title=work.title,
+        page_count=work.page_count,
+        user_id=user_id,
+        line=line,
+    )
+
+
+def _work_planned_event(
+    work: BookmarkWork,
+    planned: list[str],
+    *,
+    line: str,
+    index: int,
+    user_id: str | None = None,
+    users_total: int = 0,
+) -> ProgressEvent:
+    """Build a :attr:`ProgressKind.WORK_PLANNED` event for a dry-run work.
+
+    Carries the dry-run "would create" ``line`` and the ``planned`` filenames as
+    a tuple so a renderer need not re-parse the line. ``users_total`` is threaded
+    through for a following run's ``unit="users"`` bar (see :func:`_work_event`);
+    it defaults to ``0`` for the plain bookmark backup.
+    """
+
+    return ProgressEvent(
+        kind=ProgressKind.WORK_PLANNED,
+        index=index,
+        work_id=work.id,
+        planned=tuple(planned),
+        user_id=user_id,
+        users_total=users_total,
+        line=line,
+    )
 
 
 def _tally_status(
@@ -374,7 +458,7 @@ def run(
     auth: ResolvedAuth,
     client: PixivClient,
     *,
-    progress: Callable[[str], None] = lambda _msg: None,
+    progress: Callable[[ProgressEvent], None] = lambda _e: None,
     clock: Callable[[], str] = _utcnow,
 ) -> RunSummary:
     """Run a single bookmark backup and return its :class:`RunSummary`.
@@ -390,8 +474,9 @@ def run(
         config: The validated run parameters.
         auth: Resolved credentials (only the refresh token is read here).
         client: The Pixiv surface (authenticate, list, download, ugoira).
-        progress: Sink for human-readable progress lines; defaults to a no-op so
-            the orchestrator stays silent unless the CLI wires up output.
+        progress: Sink for :class:`~pixiv_bookmark_backup.core.ProgressEvent`s;
+            defaults to a no-op so the orchestrator stays silent unless the CLI
+            wires up output.
         clock: Source of the manifest's ``generated_at`` timestamp; injectable
             for deterministic tests.
 
@@ -451,7 +536,7 @@ def _iterate_and_process(
     counters: _Counters,
     works: list[Any],
     errors: list[dict[str, Any]],
-    progress: Callable[[str], None],
+    progress: Callable[[ProgressEvent], None],
 ) -> None:
     """Iterate bookmarks across the visibility passes and process each work.
 
@@ -470,9 +555,7 @@ def _iterate_and_process(
                 continue
 
             index += 1
-            progress(
-                f"[{index}] {work.id} {work.title!r} " f"— {work.page_count} page(s)"
-            )
+            line = f"[{index}] {work.id} {work.title!r} " f"— {work.page_count} page(s)"
 
             if work.type != "ugoira" and not work.images:
                 # No downloadable pages (deleted / restricted / limited work):
@@ -481,7 +564,9 @@ def _iterate_and_process(
                 # dedups it across resume runs (an "id" key would accumulate
                 # duplicates). The listing-interrupt error below has no work id
                 # and is intentionally always appended (it describes the run,
-                # not a single work).
+                # not a single work). The WORK event is still emitted (with
+                # counts unchanged) so verbose mode shows the unavailable work.
+                progress(_work_event(counters, work, line=line, index=index))
                 errors.append(
                     {
                         "work_id": work.id,
@@ -495,7 +580,15 @@ def _iterate_and_process(
                 counters.works_total += 1
                 counters.works_succeeded += 1
                 counters.files_downloaded += len(planned)
-                progress(f"    would create: {', '.join(planned)}")
+                progress(_work_event(counters, work, line=line, index=index))
+                progress(
+                    _work_planned_event(
+                        work,
+                        planned,
+                        line=f"    would create: {', '.join(planned)}",
+                        index=index,
+                    )
+                )
                 continue
 
             entries = _image_entries_for_work(config, client, work, counters)
@@ -505,6 +598,7 @@ def _iterate_and_process(
             else:
                 counters.works_succeeded += 1
             works.append(build_work_entry(work, entries))
+            progress(_work_event(counters, work, line=line, index=index))
 
 
 def run_following(
@@ -512,7 +606,7 @@ def run_following(
     auth: ResolvedAuth,
     client: PixivClient,
     *,
-    progress: Callable[[str], None] = lambda _msg: None,
+    progress: Callable[[ProgressEvent], None] = lambda _e: None,
     clock: Callable[[], str] = _utcnow,
 ) -> FollowingRunSummary:
     """Back up the works of every followed user and return a summary.
@@ -539,7 +633,8 @@ def run_following(
         auth: Resolved credentials (only the refresh token is read here).
         client: The Pixiv surface (authenticate, list following, list works,
             download, ugoira).
-        progress: Sink for human-readable progress lines; defaults to a no-op.
+        progress: Sink for :class:`~pixiv_bookmark_backup.core.ProgressEvent`s;
+            defaults to a no-op.
         clock: Source of the manifest's ``generated_at`` timestamp; injectable
             for deterministic tests.
 
@@ -598,7 +693,7 @@ def _iterate_following(
     counters: _FollowingCounters,
     works: list[Any],
     errors: list[dict[str, Any]],
-    progress: Callable[[str], None],
+    progress: Callable[[ProgressEvent], None],
 ) -> None:
     """Iterate followed users across the follow passes and process each.
 
@@ -632,7 +727,16 @@ def _iterate_following(
 
             seen_users.add(uid)
             counters.users_total += 1
-            progress(f"user {uid} ({user.name})")
+            safe_name = _sanitize_display_text(user.name)
+            progress(
+                ProgressEvent(
+                    kind=ProgressKind.USER,
+                    users_total=counters.users_total,
+                    user_id=uid,
+                    user_name=user.name,
+                    line=f"user {uid} ({safe_name})",
+                )
+            )
 
             if _process_following_user(
                 config, client, uid, counters, works, errors, progress
@@ -647,7 +751,7 @@ def _process_following_user(
     counters: _FollowingCounters,
     works: list[Any],
     errors: list[dict[str, Any]],
-    progress: Callable[[str], None],
+    progress: Callable[[ProgressEvent], None],
 ) -> bool:
     """Back up one followed user's works; return whether to stop the whole run.
 
@@ -663,6 +767,7 @@ def _process_following_user(
 
     image_dir = config.output_dir / uid
     per_user = 0
+    index = 0
     contributed = False
 
     try:
@@ -674,13 +779,25 @@ def _process_following_user(
             if not _passes_since(work, config.since):
                 continue
 
-            progress(f"  {work.id} {work.title!r} — {work.page_count} page(s)")
+            index += 1
+            line = f"  {work.id} {work.title!r} — {work.page_count} page(s)"
 
             if work.type != "ugoira" and not work.images:
                 # No downloadable pages (deleted / restricted / limited work):
                 # record a work-level error keyed on "work_id" (so manifest.merge
                 # dedups across resume runs) and skip it -- it is not counted as a
-                # processed work and does not consume the per-user budget.
+                # processed work and does not consume the per-user budget. The
+                # WORK event is still emitted so verbose mode shows the work.
+                progress(
+                    _work_event(
+                        counters,
+                        work,
+                        line=line,
+                        index=index,
+                        user_id=uid,
+                        users_total=counters.users_total,
+                    )
+                )
                 errors.append(
                     {
                         "work_id": work.id,
@@ -694,7 +811,26 @@ def _process_following_user(
                 counters.works_total += 1
                 counters.works_succeeded += 1
                 counters.files_downloaded += len(planned)
-                progress(f"    would create: {', '.join(planned)}")
+                progress(
+                    _work_event(
+                        counters,
+                        work,
+                        line=line,
+                        index=index,
+                        user_id=uid,
+                        users_total=counters.users_total,
+                    )
+                )
+                progress(
+                    _work_planned_event(
+                        work,
+                        planned,
+                        line=f"    would create: {', '.join(planned)}",
+                        index=index,
+                        user_id=uid,
+                        users_total=counters.users_total,
+                    )
+                )
             else:
                 entries = _image_entries_for_work(
                     config, client, work, counters, image_dir=image_dir
@@ -705,6 +841,16 @@ def _process_following_user(
                 else:
                     counters.works_succeeded += 1
                 works.append(build_work_entry(work, entries))
+                progress(
+                    _work_event(
+                        counters,
+                        work,
+                        line=line,
+                        index=index,
+                        user_id=uid,
+                        users_total=counters.users_total,
+                    )
+                )
 
             per_user += 1
             if not contributed:

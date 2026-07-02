@@ -48,6 +48,7 @@ from pixiv_bookmark_backup.core import (
 )
 from pixiv_bookmark_backup.downloader import download_image
 from pixiv_bookmark_backup.manifest import (
+    MANIFEST_NAME,
     ImageEntry,
     Manifest,
     build_work_entry,
@@ -67,9 +68,6 @@ from pixiv_bookmark_backup.naming import (
 )
 from pixiv_bookmark_backup.pixiv_client import ApiError, PixivClient
 from pixiv_bookmark_backup.ugoira import build_ugoira
-
-#: Filename of the aggregate manifest written at the output root.
-MANIFEST_NAME = "details.json"
 
 #: Filename the manifest is moved aside to on corruption / schema mismatch.
 MANIFEST_BACKUP_NAME = "details.json.bak"

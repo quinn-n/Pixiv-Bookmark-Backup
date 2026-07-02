@@ -1,12 +1,14 @@
 # backed-up files
 backup/
 backup-*/
+search/
 
 # VSCode
 .vscode/
 
 # Claude
 .claude/settings.local.json
+.claude/worktrees
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

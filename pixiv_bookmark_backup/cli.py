@@ -19,7 +19,7 @@ import click
 
 from . import __version__
 from .auth_login import GpptLogin, LoginDriverError, LoginFailed, LoginFlow
-from .backup import MANIFEST_NAME, BackupUsageError
+from .backup import BackupUsageError
 from .backup import run as run_backup
 from .backup import run_following
 from .config import (
@@ -33,13 +33,33 @@ from .config import (
     write_refresh_token,
 )
 from .core import (
+    NSFW_MODES,
+    SEARCH_FIELDS,
+    SORT_KEYS,
     VISIBILITIES,
     BackupConfig,
     ExitCode,
     FollowingConfig,
     FollowingRunSummary,
     RunSummary,
+    SearchConfig,
+    SearchMatch,
     decide_exit_code,
+    format_work_line,
+    normalize_fields,
+    run_search,
+)
+from .linking import (
+    SymlinkConfig,
+    SymlinkError,
+    SymlinkResult,
+    plan_and_link,
+)
+from .manifest import (
+    MANIFEST_NAME,
+    ManifestLoadError,
+    load_manifest_strict,
+    resolve_manifest_path,
 )
 from .pixiv_client import ApiError, AuthRejected, Pixivpy3Client
 
@@ -56,6 +76,12 @@ JSON_FOLLOWING_SUMMARY_SCHEMA = 1
 #: Version stamped as the first key of the ``login --json`` result object, so a
 #: scripting consumer can detect the payload shape and adapt across releases.
 JSON_LOGIN_SCHEMA = 1
+
+#: Version stamped as the first key of the ``search --json`` result object, so a
+#: scripting consumer can detect the payload shape and adapt across releases.
+#: Separate from the backup schemas because ``search`` reports matches and the
+#: echoed query rather than a download run.
+JSON_SEARCH_SCHEMA = 1
 
 
 def _build_login() -> LoginFlow:
@@ -965,4 +991,433 @@ def _emit_login_result(
         "refresh_token": token,
         "exit_code": int(ExitCode.SUCCESS),
     }
+    click.echo(json.dumps(payload))
+
+
+@cli.command()
+@click.argument("keyword", nargs=-1)
+@click.option(
+    "--input",
+    "-i",
+    "input_path",
+    type=click.Path(path_type=Path),
+    default="./backup",
+    show_default=True,
+    help="details.json file or backup directory to search (default ./backup).",
+)
+@click.option(
+    "--field",
+    type=click.Choice(SEARCH_FIELDS),
+    multiple=True,
+    help="Tag surface(s) to match keywords against: work, bookmark, translated "
+    "(default: all).",
+)
+@click.option(
+    "--exact",
+    is_flag=True,
+    help="Match keywords as whole tags, not substrings.",
+)
+@click.option(
+    "--match-all",
+    is_flag=True,
+    help="Require every keyword to match (AND) instead of any (OR).",
+)
+@click.option(
+    "--author",
+    multiple=True,
+    metavar="TEXT",
+    help="Keep only works by an author whose name/account contains TEXT "
+    "(repeatable).",
+)
+@click.option(
+    "--blacklist-tag",
+    multiple=True,
+    metavar="TAG",
+    help="Exclude works carrying this tag on any surface (exact match, " "repeatable).",
+)
+@click.option(
+    "--blacklist-author",
+    multiple=True,
+    metavar="TEXT",
+    help="Exclude works by an author whose name/account contains TEXT " "(repeatable).",
+)
+@click.option(
+    "--nsfw",
+    type=click.Choice(NSFW_MODES),
+    default="include",
+    show_default=True,
+    help="NSFW handling: include (default), exclude (SFW only), or only.",
+)
+@click.option(
+    "--sort",
+    type=click.Choice(SORT_KEYS),
+    default="posted",
+    show_default=True,
+    help="Result order: posted (newest first), id, or title.",
+)
+@click.option(
+    "--limit",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Print at most this many results (with --json, matches[] is truncated "
+    "but match_count stays the full total).",
+)
+@click.option(
+    "--symlink-dir",
+    "symlink_dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Populate DIR with symlinks to the matched works' image files so they "
+    "can be browsed in a file browser (created if missing).",
+)
+@click.option(
+    "--all-pages/--first-page-only",
+    "all_pages",
+    default=True,
+    show_default=False,
+    help="With --symlink-dir, link every existing page of each work "
+    "(--all-pages, the default) or only the first existing page "
+    "(--first-page-only).",
+)
+@click.option(
+    "--layout",
+    type=click.Choice(["flat", "by-author", "titled"]),
+    default="flat",
+    show_default=True,
+    help="With --symlink-dir, how links are named/placed: flat (bare "
+    "<id>_p<n>.<ext>), by-author (per-author subdir <account>_<id>/), or "
+    "titled (<title>_<id>_p<n>.<ext>). Non-flat layouts sanitize Pixiv "
+    "metadata into filesystem-safe names.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="With --symlink-dir, report what would be linked without creating "
+    "anything.",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="With --symlink-dir, re-point an existing symlink to the new target "
+    "(never overwrites a regular file).",
+)
+@click.option(
+    "--count",
+    is_flag=True,
+    help="Print only the number of matches.",
+)
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    help="Print a machine-readable result object to stdout.",
+)
+@click.option(
+    "--quiet",
+    "-q",
+    is_flag=True,
+    help="Suppress the match-count summary on stderr.",
+)
+@click.option(
+    "--verbose",
+    "-v",
+    count=True,
+    help="Increase detail on stderr; repeat for more.",
+)
+@click.pass_context
+def search(
+    ctx: click.Context,
+    keyword: tuple[str, ...],
+    input_path: Path,
+    field: tuple[str, ...],
+    exact: bool,
+    match_all: bool,
+    author: tuple[str, ...],
+    blacklist_tag: tuple[str, ...],
+    blacklist_author: tuple[str, ...],
+    nsfw: str,
+    sort: str,
+    limit: int | None,
+    symlink_dir: Path | None,
+    all_pages: bool,
+    layout: str,
+    dry_run: bool,
+    force: bool,
+    count: bool,
+    json_output: bool,
+    quiet: bool,
+    verbose: int,
+) -> None:
+    """Search a local details.json manifest offline -- no token or network required.
+
+    Reads the works recorded by 'backup' / 'backup-following' and matches each
+    KEYWORD against the work's tag surfaces (work tags, bookmark tags, and the
+    translated tag names). With multiple keywords, any match keeps a work (OR);
+    pass --match-all to require every keyword (AND). Narrow results with --field
+    (which surfaces to match on), filter by --author or --nsfw, and drop works
+    with --blacklist-tag / --blacklist-author. With no KEYWORD it lists every
+    work that passes the filters (browse mode).
+
+    Point at a backup with -i: an existing directory is treated as a backup root
+    (its details.json is loaded), otherwise the path is used as the manifest file
+    directly. Results go to stdout, one per line; the match-count summary goes to
+    stderr. This command never authenticates or hits the network.
+
+    \b
+    Exit codes:
+      0 success (including zero matches)   2 usage / manifest-input error
+      10 symlink write error
+         (symlinks already created before the error are kept; re-run to resume)
+
+    \b
+    Examples:
+      # Any of these tags (OR), newest first, from the default ./backup
+      pixiv-bookmark-backup search touhou original
+
+    \b
+      # Symlink matches into ./review (all pages of each work, by default)
+      pixiv-bookmark-backup search touhou --symlink-dir ./review
+
+    \b
+      # Link only the first existing page of each work
+      pixiv-bookmark-backup search touhou --symlink-dir ./review --first-page-only
+
+    \b
+      # Group symlinks into per-author subdirectories
+      pixiv-bookmark-backup search touhou --symlink-dir ./review --layout by-author
+
+    \b
+      # Prefix each link with the work title (metadata is sanitized)
+      pixiv-bookmark-backup search touhou --symlink-dir ./review --layout titled
+
+    \b
+      # Require both tags (AND) and match them as whole tags
+      pixiv-bookmark-backup search touhou original --match-all --exact
+
+    \b
+      # Only your bookmark tag "fav", exact match, from a specific manifest
+      pixiv-bookmark-backup search fav --field bookmark --exact -i ./out
+
+    \b
+      # Browse only NSFW works ordered by id, and just count the JSON hits
+      pixiv-bookmark-backup search --nsfw only --sort id --count
+      pixiv-bookmark-backup search touhou --json
+    """
+
+    if quiet and verbose:
+        raise click.UsageError("--quiet and --verbose are mutually exclusive")
+    if count and json_output:
+        raise click.UsageError("--count and --json are mutually exclusive")
+    if (
+        ctx.get_parameter_source("all_pages") is click.core.ParameterSource.COMMANDLINE
+        and symlink_dir is None
+    ):
+        raise click.UsageError("--all-pages/--first-page-only requires --symlink-dir")
+    if dry_run and symlink_dir is None:
+        raise click.UsageError("--dry-run requires --symlink-dir")
+    if force and symlink_dir is None:
+        raise click.UsageError("--force requires --symlink-dir")
+    if (
+        ctx.get_parameter_source("layout") is click.core.ParameterSource.COMMANDLINE
+        and symlink_dir is None
+    ):
+        raise click.UsageError("--layout requires --symlink-dir")
+
+    effective_fields = normalize_fields(field)
+    manifest_path = resolve_manifest_path(input_path)
+    try:
+        manifest = load_manifest_strict(manifest_path)
+    except ManifestLoadError as exc:
+        raise click.UsageError(str(exc)) from exc
+
+    if verbose:
+        click.echo(f"Reading {manifest_path} ({len(manifest.works)} works)", err=True)
+
+    config = SearchConfig(
+        input_path=manifest_path,
+        keywords=keyword,
+        fields=effective_fields,
+        exact=exact,
+        match_all=match_all,
+        authors=author,
+        blacklist_tags=blacklist_tag,
+        blacklist_authors=blacklist_author,
+        nsfw=nsfw,
+        sort=sort,
+        limit=limit,
+        count=count,
+        json_output=json_output,
+        verbosity=verbose,
+        quiet=quiet,
+    )
+
+    matches, scanned = run_search(manifest.works, config)
+    match_count = len(matches)
+    emitted = matches[:limit] if limit else matches
+
+    if not quiet:
+        click.echo(f"Matched {match_count} / {scanned} works", err=True)
+
+    # Create the symlinks (or preview them under --dry-run) before emitting any
+    # results, so a fatal SymlinkError (exit 10) aborts before printing a
+    # partial result set, and so the --json symlink sub-object can be folded
+    # into the single stdout object.
+    link_result: SymlinkResult | None = None
+    if symlink_dir is not None:
+        symlink_config = SymlinkConfig(
+            dir=symlink_dir,
+            all_pages=all_pages,
+            dry_run=dry_run,
+            force=force,
+            layout=layout,
+        )
+        try:
+            link_result = plan_and_link(emitted, manifest_path, symlink_config)
+        except SymlinkError as exc:
+            raise _exit_error(str(exc), int(ExitCode.SYMLINK)) from exc
+
+    if count:
+        click.echo(str(match_count))
+    elif json_output:
+        _emit_search_result(
+            config, manifest_path, emitted, scanned, match_count, symlink=link_result
+        )
+    else:
+        for match in emitted:
+            click.echo(format_work_line(match))
+
+    if not quiet and link_result is not None:
+        _emit_link_summary(link_result, verbose)
+
+    ctx.exit(int(ExitCode.SUCCESS))
+
+
+def _plural(count: int, noun: str) -> str:
+    """Return ``"1 file"`` / ``"3 files"`` -- ``noun`` pluralized by adding ``s``.
+
+    A tiny helper so the link summary reads naturally for singular counts; the
+    project's nouns ("file", "work") pluralize with a plain trailing ``s``.
+    """
+
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+
+def _emit_link_summary(link_result: SymlinkResult, verbose: int) -> None:
+    """Write the symlink run summary to **stderr** (after the match summary).
+
+    A single human-readable line reporting how many files were linked -- broken
+    down into new / reused (and replaced under ``--force``) so a re-run's reuses
+    are visible -- for how many works and where. A non-``"flat"`` ``layout`` is
+    reported as a ``(layout: ...)`` suffix right after the directory (flat output
+    stays byte-identical to before the feature). Works skipped because they had
+    no local file are appended in parentheses. Under ``-v`` each skipped work id
+    is echoed; under ``-vv`` each ``link_name -> target`` pair is echoed as well,
+    mirroring the command's existing verbose diagnostics.
+    """
+
+    verb = "Would link" if link_result.dry_run else "Linked"
+    breakdown = f"{link_result.links_created} new, {link_result.links_reused} reused"
+    if link_result.links_replaced:
+        breakdown += f", {link_result.links_replaced} replaced"
+    summary = (
+        f"{verb} {_plural(link_result.links_total, 'file')} ({breakdown}) for "
+        f"{_plural(link_result.works_linked, 'work')} into {link_result.dir}"
+    )
+    # Report a non-flat layout right after the directory; flat stays byte-
+    # identical to the pre-layout summary (no suffix), so existing consumers
+    # and tests see no change.
+    if link_result.layout != "flat":
+        summary += f" (layout: {link_result.layout})"
+    if link_result.works_without_files:
+        summary += (
+            f" ({_plural(link_result.works_without_files, 'work')} "
+            "skipped: no local file)"
+        )
+    click.echo(summary, err=True)
+
+    if verbose >= 1:
+        for work_id in link_result.skipped_work_ids:
+            click.echo(f"  skipped {work_id}: no local file", err=True)
+    if verbose >= 2:
+        for link_name, target in link_result.linked:
+            click.echo(f"  {link_name} -> {target}", err=True)
+
+
+def _emit_search_result(
+    config: SearchConfig,
+    manifest_path: Path,
+    emitted: list[SearchMatch],
+    scanned: int,
+    match_count: int,
+    symlink: SymlinkResult | None = None,
+) -> None:
+    """Write the ``search --json`` result object to **stdout** (one JSON line).
+
+    ``match_count`` is the true pre-limit total (also driving ``--count`` and the
+    stderr summary), while ``matches`` reflects only the ``--limit``-truncated
+    ``emitted`` slice actually shown to the user.
+
+    When ``symlink`` is given (a ``--symlink-dir`` run), a top-level ``"symlink"``
+    key carrying the run's directory, flags (including the ``"layout"``), and
+    per-category link tallies is added to the payload; its ``"linked"`` entries
+    are link-dir-relative POSIX names (nested ``subdir/basename`` under the
+    ``"by-author"`` layout, bare basenames otherwise). It is absent entirely
+    otherwise, so ``JSON_SEARCH_SCHEMA`` stays ``1`` (the default output is
+    byte-identical to before this feature; the sub-object appears only with
+    ``--symlink-dir``).
+    """
+
+    payload = {
+        "schema": JSON_SEARCH_SCHEMA,
+        "input": str(manifest_path),
+        "query": {
+            "keywords": list(config.keywords),
+            "fields": list(config.fields),
+            "exact": config.exact,
+            "match_all": config.match_all,
+            "authors": list(config.authors),
+            "blacklist_tags": list(config.blacklist_tags),
+            "blacklist_authors": list(config.blacklist_authors),
+            "nsfw": config.nsfw,
+            "sort": config.sort,
+            "limit": config.limit,
+        },
+        "works_scanned": scanned,
+        "match_count": match_count,
+        "matches": [
+            {
+                "id": match.work.id,
+                "type": match.work.type,
+                "title": match.work.title,
+                "author": dict(match.work.author),
+                "posted_at": match.work.posted_at,
+                "is_nsfw": bool(match.work.nsfw.get("is_nsfw")),
+                "work_tags": [dict(tag) for tag in match.work.work_tags],
+                "bookmark_tags": (
+                    None
+                    if match.work.bookmark_tags is None
+                    else list(match.work.bookmark_tags)
+                ),
+                "matched_fields": match.matched_fields,
+            }
+            for match in emitted
+        ],
+        "exit_code": int(ExitCode.SUCCESS),
+    }
+    if symlink is not None:
+        payload["symlink"] = {
+            "dir": str(symlink.dir),
+            "all_pages": symlink.all_pages,
+            "dry_run": symlink.dry_run,
+            "force": symlink.force,
+            "layout": symlink.layout,
+            "links_created": symlink.links_created,
+            "links_reused": symlink.links_reused,
+            "links_replaced": symlink.links_replaced,
+            "links_total": symlink.links_total,
+            "works_linked": symlink.works_linked,
+            "works_without_files": symlink.works_without_files,
+            "skipped_work_ids": list(symlink.skipped_work_ids),
+            "linked": [list(pair) for pair in symlink.linked],
+        }
     click.echo(json.dumps(payload))

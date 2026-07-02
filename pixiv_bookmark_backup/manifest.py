@@ -29,6 +29,21 @@ from pixiv_bookmark_backup.models import BookmarkWork, ImageStatus
 #: mismatch, backs the old file up and regenerates.
 SCHEMA_VERSION: int = 1
 
+#: Canonical filename of the aggregate manifest at the output root. This module
+#: is the single source of truth for the name; ``backup.py`` imports it from here
+#: (safe because this module only depends on ``models``, so there is no cycle).
+MANIFEST_NAME = "details.json"
+
+
+class ManifestLoadError(Exception):
+    """Raised when a manifest cannot be loaded for a read-only consumer.
+
+    Covers a missing file, an unreadable file, malformed JSON, a
+    ``schema_version`` mismatch, or a structurally invalid document. It is a
+    plain message-carrying exception so callers (e.g. the ``search`` command)
+    can surface a clear error and map it to a non-zero exit code.
+    """
+
 
 @frozen
 class ImageEntry:
@@ -373,6 +388,70 @@ def load_or_init(path: Path) -> tuple[Manifest, bool]:
     if schema_mismatch:
         return _empty_manifest(), True
     return Manifest.from_dict(data), False
+
+
+def resolve_manifest_path(input_path: Path) -> Path:
+    """Resolve a user-supplied path to the concrete manifest file to load.
+
+    When ``input_path`` is an existing directory it is treated as an output
+    root and :data:`MANIFEST_NAME` is appended. Otherwise ``input_path`` is
+    returned unchanged and treated as a file path directly -- if it does not
+    exist, :func:`load_manifest_strict` surfaces the error.
+    """
+
+    if input_path.is_dir():
+        return input_path / MANIFEST_NAME
+    return input_path
+
+
+def load_manifest_strict(path: Path) -> Manifest:
+    """Load the manifest at ``path``, raising :class:`ManifestLoadError` on any fault.
+
+    Unlike :func:`load_or_init`, this never falls back to an empty manifest: a
+    missing file, an unreadable file, malformed JSON, a ``schema_version``
+    mismatch, or a structurally invalid document each raise
+    :class:`ManifestLoadError`. This is the loader for read-only consumers (such
+    as the ``search`` command) that must report such conditions as explicit
+    errors instead of silently treating them as an empty result.
+    """
+
+    if not path.exists():
+        raise ManifestLoadError(
+            f"No manifest found at {path}; run a backup first or pass -i to "
+            "point at a details.json."
+        )
+
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except OSError as exc:
+        raise ManifestLoadError(f"could not read {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ManifestLoadError(f"{path} is not valid JSON: {exc}") from exc
+    except RecursionError as exc:
+        # CPython's JSON decoder is recursive, so a deeply-nested (possibly
+        # hostile) document overflows the stack. Map it to a clean load error
+        # instead of leaking a raw RecursionError traceback.
+        raise ManifestLoadError(
+            f"{path} is too deeply nested to parse as JSON."
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise ManifestLoadError(
+            f"{path} is not a manifest object: got {type(data).__name__}."
+        )
+
+    schema = data.get("schema_version")
+    if schema != SCHEMA_VERSION:
+        raise ManifestLoadError(
+            f"{path} has schema_version {schema!r}; this build expects "
+            f"{SCHEMA_VERSION}. Re-run the backup to regenerate it."
+        )
+
+    try:
+        return Manifest.from_dict(data)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ManifestLoadError(f"{path} is structurally invalid: {exc}") from exc
 
 
 def write_atomic(path: Path, manifest: Manifest) -> None:

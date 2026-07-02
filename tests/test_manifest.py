@@ -736,9 +736,16 @@ def test_merge_new_record_wins_for_shared_ids(
     result = merge(existing, incoming)
 
     new_by_id = {work.id: work for work in new_works}
+    existing_by_id = {work.id: work for work in existing_works}
     result_by_id = {work.id: work for work in result.works}
+
+    # An id present in `new` always takes the new record...
     for work_id, new_work in new_by_id.items():
         assert result_by_id[work_id] == new_work
+    # ...and an id present only in `existing` survives completely unchanged.
+    for work_id, old_work in existing_by_id.items():
+        if work_id not in new_by_id:
+            assert result_by_id[work_id] == old_work
 
 
 @given(existing_works=st.lists(_work_entries, max_size=5, unique_by=lambda w: w.id))

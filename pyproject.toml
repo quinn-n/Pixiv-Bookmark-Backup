@@ -46,6 +46,7 @@ pixiv-bookmark-backup = { path = ".", editable = true }
 [tool.pixi.feature.dev.dependencies]
 pytest = "*"
 pytest-cov = "*"
+hypothesis = "*"
 black = "*"
 flake8 = "*"
 flake8-bugbear = "*"

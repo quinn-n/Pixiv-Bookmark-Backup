@@ -1,6 +1,7 @@
 # backed-up files
 backup/
 backup-*/
+search/
 
 # VSCode
 .vscode/

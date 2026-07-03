@@ -162,6 +162,58 @@ def test_structurally_invalid_value_error_raises(tmp_path: Path) -> None:
     assert "structurally invalid" in str(exc_info.value)
 
 
+def test_author_missing_id_raises(tmp_path: Path) -> None:
+    # WorkEntry.from_dict copies "author" wholesale without reading "id", so a
+    # manifest whose author dict omits it loads through from_dict cleanly and
+    # would only crash later (e.g. --layout by-author's author['id'] subscript).
+    # load_manifest_strict must catch it up front as a teaching load error.
+    data = _valid_manifest_dict()
+    del data["works"][0]["author"]["id"]
+    path = tmp_path / "details.json"
+    _write_json(path, data)
+    with pytest.raises(ManifestLoadError) as exc_info:
+        load_manifest_strict(path)
+    message = str(exc_info.value)
+    assert "author.id" in message
+    # The offending work is named by id and title so the user can find it.
+    assert "123" in message
+    assert "A work" in message
+
+
+def test_missing_author_id_message_escapes_control_bytes(tmp_path: Path) -> None:
+    # A hand-edited manifest can smuggle control/escape bytes through work.id and
+    # work.title (neither type is enforced at runtime). The teaching message must
+    # not echo raw ESC/BEL to the terminal, so both fields are interpolated with
+    # !r; assert no raw control byte survives into the message.
+    data = _valid_manifest_dict()
+    data["works"][0]["id"] = "\x1b]0;PWNED\x07evil"
+    data["works"][0]["title"] = "t\x1bitle"
+    del data["works"][0]["author"]["id"]
+    path = tmp_path / "details.json"
+    _write_json(path, data)
+    with pytest.raises(ManifestLoadError) as exc_info:
+        load_manifest_strict(path)
+    message = str(exc_info.value)
+    assert "\x1b" not in message  # ESC escaped by repr
+    assert "\x07" not in message  # BEL escaped by repr
+    assert "author.id" in message
+    assert "PWNED" in message  # payload still visible, but as inert escaped text
+
+
+def test_author_id_null_still_loads(tmp_path: Path) -> None:
+    # The validation checks key *presence* only: a present-but-null author id
+    # does not crash any consumer today (str(None) -> "None"), so it is left
+    # valid rather than rejected -- a deliberate scope line.
+    data = _valid_manifest_dict()
+    data["works"][0]["author"]["id"] = None
+    path = tmp_path / "details.json"
+    _write_json(path, data)
+
+    manifest = load_manifest_strict(path)
+
+    assert manifest.works[0].author["id"] is None
+
+
 def test_happy_path_returns_manifest(tmp_path: Path) -> None:
     data = _valid_manifest_dict()
     path = tmp_path / "details.json"

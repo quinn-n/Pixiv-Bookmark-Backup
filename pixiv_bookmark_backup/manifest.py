@@ -413,6 +413,17 @@ def load_manifest_strict(path: Path) -> Manifest:
     :class:`ManifestLoadError`. This is the loader for read-only consumers (such
     as the ``search`` command) that must report such conditions as explicit
     errors instead of silently treating them as an empty result.
+
+    "Structurally invalid" also covers a work whose ``author`` object is missing
+    the required ``id`` key: :meth:`WorkEntry.from_dict` copies ``author``
+    wholesale without reading ``id``, so :func:`_require_author_ids` re-checks it
+    here and raises a teaching :class:`ManifestLoadError` -- otherwise a
+    hand-edited/corrupt manifest would only crash much later, with a raw
+    ``KeyError``, in a consumer that subscripts ``author['id']`` (e.g. the
+    ``--layout by-author`` symlink layout, or the default text output's
+    unknown-author fallback). This validation is intentionally confined to this
+    read-only loader so the resume loader (:func:`load_or_init`) keeps its
+    existing tolerance (see DEFERRED item #5), which is out of scope here.
     """
 
     if not path.exists():
@@ -449,9 +460,41 @@ def load_manifest_strict(path: Path) -> Manifest:
         )
 
     try:
-        return Manifest.from_dict(data)
+        manifest = Manifest.from_dict(data)
     except (KeyError, TypeError, ValueError) as exc:
         raise ManifestLoadError(f"{path} is structurally invalid: {exc}") from exc
+
+    # Runs outside the try/except above so its own ManifestLoadError propagates
+    # cleanly instead of being re-wrapped.
+    _require_author_ids(manifest, path)
+    return manifest
+
+
+def _require_author_ids(manifest: Manifest, path: Path) -> None:
+    """Raise :class:`ManifestLoadError` if any work's ``author`` lacks ``id``.
+
+    :meth:`WorkEntry.from_dict` stores the ``author`` object verbatim without
+    reading ``id``, so a manifest whose ``author`` dict omits that key loads
+    without error and only crashes later, with a raw ``KeyError``, in a consumer
+    that subscripts ``author['id']`` directly. This fail-fast check maps that
+    condition to a teaching :class:`ManifestLoadError` at load time for the
+    read-only ``search`` path. Only key *presence* is checked -- a present but
+    ``null`` id does not crash any consumer today, so it is deliberately left
+    valid. The first offending work is reported (fail fast); both ``id`` and
+    ``title`` are interpolated with ``!r`` -- neither field's declared type is
+    enforced at runtime, so a hand-edited manifest can smuggle control/escape
+    bytes into either, and ``repr`` escapes them (a normal integer id still
+    renders bare, e.g. ``123``) rather than letting them reach the terminal raw.
+    """
+
+    for work in manifest.works:
+        if "id" not in work.author:
+            raise ManifestLoadError(
+                f"{path} is structurally invalid: work {work.id!r} "
+                f"({work.title!r}) is missing required field 'author.id'. The "
+                "manifest may have been hand-edited or corrupted; re-run the "
+                "backup to regenerate it."
+            )
 
 
 def write_atomic(path: Path, manifest: Manifest) -> None:

@@ -32,8 +32,8 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import time
+import unicodedata
 from collections.abc import Callable
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -149,18 +149,38 @@ def _planned_filenames(work: BookmarkWork) -> list[str]:
     ]
 
 
-def _sanitize_display_text(s: str) -> str:
-    """Strip C0/C1 control characters from untrusted display text.
+_SANITIZED_CATEGORIES = frozenset({"Cc", "Cf"})
 
-    A Pixiv display name is attacker-controlled and may embed ANSI/OSC escape
-    sequences (terminal control chars) that would render unescaped when a
-    verbose/dry-run ``line`` is written straight to a real TTY. Removing the
-    control bytes neutralises that before the text reaches the terminal.
-    (``work.title`` is already protected by ``!r``/repr, which escapes these;
-    ``user.name`` is interpolated raw, so it is sanitised here.)
+
+def _sanitize_display_text(s: str) -> str:
+    """Strip control and format characters from untrusted display text.
+
+    A Pixiv display name is attacker-controlled and may embed:
+
+    * Unicode category ``Cc`` (C0/C1 control chars, ``\\x00-\\x1f``/``\\x7f-\\x9f``):
+      ANSI/OSC/CSI terminal escape sequences that would render unescaped when
+      a verbose/dry-run ``line`` is written straight to a real TTY.
+    * Unicode category ``Cf`` (format chars): bidirectional-override/isolate
+      controls (e.g. U+202E RIGHT-TO-LEFT OVERRIDE -- Trojan-Source-style
+      deception) and zero-width characters (e.g. U+200B ZERO WIDTH SPACE,
+      U+FEFF), which visually misrepresent the name without needing any
+      control byte.
+
+    Stripping both categories neutralises escape-sequence injection *and*
+    visual spoofing before the text reaches the terminal. (``work.title`` is
+    already protected by ``!r``/repr, which escapes non-printable characters
+    -- including every ``Cc``/``Cf`` code point -- to ``\\xXX``/``\\uXXXX``
+    sequences; ``user.name`` is interpolated raw, so it is sanitised here.)
+
+    Stripping ``Cf`` is a known, accepted display-fidelity trade-off shared
+    with mainstream Trojan-Source mitigations: it also removes the
+    zero-width joiner/non-joiner used in legitimate multi-codepoint emoji
+    (e.g. family emoji) and some Indic-script conjuncts, which may then
+    render as separate glyphs. That is preferable to leaving a spoofing
+    vector in place.
     """
 
-    return re.sub(r"[\x00-\x1f\x7f-\x9f]", "", s)
+    return "".join(c for c in s if unicodedata.category(c) not in _SANITIZED_CATEGORIES)
 
 
 def _work_event(

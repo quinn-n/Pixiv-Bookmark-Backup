@@ -52,6 +52,8 @@ flake8 = "*"
 flake8-bugbear = "*"
 basedpyright = "*"
 bandit = "*"
+pip-audit = ">=2.10.1,<3"
+filelock = ">=3.29.4,<4"
 
 # Optional `login` feature: gppt drives the real interactive Pixiv login flow.
 # It is PyPI-only (not on conda-forge) and pulls in playwright; it stays off the
@@ -70,7 +72,12 @@ fmt-check = "black --check --diff ."
 lint = "flake8"
 typecheck = "basedpyright"
 test = "pytest --cov=pixiv_bookmark_backup --cov-report=term-missing"
+# bandit has no config-file default target, so the package dir is baked in here.
+# Run it bare (`pixi run bandit`); don't also pass `-r pixiv_bookmark_backup` on
+# the CLI or bandit's argparse will see it twice and error. To scan a different
+# target ad hoc, use `pixi exec bandit -r <dir>` instead.
 bandit = "bandit -r pixiv_bookmark_backup"
+audit = "pip-audit"
 check = { depends-on = ["fmt-check", "lint", "typecheck", "test"] }
 
 # --- tooling config -------------------------------------------------------

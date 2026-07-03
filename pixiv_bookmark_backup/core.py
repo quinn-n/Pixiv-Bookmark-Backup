@@ -9,7 +9,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from datetime import date, datetime
-from enum import IntEnum
+from enum import Enum, IntEnum
 from pathlib import Path
 from typing import NamedTuple, Protocol
 
@@ -158,6 +158,48 @@ class FollowingRunSummary:
     users_total: int = 0
     users_with_works: int = 0
     following_of: str | None = None
+
+
+class ProgressKind(Enum):
+    """The category of a :class:`ProgressEvent`.
+
+    Lets a renderer switch on the event type without inspecting which fields
+    happen to be populated.
+    """
+
+    RUN_START = "run_start"
+    USER = "user"
+    WORK = "work"
+    WORK_PLANNED = "work_planned"
+
+
+@frozen
+class ProgressEvent:
+    """A structured progress notification emitted by the orchestrator.
+
+    A click-agnostic value object: the orchestrator in ``backup.py`` emits
+    these through a ``progress`` callback so it never touches any terminal or
+    rendering concern. ``line`` carries the ready-made human-readable text (for
+    a verbose mode to print verbatim); the other fields carry structured
+    counts/context so a progress-bar renderer can use them without parsing
+    strings. Unused fields keep their zero/``None`` defaults.
+    """
+
+    kind: ProgressKind
+    works_total: int = 0
+    files_downloaded: int = 0
+    files_skipped: int = 0
+    files_failed: int = 0
+    bytes_downloaded: int = 0
+    users_total: int = 0
+    index: int = 0
+    work_id: int | None = None
+    title: str | None = None
+    page_count: int | None = None
+    user_id: str | None = None
+    user_name: str | None = None
+    planned: tuple[str, ...] = field(factory=tuple)
+    line: str | None = None
 
 
 class ExitCode(IntEnum):

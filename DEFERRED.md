@@ -119,8 +119,39 @@ asserting the subcommand dispatches rather than binding to `USER_ID`.
 
 ## Manifest loading
 
-### 5. Harden `load_or_init` against a corrupt or deeply-nested manifest
-*Source: security review of the `search` feature (out of scope there). Behavior change.*
+### 5. Harden `load_or_init` against a corrupt or deeply-nested manifest — DONE
+*Source: security review of the `search` feature (out of scope there). Behavior change. Supersedes closed PR #13, whose silent-`.bak`+regenerate-on-corrupt approach the maintainer rejected.*
+
+Done with a **fail-loud** policy (the maintainer's decision), *not* the rejected
+silent-regenerate approach. `load_or_init` in `manifest.py` now wraps the
+`json.load` in `except json.JSONDecodeError` / `except RecursionError` and guards
+`isinstance(data, dict)`, raising a teaching `ManifestLoadError` (naming the path,
+explaining the file looks corrupt/hand-edited, and how to recover) on a corrupt,
+deeply-nested, or non-object manifest — the corrupt file is **left untouched on
+disk**, never silently discarded. `OSError` from opening the file is deliberately
+*not* caught here so `backup.py`'s `_load_existing_manifest` (narrowed from
+`except (json.JSONDecodeError, OSError)` to `except OSError`) keeps its genuine
+I/O-recovery path. The `backup` and `backup-following` click commands map
+`ManifestLoadError` → `click.UsageError` (exit 2), mirroring the `search`
+command exactly — clean stderr message, no traceback, no partial summary on
+stdout.
+
+A genuine `schema_version` mismatch keeps the safe move-aside-to-`details.json.bak`
++ regenerate behavior (a routine tool-version bump must not block resume) but is
+**no longer silent**: it is announced on stderr, naming the `.bak` file. The
+announcement is emitted via an injected click-agnostic `warn` callback threaded
+through `run()`/`run_following()` → `_flush_manifest`/`_flush_following_manifest`,
+so `manifest.py`/`backup.py` stay click-free; `cli.py` wires `warn` to
+`click.echo("Warning: ...", err=True)` (reusing the reporter-aware closure the
+`backup-following` `--only` warning already used, and adding an equivalent to the
+`backup` command). A structurally-valid dict with a matching schema but missing
+required keys (raw `KeyError` from `Manifest.from_dict`) is deliberately left out
+of scope. Tests were inverted to assert the fail-loud behavior (unit at the
+loader level and CLI level via `CliRunner` for both commands) plus a
+schema-mismatch test asserting the new stderr `.bak` warning. Kept here for
+history.
+
+Original report below.
 
 `load_or_init` in `manifest.py` (the resume-oriented loader used by `backup` /
 `backup-following`) calls `json.load(handle)` with no exception handling. Two

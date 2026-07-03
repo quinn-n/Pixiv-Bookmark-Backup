@@ -168,7 +168,7 @@ def _build_reporter(
     verbose: int,
     dry_run: bool,
     total: int | None,
-    unit: str,
+    unit: ProgressUnit,
 ) -> ProgressReporter:
     """Build the :class:`ProgressReporter` shared by ``backup`` and
     ``backup_following``.
@@ -476,9 +476,19 @@ def backup(
     # records the start timestamp.
     reporter.handle(ProgressEvent(kind=ProgressKind.RUN_START))
 
+    def _warn(msg: str) -> None:
+        # A warning emitted from inside run_backup may land while the live bar is
+        # still on screen; clear the dangling bar line first (finish() is
+        # idempotent, so the inner finally calling it again is harmless) so the
+        # warning prints on its own clean line instead of after the spinner.
+        reporter.finish()
+        click.echo(f"Warning: {msg}", err=True)
+
     try:
         try:
-            summary = run_backup(run_config, auth, client, progress=reporter.handle)
+            summary = run_backup(
+                run_config, auth, client, progress=reporter.handle, warn=_warn
+            )
         finally:
             # finish() lives in this INNER finally so it runs before any outer
             # except body: on KeyboardInterrupt the dangling bar line is erased
@@ -488,6 +498,11 @@ def backup(
             # (and nowhere else) is safe.
             reporter.finish()
     except BackupUsageError as exc:
+        raise click.UsageError(str(exc)) from exc
+    except ManifestLoadError as exc:
+        # A corrupt/hand-edited existing details.json on resume: surface the
+        # teaching message and exit cleanly (2), mirroring the search command --
+        # never a raw traceback, and no partial summary reaches stdout.
         raise click.UsageError(str(exc)) from exc
     except AuthRejected as exc:
         raise _exit_error(str(exc), int(ExitCode.AUTH)) from exc
@@ -840,6 +855,11 @@ def backup_following(
             # finish() is idempotent, so the normal-return path calling it here
             # (and nowhere else) is safe.
             reporter.finish()
+    except ManifestLoadError as exc:
+        # A corrupt/hand-edited existing details.json on resume: surface the
+        # teaching message and exit cleanly (2), mirroring the search command --
+        # never a raw traceback, and no partial summary reaches stdout.
+        raise click.UsageError(str(exc)) from exc
     except AuthRejected as exc:
         raise _exit_error(str(exc), int(ExitCode.AUTH)) from exc
     except ApiError as exc:

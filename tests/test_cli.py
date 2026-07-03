@@ -1068,3 +1068,65 @@ def test_time_per_request_absent_from_json_payload(
     # The summary schema is unchanged: the pacing knob is not a JSON field.
     assert payload["schema"] == 1
     assert "time_per_request" not in payload
+
+
+# -- resume manifest: corrupt fails loud, schema mismatch warns ---------
+
+
+def test_corrupt_manifest_fails_loud_exit_2(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "details.json").write_text("this is not json {{{", encoding="utf-8")
+    client = FakePixivClient({"public": [_make_work(100, pages=1)]})
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        ["backup", "--output-dir", str(out), "--config", _missing_config(tmp_path)],
+        env=_token_env(),
+    )
+
+    # Clean, teaching exit -- not a traceback, not a silent regenerate.
+    assert result.exit_code == 2
+    assert "not valid JSON" in result.stderr
+    assert "rename or delete it" in result.stderr
+    assert str(out / "details.json") in result.stderr
+    assert "Traceback" not in result.output
+    # No summary line reached stdout.
+    assert "Backed up" not in result.stdout
+    # The corrupt file is left in place; nothing moved aside.
+    assert (out / "details.json").read_text(encoding="utf-8") == "this is not json {{{"
+    assert not (out / "details.json.bak").exists()
+
+
+def test_schema_mismatch_regenerates_and_warns_on_stderr(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "out"
+    out.mkdir()
+    details = out / "details.json"
+    details.write_text(
+        json.dumps({"schema_version": 999, "generated_at": "", "source": {}}),
+        encoding="utf-8",
+    )
+    client = FakePixivClient({"public": [_make_work(100, pages=1)]})
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        ["backup", "--output-dir", str(out), "--config", _missing_config(tmp_path)],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    # The regenerate still happens...
+    assert (out / "details.json.bak").exists()
+    manifest = json.loads(details.read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == 1
+    # ...but is now announced on stderr, naming the .bak file.
+    assert "Warning:" in result.stderr
+    assert str(out / "details.json.bak") in result.stderr
+    # The run summary still lands on stdout.
+    assert "Backed up 1/1 works" in result.stdout

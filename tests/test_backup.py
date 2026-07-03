@@ -30,6 +30,7 @@ from pixiv_bookmark_backup.core import (
     decide_exit_code,
 )
 from pixiv_bookmark_backup.downloader import ImageResult
+from pixiv_bookmark_backup.manifest import ManifestLoadError
 from pixiv_bookmark_backup.models import (
     Author,
     BookmarkWork,
@@ -757,7 +758,7 @@ def test_resume_merges_with_prior_manifest(
 # -- schema mismatch / corruption ---------------------------------------
 
 
-def test_schema_mismatch_backs_up_and_regenerates(
+def test_schema_mismatch_backs_up_regenerates_and_warns(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _patch_downloads(monkeypatch)
@@ -768,16 +769,28 @@ def test_schema_mismatch_backs_up_and_regenerates(
     works = {"public": [_make_work(100, pages=1)]}
     client = FakePixivClient(works)
 
-    _run(_config(tmp_path), client)
+    warnings: list[str] = []
+    run(
+        _config(tmp_path),
+        _auth(),
+        client,
+        clock=lambda: FIXED_CLOCK,
+        warn=warnings.append,
+    )
 
-    assert (tmp_path / "details.json.bak").exists()
+    bak = tmp_path / "details.json.bak"
+    assert bak.exists()
     manifest = _read_manifest(tmp_path)
     assert manifest["schema_version"] == 1
     # The stale work was not carried over; only the freshly backed-up one is in.
     assert {work["id"] for work in manifest["works"]} == {100}
+    # The move-aside is now announced (no longer silent), naming the .bak file.
+    assert len(warnings) == 1
+    assert str(bak) in warnings[0]
+    assert str(details) in warnings[0]
 
 
-def test_corrupt_manifest_backs_up_and_regenerates(
+def test_corrupt_manifest_fails_loud_and_is_left_in_place(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _patch_downloads(monkeypatch)
@@ -786,12 +799,51 @@ def test_corrupt_manifest_backs_up_and_regenerates(
     works = {"public": [_make_work(100, pages=1)]}
     client = FakePixivClient(works)
 
-    _run(_config(tmp_path), client)
+    with pytest.raises(ManifestLoadError) as excinfo:
+        _run(_config(tmp_path), client)
 
-    assert (tmp_path / "details.json.bak").exists()
+    # Fail loud: teaching message names the file; the corrupt manifest is left
+    # untouched (not moved aside, not regenerated).
+    assert str(details) in str(excinfo.value)
+    assert "not valid JSON" in str(excinfo.value)
+    assert details.read_text(encoding="utf-8") == "this is not json {{{"
+    assert not (tmp_path / "details.json.bak").exists()
+
+
+def test_unreadable_manifest_recovers_backs_up_and_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A genuine I/O error (OSError) reading the existing manifest -- distinct
+    # from corrupt JSON -- keeps the old recovery: move aside to .bak, regenerate,
+    # and announce it. load_or_init lets OSError propagate; _load_existing_manifest
+    # recovers from it.
+    _patch_downloads(monkeypatch)
+    details = tmp_path / "details.json"
+    details.write_text("{}", encoding="utf-8")
+
+    def _raise_oserror(_path: Path) -> tuple[Any, bool]:
+        raise OSError("disk gremlins")
+
+    monkeypatch.setattr(backup, "load_or_init", _raise_oserror)
+
+    works = {"public": [_make_work(100, pages=1)]}
+    client = FakePixivClient(works)
+
+    warnings: list[str] = []
+    run(
+        _config(tmp_path),
+        _auth(),
+        client,
+        clock=lambda: FIXED_CLOCK,
+        warn=warnings.append,
+    )
+
+    bak = tmp_path / "details.json.bak"
+    assert bak.exists()
     manifest = _read_manifest(tmp_path)
-    assert manifest["schema_version"] == 1
     assert {work["id"] for work in manifest["works"]} == {100}
+    assert len(warnings) == 1
+    assert str(bak) in warnings[0]
 
 
 # -- SIGINT / KeyboardInterrupt -----------------------------------------
@@ -810,6 +862,28 @@ def test_keyboard_interrupt_flushes_partial_and_reraises(
     # A partial manifest with the one processed work was flushed before re-raise.
     manifest = _read_manifest(tmp_path)
     assert {work["id"] for work in manifest["works"]} == {100}
+
+
+def test_keyboard_interrupt_with_corrupt_manifest_surfaces_load_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # When a KeyboardInterrupt fires but the existing details.json is corrupt,
+    # the interrupt-path flush raises ManifestLoadError, which takes precedence
+    # over the KeyboardInterrupt (CLI -> exit 2, corrupt file left in place). Lock
+    # in that precedence rather than leaving it incidental.
+    _patch_downloads(monkeypatch)
+    details = tmp_path / "details.json"
+    details.write_text("this is not json {{{", encoding="utf-8")
+    works = {"public": [_make_work(100, pages=1), _make_work(200, pages=1)]}
+    client = FakePixivClient(works, raise_after=1, raise_exc=KeyboardInterrupt)
+
+    with pytest.raises(ManifestLoadError) as excinfo:
+        _run(_config(tmp_path), client)
+
+    assert "not valid JSON" in str(excinfo.value)
+    # The corrupt file is untouched and no partial manifest was persisted.
+    assert details.read_text(encoding="utf-8") == "this is not json {{{"
+    assert not (tmp_path / "details.json.bak").exists()
 
 
 # -- network mid-run ----------------------------------------------------

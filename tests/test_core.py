@@ -17,6 +17,7 @@ from pixiv_bookmark_backup.core import (
     ProgressKind,
     RequestPacer,
     RunSummary,
+    VISIBILITIES,
     decide_exit_code,
     describe_plan,
 )
@@ -148,7 +149,7 @@ def test_following_run_summary_defaults() -> None:
 
 def test_following_config_defaults(tmp_path: Path) -> None:
     config = FollowingConfig(output_dir=tmp_path)
-    assert config.follows == "public"
+    assert config.follow_visibility == "public"
     assert config.dry_run is False
     assert config.limit is None
     assert config.since is None
@@ -172,7 +173,7 @@ def test_following_config_output_dir_is_coerced_to_path() -> None:
 def test_following_config_all_fields_construct_and_validate(tmp_path: Path) -> None:
     config = FollowingConfig(
         output_dir=tmp_path,
-        follows="private",
+        follow_visibility="private",
         dry_run=True,
         limit=10,
         since=date(2024, 1, 1),
@@ -187,16 +188,26 @@ def test_following_config_all_fields_construct_and_validate(tmp_path: Path) -> N
         only=("illust",),
         exclude=("manga",),
     )
-    assert config.follows == "private"
+    assert config.follow_visibility == "private"
     assert config.per_user_limit == 4
     assert config.max_users == 20
     assert config.only == ("illust",)
     assert config.exclude == ("manga",)
 
 
-def test_following_config_invalid_follows_is_rejected(tmp_path: Path) -> None:
+@pytest.mark.parametrize("visibility", VISIBILITIES)
+def test_following_config_accepts_every_visibility(
+    tmp_path: Path, visibility: str
+) -> None:
+    config = FollowingConfig(output_dir=tmp_path, follow_visibility=visibility)
+    assert config.follow_visibility == visibility
+
+
+def test_following_config_invalid_follow_visibility_is_rejected(
+    tmp_path: Path,
+) -> None:
     with pytest.raises(ValueError):
-        FollowingConfig(output_dir=tmp_path, follows="bogus")
+        FollowingConfig(output_dir=tmp_path, follow_visibility="bogus")
 
 
 def test_following_config_limit_zero_is_rejected(tmp_path: Path) -> None:

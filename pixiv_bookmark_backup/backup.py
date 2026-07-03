@@ -103,17 +103,17 @@ def _restrict_passes(visibility: str) -> list[str]:
     return [visibility]
 
 
-def _follow_passes(follows: str) -> list[str]:
-    """Return the Pixiv follow-list ``restrict`` passes for ``follows``.
+def _follow_passes(follow_visibility: str) -> list[str]:
+    """Return the Pixiv follow-list ``restrict`` passes for ``follow_visibility``.
 
     Mirrors :func:`_restrict_passes`: ``"all"`` is expanded into the two
     concrete passes (your public follows then your private follows); ``"public"``
     / ``"private"`` map to a single pass.
     """
 
-    if follows == "all":
+    if follow_visibility == "all":
         return ["public", "private"]
-    return [follows]
+    return [follow_visibility]
 
 
 def _passes_since(work: BookmarkWork, since: date | None) -> bool:
@@ -626,7 +626,8 @@ def run_following(
     """Back up the works of every followed user and return a summary.
 
     Authenticates, then iterates the authenticated user's follow list across the
-    requested :attr:`~pixiv_bookmark_backup.core.FollowingConfig.follows` passes,
+    passes requested by
+    :attr:`~pixiv_bookmark_backup.core.FollowingConfig.follow_visibility`,
     backing up each followed user's works into a per-author subdirectory
     (``<output_dir>/<author_id>/``). A single aggregate ``details.json`` is
     written at the output root (unless ``dry_run``).
@@ -720,14 +721,15 @@ def _iterate_following(
 
     Applies ``--only``/``--exclude`` (compared by ``str(user.id)``), dedups users
     across passes (so a user followed both publicly and privately is processed
-    once under ``follows="all"``), and stops the whole run once ``--max-users``
-    users have been processed. Per-user work processing -- and the ``--limit``
-    stop signal -- is delegated to :func:`_process_following_user`.
+    once under ``follow_visibility="all"``), and stops the whole run once
+    ``--max-users`` users have been processed. Per-user work processing -- and
+    the ``--limit`` stop signal -- is delegated to
+    :func:`_process_following_user`.
     ``ApiError`` from the follow-list listing and ``KeyboardInterrupt`` propagate
     to :func:`run_following`, which owns recovery.
     """
 
-    for restrict in _follow_passes(config.follows):
+    for restrict in _follow_passes(config.follow_visibility):
         for user in client.iter_following(self_id, restrict):
             uid = str(user.id)
             if uid in seen_users:
@@ -914,6 +916,8 @@ def _flush_following_manifest(
     if schema_mismatch and details_path.exists():
         os.replace(details_path, details_path.with_name(MANIFEST_BACKUP_NAME))
 
-    new = new_following_manifest(following_of, config.follows, clock(), works, errors)
+    new = new_following_manifest(
+        following_of, config.follow_visibility, clock(), works, errors
+    )
     final = merge(existing, new)
     write_atomic(details_path, final)

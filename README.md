@@ -90,7 +90,7 @@ pixiv-bookmark-backup backup 12345 --limit 50 --since 2025-01-01
 
 ```bash
 pixiv-bookmark-backup backup-following --dry-run
-pixiv-bookmark-backup backup-following --follows all --per-user-limit 20
+pixiv-bookmark-backup backup-following --follow-visibility all --per-user-limit 20
 pixiv-bookmark-backup backup-following -o ./out --only 123 --only 456
 ```
 

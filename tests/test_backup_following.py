@@ -608,7 +608,7 @@ def test_follows_public_single_pass(
 ) -> None:
     _patch_downloads(monkeypatch)
     client = FakeFollowingClient({"public": [_make_user(10)]}, {"10": []})
-    _run(_config(tmp_path, follows="public"), client)
+    _run(_config(tmp_path, follow_visibility="public"), client)
     assert [restrict for _uid, restrict in client.following_calls] == ["public"]
 
 
@@ -617,7 +617,7 @@ def test_follows_private_single_pass(
 ) -> None:
     _patch_downloads(monkeypatch)
     client = FakeFollowingClient({"private": [_make_user(10)]}, {"10": []})
-    _run(_config(tmp_path, follows="private"), client)
+    _run(_config(tmp_path, follow_visibility="private"), client)
     assert [restrict for _uid, restrict in client.following_calls] == ["private"]
 
 
@@ -637,7 +637,7 @@ def test_follows_all_two_passes_dedups_user(
     }
     client = FakeFollowingClient(following, works)
 
-    summary = _run(_config(tmp_path, follows="all"), client)
+    summary = _run(_config(tmp_path, follow_visibility="all"), client)
 
     assert [restrict for _uid, restrict in client.following_calls] == [
         "public",

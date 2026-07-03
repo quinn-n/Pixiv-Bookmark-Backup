@@ -108,11 +108,11 @@ class FollowingConfig:
 
     Unlike :class:`BackupConfig`, this has no ``user_id`` or ``visibility``:
     the works backed up are those of the authenticated user's followed
-    creators, selected via ``follows``.
+    creators, selected via ``follow_visibility``.
     """
 
     output_dir: Path = field(converter=Path)
-    follows: str = field(default="public", validator=in_(("public", "private", "all")))
+    follow_visibility: str = field(default="public", validator=in_(VISIBILITIES))
     dry_run: bool = field(default=False, validator=instance_of(bool))
     limit: int | None = field(
         default=None, validator=optional([instance_of(int), ge(1)])

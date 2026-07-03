@@ -188,9 +188,17 @@ def test_help_lists_new_flags_and_omits_visibility(runner: CliRunner) -> None:
     assert result.exit_code == 0
     out = result.output
     assert "Back up works from the Pixiv users you follow." in out
-    for flag in ("--follows", "--per-user-limit", "--max-users", "--only", "--exclude"):
+    for flag in (
+        "--follow-visibility",
+        "--per-user-limit",
+        "--max-users",
+        "--only",
+        "--exclude",
+    ):
         assert flag in out
     assert "./backup-following" in out
+    # The flag is --follow-visibility, not the old --follows spelling.
+    assert "--follows" not in out
     # This command has no --visibility axis and no positional USER_ID argument.
     assert "--visibility" not in out
     assert "[USER_ID]" not in out and "USER_ID]" not in out.split("Options")[0]
@@ -415,7 +423,7 @@ def test_options_plumbed_into_config(
             _missing_config(tmp_path),
             "--output-dir",
             str(tmp_path / "out"),
-            "--follows",
+            "--follow-visibility",
             "all",
             "--limit",
             "5",
@@ -434,7 +442,7 @@ def test_options_plumbed_into_config(
     assert result.exit_code == 0, result.output
     config = captured["config"]
     assert isinstance(config, FollowingConfig)
-    assert config.follows == "all"
+    assert config.follow_visibility == "all"
     assert config.limit == 5
     assert config.per_user_limit == 3
     assert config.max_users == 2
@@ -456,6 +464,53 @@ def test_default_output_dir(
 
     assert result.exit_code == 0, result.output
     assert captured["config"].output_dir == Path("./backup-following")
+
+
+def test_old_follows_flag_is_rejected(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pre-rename ``--follows`` spelling is gone; click rejects it (exit 2)."""
+    _install_run_following(monkeypatch)
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup-following",
+            "--config",
+            _missing_config(tmp_path),
+            "--follows",
+            "all",
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 2
+    assert "No such option" in result.output
+    assert "--follows" in result.output
+    # Click helpfully points users at the new spelling.
+    assert "--follow-visibility" in result.output
+
+
+def test_follow_visibility_invalid_choice_is_rejected(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A value outside VISIBILITIES is rejected by click.Choice (exit 2)."""
+    _install_run_following(monkeypatch)
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup-following",
+            "--config",
+            _missing_config(tmp_path),
+            "--follow-visibility",
+            "bogus",
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 2
+    assert "'bogus'" in result.output
 
 
 # -- exit-code mapping (scripted run_following) ------------------------

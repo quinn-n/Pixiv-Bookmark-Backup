@@ -46,8 +46,18 @@ need to diverge.
 
 ## Entry point
 
-### 4. `python -m pixiv_bookmark_backup` bypasses the click group
+### 4. `python -m pixiv_bookmark_backup` bypasses the click group — DONE
 *Source: cli-tester (during the `--time-per-request` feature). Pre-existing bug, unrelated to that feature. Behavior fix.*
+
+Fixed: `__main__.py` now does `from .cli import cli` / `cli()`, so the module
+invocation dispatches through the group exactly like the console script.
+Regression coverage lives in `tests/test_main_module.py`, which spawns a real
+`python -m pixiv_bookmark_backup ...` subprocess (a `CliRunner` test invokes the
+group object directly and so would not catch this wiring bug) and asserts that
+`backup-following`/`login`/`search` dispatch to their own subcommands rather than
+binding to `backup`'s `USER_ID` positional. Kept here for history.
+
+Original report below.
 
 `pixiv_bookmark_backup/__main__.py` does `from .cli import backup` / `backup()`,
 so running `python -m pixiv_bookmark_backup ...` always invokes the standalone

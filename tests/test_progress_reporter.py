@@ -9,6 +9,7 @@ involved -- exactly what the injected-dependency design in
 from __future__ import annotations
 
 import io
+from typing import Literal
 
 import pytest
 from hypothesis import given
@@ -48,7 +49,7 @@ def make_reporter(
     *,
     show_planned: bool = False,
     total: int | None = None,
-    unit: str = "works",
+    unit: Literal["works", "users"] = "works",
     ascii_only: bool = True,
 ) -> ProgressReporter:
     return ProgressReporter(

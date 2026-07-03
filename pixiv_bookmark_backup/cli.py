@@ -14,7 +14,7 @@ import datetime
 import json
 import sys
 from pathlib import Path
-from typing import TextIO
+from typing import Literal, TextIO
 
 import click
 
@@ -743,6 +743,7 @@ def backup_following(
     # works; otherwise --max-users bounds the run in users; with neither the bar
     # is indeterminate (spinner + running counts).
     total: int | None
+    unit: Literal["works", "users"]
     if limit is not None:
         total = limit
         unit = "works"

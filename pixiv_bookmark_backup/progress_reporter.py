@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import time
 from enum import Enum
-from typing import Callable, TextIO
+from typing import Callable, Literal, TextIO
 
 from attrs import define, field
 
@@ -106,7 +106,7 @@ class ProgressReporter:
     total: int | None
     """Determinate denominator (e.g. ``--limit``), or ``None`` if unknown."""
 
-    unit: str
+    unit: Literal["works", "users"]
     """What ``total`` counts: ``"works"`` or ``"users"``."""
 
     ascii_only: bool

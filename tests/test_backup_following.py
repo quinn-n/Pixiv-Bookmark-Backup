@@ -12,13 +12,18 @@ files are byte-stable.
 
 from __future__ import annotations
 
+import io
 import json
+import tempfile
 from collections.abc import Callable, Iterator
 from datetime import date
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 import pytest
+from hypothesis import assume, given, settings
+from hypothesis import strategies as st
 
 from pixiv_bookmark_backup import backup
 from pixiv_bookmark_backup.backup import run_following
@@ -27,6 +32,8 @@ from pixiv_bookmark_backup.core import (
     ExitCode,
     FollowingConfig,
     FollowingRunSummary,
+    ProgressEvent,
+    ProgressKind,
     decide_exit_code,
 )
 from pixiv_bookmark_backup.downloader import ImageResult
@@ -43,6 +50,7 @@ from pixiv_bookmark_backup.pixiv_client import (
     FollowedUser,
     PixivClient,
 )
+from pixiv_bookmark_backup.progress_reporter import ProgressReporter, ReporterMode
 from pixiv_bookmark_backup.ugoira import UgoiraResult
 
 from conftest import ScriptedMonotonic, SpySleep
@@ -1012,3 +1020,359 @@ def test_unavailable_work_recorded_not_counted(
     manifest = _read_manifest(tmp_path)
     assert {work["id"] for work in manifest["works"]} == {2}
     assert any(err.get("work_id") == 1 for err in manifest["errors"])
+
+
+# -- progress events ----------------------------------------------------
+
+
+def _run_events(
+    config: FollowingConfig, client: FakeFollowingClient
+) -> list[ProgressEvent]:
+    """Run ``run_following`` collecting emitted :class:`ProgressEvent`s in order."""
+
+    events: list[ProgressEvent] = []
+    run_following(
+        config, _auth(), client, progress=events.append, clock=lambda: FIXED_CLOCK
+    )
+    return events
+
+
+def test_user_events_carry_fields_and_running_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each followed user yields a USER event with live ``users_total``."""
+    _patch_downloads(monkeypatch)
+    following = {"public": [_make_user(10, name="Alice"), _make_user(20, name="Bob")]}
+    works = {
+        "10": [_make_work(101, author_id=10)],
+        "20": [_make_work(201, author_id=20)],
+    }
+    client = FakeFollowingClient(following, works)
+
+    events = _run_events(_config(tmp_path), client)
+
+    user_events = [e for e in events if e.kind == ProgressKind.USER]
+    assert len(user_events) == 2
+    assert [(e.user_id, e.user_name) for e in user_events] == [
+        ("10", "Alice"),
+        ("20", "Bob"),
+    ]
+    # users_total is the running count at emit time (1 then 2).
+    assert [e.users_total for e in user_events] == [1, 2]
+    # Line wording preserved verbatim.
+    assert user_events[0].line == "user 10 (Alice)"
+    assert user_events[1].line == "user 20 (Bob)"
+
+
+def test_work_events_carry_live_counts_across_users(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WORK events snapshot counts AFTER each work, across per-author scope."""
+    _patch_downloads(monkeypatch)
+    following = {"public": [_make_user(10), _make_user(20)]}
+    works = {
+        "10": [_make_work(101, author_id=10, pages=2)],
+        "20": [_make_work(201, author_id=20, pages=1)],
+    }
+    client = FakeFollowingClient(following, works)
+
+    events = _run_events(_config(tmp_path), client)
+
+    work_events = [e for e in events if e.kind == ProgressKind.WORK]
+    assert len(work_events) == 2
+    # After user 10's 2-page work.
+    assert (
+        work_events[0].works_total,
+        work_events[0].files_downloaded,
+        work_events[0].bytes_downloaded,
+    ) == (1, 2, 20)
+    assert work_events[0].user_id == "10"
+    # After user 20's 1-page work: totals climbed, never lagging.
+    assert (
+        work_events[1].works_total,
+        work_events[1].files_downloaded,
+        work_events[1].bytes_downloaded,
+    ) == (2, 3, 30)
+    assert work_events[1].user_id == "20"
+
+
+def test_work_event_line_preserves_exact_wording(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The per-user WORK event ``line`` matches today's wording byte-for-byte."""
+    _patch_downloads(monkeypatch)
+    following = {"public": [_make_user(10)]}
+    works = {"10": [_make_work(101, author_id=10, title="A Work")]}
+    client = FakeFollowingClient(following, works)
+
+    events = _run_events(_config(tmp_path), client)
+
+    work_events = [e for e in events if e.kind == ProgressKind.WORK]
+    assert len(work_events) == 1
+    event = work_events[0]
+    # Literal copied verbatim from backup.py (2-space indent, U+2014 em dash).
+    assert event.line == "  101 'A Work' — 1 page(s)"
+    assert event.index == 1
+    assert event.work_id == 101
+
+
+def test_dry_run_emits_work_then_planned_with_bare_filenames(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Dry-run emits WORK then WORK_PLANNED; planned names are bare (not nested).
+
+    ``_planned_filenames`` returns flat-layout names, so the following-mode
+    "would create" preview shows bare ``<id>_pN.jpg`` (a pre-existing quirk),
+    even though the on-disk layout nests works under the author id.
+    """
+    _patch_downloads(monkeypatch)
+    following = {"public": [_make_user(10)]}
+    works = {"10": [_make_work(101, author_id=10, pages=2)]}
+    client = FakeFollowingClient(following, works)
+
+    events = _run_events(_config(tmp_path, dry_run=True), client)
+
+    work_kinds = [
+        e.kind
+        for e in events
+        if e.kind in (ProgressKind.WORK, ProgressKind.WORK_PLANNED)
+    ]
+    assert work_kinds == [ProgressKind.WORK, ProgressKind.WORK_PLANNED]
+    # The dry-run WORK event fires AFTER tallying, so its counts are live.
+    work_event = next(e for e in events if e.kind == ProgressKind.WORK)
+    assert work_event.works_total == 1
+    assert work_event.files_downloaded == 2
+    planned_event = next(e for e in events if e.kind == ProgressKind.WORK_PLANNED)
+    assert planned_event.planned == ("101_p0.jpg", "101_p1.jpg")
+    assert planned_event.line == "    would create: 101_p0.jpg, 101_p1.jpg"
+    assert planned_event.work_id == 101
+    assert planned_event.user_id == "10"
+
+
+def test_unavailable_work_still_emits_work_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unavailable followed-user work emits a WORK event but is not counted."""
+    _patch_downloads(monkeypatch)
+    following = {"public": [_make_user(10)]}
+    unavailable = _make_work(1, author_id=10, pages=0)
+    good = _make_work(2, author_id=10)
+    client = FakeFollowingClient(following, {"10": [unavailable, good]})
+
+    events = _run_events(_config(tmp_path, per_user_limit=5), client)
+
+    work_events = [e for e in events if e.kind == ProgressKind.WORK]
+    # Both works emit a WORK event, including the unavailable one.
+    assert [e.work_id for e in work_events] == [1, 2]
+    # The unavailable work's event carries pre-tally counts (nothing counted yet).
+    assert work_events[0].works_total == 0
+    assert work_events[0].user_id == "10"
+    # The good work's event reflects it having been counted.
+    assert work_events[1].works_total == 1
+
+
+class _SteppingClock:
+    """A monotonic clock that advances a fixed step on every call.
+
+    Stepping ~1s per call defeats the reporter's first-draw delay and inter-draw
+    throttle, so *every* fed event actually renders -- exactly what a
+    non-vacuous "the bar never shows a 0 numerator" assertion needs.
+    """
+
+    def __init__(self, step: float = 1.0) -> None:
+        self._value = 0.0
+        self._step = step
+
+    def __call__(self) -> float:
+        now = self._value
+        self._value += self._step
+        return now
+
+
+def test_work_events_carry_running_users_total_in_following(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: WORK events must carry the running ``users_total``.
+
+    The bug: ``_work_event`` left ``users_total`` at its ``0`` default, so a
+    ``unit="users"`` bar/milestone rendered ``0`` for every WORK event (jumping
+    back only on the next USER event). Guard directly on the *real* event stream
+    (immune to bar throttling): once a USER event establishes ``users_total=k``,
+    every following WORK event until the next USER must also report ``k``.
+    """
+    _patch_downloads(monkeypatch)
+    following = {"public": [_make_user(10), _make_user(20)]}
+    works = {
+        "10": [_make_work(101, author_id=10), _make_work(102, author_id=10)],
+        "20": [_make_work(201, author_id=20)],
+    }
+    client = FakeFollowingClient(following, works)
+
+    events = _run_events(_config(tmp_path), client)
+
+    current_users = 0
+    saw_work = False
+    for event in events:
+        if event.kind is ProgressKind.USER:
+            current_users = event.users_total
+        elif event.kind is ProgressKind.WORK:
+            saw_work = True
+            assert current_users > 0  # a USER event already ran
+            assert event.users_total == current_users, (
+                "WORK event regressed users_total to "
+                f"{event.users_total} (expected {current_users})"
+            )
+    assert saw_work  # the loop actually exercised WORK events
+
+
+@settings(deadline=None)
+@given(
+    works_per_user=st.lists(
+        st.integers(min_value=0, max_value=3), min_size=1, max_size=6
+    )
+)
+def test_work_events_users_total_never_regresses_for_any_shape(
+    works_per_user: list[int],
+) -> None:
+    """Property version of the regression above: for ANY number of followed
+    users with ANY number of works each (including a user with zero works), a
+    WORK event's ``users_total`` must equal the most recently seen USER
+    event's ``users_total`` -- never regress to 0 or lag behind.
+
+    Deliberately avoids the ``monkeypatch``/``tmp_path`` fixtures the fixed
+    example above uses: pytest fixtures are set up once per outer test call,
+    not once per Hypothesis example, so reusing them here would let state
+    leak across examples. A plain ``mock.patch.object`` and
+    ``TemporaryDirectory`` are (re-)applied fresh inside the function body on
+    every example instead. ``deadline=None`` because the real (if fake)
+    filesystem I/O through ``run_following`` can occasionally exceed
+    Hypothesis's default per-example deadline under CI load.
+    """
+    # At least one followed user must actually have works, or the WORK-event
+    # assertions below would pass vacuously on an all-zero-works shape.
+    assume(any(count > 0 for count in works_per_user))
+
+    following = {"public": [_make_user(10 + i) for i in range(len(works_per_user))]}
+    works: dict[str, list[BookmarkWork]] = {}
+    work_id = 1000
+    for i, count in enumerate(works_per_user):
+        uid = str(10 + i)
+        works[uid] = [_make_work(work_id + j, author_id=10 + i) for j in range(count)]
+        work_id += count
+    client = FakeFollowingClient(following, works)
+
+    with (
+        mock.patch.object(
+            backup,
+            "download_image",
+            return_value=ImageResult(ImageStatus.DOWNLOADED, 10, None),
+        ),
+        mock.patch.object(
+            backup,
+            "build_ugoira",
+            return_value=UgoiraResult(ImageStatus.DOWNLOADED, 20, None),
+        ),
+        tempfile.TemporaryDirectory() as tmp,
+    ):
+        events = _run_events(_config(Path(tmp)), client)
+
+    current_users = 0
+    for event in events:
+        if event.kind is ProgressKind.USER:
+            current_users = event.users_total
+        elif event.kind is ProgressKind.WORK:
+            assert current_users > 0
+            assert event.users_total == current_users, (
+                "WORK event regressed users_total to "
+                f"{event.users_total} (expected {current_users})"
+            )
+
+
+def test_users_bar_never_shows_zero_numerator_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: a real ``unit="users"`` BAR must never render ``0/N users``.
+
+    Drives the full pipeline -- ``run_following`` -> real ``ProgressEvent``s ->
+    a real ``ProgressReporter(unit="users", total=N, mode=BAR)`` with a clock
+    that steps every event so nothing is throttled away. The first emitted event
+    is a USER with ``users_total>=1``, so a ``0`` numerator could only come from
+    the WORK-event bug.
+    """
+    _patch_downloads(monkeypatch)
+    following = {"public": [_make_user(10), _make_user(20)]}
+    works = {
+        "10": [_make_work(101, author_id=10), _make_work(102, author_id=10)],
+        "20": [_make_work(201, author_id=20)],
+    }
+    client = FakeFollowingClient(following, works)
+
+    stream = io.StringIO()
+    reporter = ProgressReporter(
+        stream=stream,
+        mode=ReporterMode.BAR,
+        show_planned=False,
+        total=2,
+        unit="users",
+        ascii_only=True,
+        clock=_SteppingClock(),
+    )
+    run_following(
+        _config(tmp_path, max_users=2),
+        _auth(),
+        client,
+        progress=reporter.handle,
+        clock=lambda: FIXED_CLOCK,
+    )
+    reporter.finish()
+
+    out = stream.getvalue()
+    assert "0/2 users" not in out
+    assert "1/2 users" in out  # the running count is actually rendered
+    assert "2/2 users" in out
+
+
+def test_user_line_strips_control_characters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A malicious display name's control bytes must not reach the ``line``.
+
+    ``user.name`` is interpolated raw into the verbose per-user line (unlike
+    ``work.title``, protected by ``!r``), so an ANSI/OSC escape in a Pixiv
+    display name would render unescaped on a real TTY. The raw control byte must
+    be stripped from the emitted ``ProgressEvent.line``.
+    """
+    _patch_downloads(monkeypatch)
+    following = {"public": [_make_user(10, name="evil\x1buser")]}
+    client = FakeFollowingClient(following, {"10": []})
+
+    events = _run_events(_config(tmp_path), client)
+
+    user_events = [e for e in events if e.kind == ProgressKind.USER]
+    assert len(user_events) == 1
+    line = user_events[0].line
+    assert line is not None
+    assert "\x1b" not in line  # the raw ESC byte is gone
+    assert line == "user 10 (eviluser)"
+
+
+_C0_C1_CONTROL = frozenset(chr(c) for c in range(0x20)) | frozenset(
+    chr(c) for c in range(0x7F, 0xA0)
+)
+
+
+@given(text=st.text(max_size=80))
+def test_sanitize_display_text_never_yields_control_chars(text: str) -> None:
+    # Property, not just the single ESC-byte example above: for ANY input,
+    # not just a hand-picked attack string, no C0/C1 control byte survives.
+    result = backup._sanitize_display_text(text)
+    assert not any(c in _C0_C1_CONTROL for c in result)
+
+
+@given(
+    text=st.text(alphabet=st.characters(blacklist_categories=("Cc", "Cs")), max_size=80)
+)
+def test_sanitize_display_text_is_identity_without_control_chars(text: str) -> None:
+    # A display name that never had control bytes must pass through unchanged
+    # -- the sanitizer should not mangle ordinary (including non-ASCII) names.
+    assert backup._sanitize_display_text(text) == text

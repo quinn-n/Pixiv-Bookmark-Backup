@@ -22,7 +22,13 @@ import pytest
 from pixiv_bookmark_backup import backup
 from pixiv_bookmark_backup.backup import BackupUsageError, run
 from pixiv_bookmark_backup.config import ResolvedAuth
-from pixiv_bookmark_backup.core import BackupConfig, ExitCode, decide_exit_code
+from pixiv_bookmark_backup.core import (
+    BackupConfig,
+    ExitCode,
+    ProgressEvent,
+    ProgressKind,
+    decide_exit_code,
+)
 from pixiv_bookmark_backup.downloader import ImageResult
 from pixiv_bookmark_backup.models import (
     Author,
@@ -569,7 +575,7 @@ def test_dry_run_writes_nothing_but_counts_works(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls = _patch_downloads(monkeypatch)
-    messages: list[str] = []
+    events: list[ProgressEvent] = []
     works = {"public": [_make_work(100, pages=2), _make_work(200, pages=1)]}
     client = FakePixivClient(works)
 
@@ -577,7 +583,7 @@ def test_dry_run_writes_nothing_but_counts_works(
         _config(tmp_path, dry_run=True),
         _auth(),
         client,
-        progress=messages.append,
+        progress=events.append,
         clock=lambda: FIXED_CLOCK,
     )
 
@@ -591,8 +597,15 @@ def test_dry_run_writes_nothing_but_counts_works(
     assert summary.works_total == 2
     assert summary.works_succeeded == 2
     assert summary.files_downloaded == 3
-    # A "would create" preview line is emitted per work.
-    assert any("would create" in msg for msg in messages)
+    # A WORK_PLANNED event carries the exact filenames each work would create.
+    planned_by_work = {
+        e.work_id: e.planned for e in events if e.kind == ProgressKind.WORK_PLANNED
+    }
+    assert planned_by_work == {
+        100: ("100_p0.jpg", "100_p1.jpg"),
+        200: ("200_p0.jpg",),
+    }
+    assert all("would create" in (e.line or "") for e in events if e.planned)
 
 
 # -- visibility vs self -------------------------------------------------
@@ -899,7 +912,7 @@ def test_dry_run_ugoira_counts_work_and_calls_nothing(
     build_ugoira, and write nothing to disk.
     """
     calls = _patch_downloads(monkeypatch)
-    messages: list[str] = []
+    events: list[ProgressEvent] = []
     works = {"public": [_make_work(300, work_type="ugoira")]}
     client = FakePixivClient(works)
 
@@ -907,7 +920,7 @@ def test_dry_run_ugoira_counts_work_and_calls_nothing(
         _config(tmp_path, dry_run=True),
         _auth(),
         client,
-        progress=messages.append,
+        progress=events.append,
         clock=lambda: FIXED_CLOCK,
     )
 
@@ -921,8 +934,11 @@ def test_dry_run_ugoira_counts_work_and_calls_nothing(
     assert summary.works_total == 1
     assert summary.works_succeeded == 1
     assert summary.files_downloaded == 1
-    # The progress sink received a "would create" line naming the GIF.
-    assert any("300_p0.gif" in msg for msg in messages)
+    # A WORK_PLANNED event names the single planned GIF file.
+    planned_events = [e for e in events if e.kind == ProgressKind.WORK_PLANNED]
+    assert len(planned_events) == 1
+    assert planned_events[0].planned == ("300_p0.gif",)
+    assert "300_p0.gif" in (planned_events[0].line or "")
 
 
 # -- SIGINT during dry-run ----------------------------------------------
@@ -1018,3 +1034,121 @@ def test_metadata_only_ugoira_records_entry_without_building_gif(
     assert images[0]["page"] == 0
     assert images[0]["path"] == "300_p0.gif"
     assert images[0]["status"] == "metadata-only"
+
+
+# -- progress events ----------------------------------------------------
+
+
+def _run_events(config: BackupConfig, client: FakePixivClient) -> list[ProgressEvent]:
+    """Run ``run`` collecting the emitted :class:`ProgressEvent`s in order."""
+
+    events: list[ProgressEvent] = []
+    run(config, _auth(), client, progress=events.append, clock=lambda: FIXED_CLOCK)
+    return events
+
+
+def test_work_events_carry_live_counts_after_each_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each WORK event snapshots counts AFTER that work was tallied.
+
+    With two works (a 2-page one then a 1-page one) the WORK events' totals must
+    increase monotonically and the final WORK event must equal the run summary.
+    """
+    _patch_downloads(monkeypatch)
+    works = {
+        "public": [
+            _make_work(100, pages=2, title="Multi"),
+            _make_work(200, pages=1, title="Single"),
+        ]
+    }
+    client = FakePixivClient(works)
+
+    events = _run_events(_config(tmp_path), client)
+
+    work_events = [e for e in events if e.kind == ProgressKind.WORK]
+    assert len(work_events) == 2
+    # After work 100 (2 pages @ 10 bytes each): live totals reflect it.
+    assert (
+        work_events[0].works_total,
+        work_events[0].files_downloaded,
+        work_events[0].bytes_downloaded,
+    ) == (1, 2, 20)
+    # After work 200 (1 more page): totals moved up, never lagging.
+    assert (
+        work_events[1].works_total,
+        work_events[1].files_downloaded,
+        work_events[1].bytes_downloaded,
+    ) == (2, 3, 30)
+    # Monotonic and matching final totals on the last WORK event.
+    assert work_events[1].works_total == 2
+    assert work_events[1].files_downloaded == 3
+    assert work_events[1].bytes_downloaded == 30
+
+
+def test_work_event_line_preserves_exact_wording(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The WORK event's ``line`` matches today's per-work wording byte-for-byte."""
+    _patch_downloads(monkeypatch)
+    works = {"public": [_make_work(100, pages=2, title="Multi")]}
+    client = FakePixivClient(works)
+
+    events = _run_events(_config(tmp_path), client)
+
+    work_events = [e for e in events if e.kind == ProgressKind.WORK]
+    assert len(work_events) == 1
+    event = work_events[0]
+    # Literal copied verbatim from backup.py (note the U+2014 em dash).
+    assert event.line == "[1] 100 'Multi' — 2 page(s)"
+    assert event.index == 1
+    assert event.work_id == 100
+    assert event.title == "Multi"
+    assert event.page_count == 2
+
+
+def test_dry_run_emits_work_then_work_planned_in_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dry-run work emits WORK first, then WORK_PLANNED with the filenames."""
+    _patch_downloads(monkeypatch)
+    works = {"public": [_make_work(100, pages=2, title="Multi")]}
+    client = FakePixivClient(works)
+
+    events = _run_events(_config(tmp_path, dry_run=True), client)
+
+    kinds = [e.kind for e in events]
+    assert kinds == [ProgressKind.WORK, ProgressKind.WORK_PLANNED]
+    # The dry-run WORK event fires AFTER tallying, so its counts are live.
+    assert events[0].works_total == 1
+    assert events[0].files_downloaded == 2
+    assert events[1].planned == ("100_p0.jpg", "100_p1.jpg")
+    assert events[1].line == "    would create: 100_p0.jpg, 100_p1.jpg"
+    assert events[1].work_id == 100
+
+
+def test_unavailable_work_still_emits_work_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unavailable work (no pages) emits a WORK event but is not counted.
+
+    Verbose mode still shows the work, yet ``works_total`` stays 0 because the
+    work contributes no downloadable pages.
+    """
+    _patch_downloads(monkeypatch)
+    unavailable = _make_work(800, pages=0, title="Gone")
+    assert unavailable.images == []
+    client = FakePixivClient({"public": [unavailable]})
+
+    events = _run_events(_config(tmp_path), client)
+
+    work_events = [e for e in events if e.kind == ProgressKind.WORK]
+    assert len(work_events) == 1
+    event = work_events[0]
+    assert event.work_id == 800
+    assert event.index == 1
+    # Counts unchanged: an unavailable work is not tallied.
+    assert event.works_total == 0
+    assert event.files_downloaded == 0
+    # No WORK_PLANNED for a non-dry unavailable work.
+    assert not any(e.kind == ProgressKind.WORK_PLANNED for e in events)

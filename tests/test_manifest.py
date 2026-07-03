@@ -9,6 +9,8 @@ import sys
 from pathlib import Path
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from pixiv_bookmark_backup.manifest import (
     SCHEMA_VERSION,
@@ -598,3 +600,187 @@ def test_write_atomic_writes_owner_only_mode(tmp_path: Path) -> None:
     # The token-bearing manifest must not be group/other-readable: mkstemp
     # creates the temp file 0o600 and os.replace preserves that mode.
     assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+
+
+# --------------------------------------------------------------------------- #
+# property-based tests
+# --------------------------------------------------------------------------- #
+#
+# The example-based round-trip/merge tests above pin known cases (Japanese
+# text, a specific bytes_/None mix, a handful of ids). These generate whole
+# manifests -- arbitrary text, missing fields, None-shaped ``bytes_``/
+# ``bookmark_tags``/``error`` -- to check the to_dict/from_dict and merge
+# contracts hold for any well-typed manifest, not just the ones written down.
+
+_json_scalar = st.one_of(
+    st.none(),
+    st.booleans(),
+    st.integers(min_value=-(10**9), max_value=10**9),
+    st.text(max_size=20),
+)
+_json_dict = st.dictionaries(st.text(max_size=10), _json_scalar, max_size=4)
+
+_image_entries = st.builds(
+    ImageEntry,
+    page=st.integers(min_value=0, max_value=999),
+    source_url=st.text(max_size=50),
+    path=st.text(max_size=50),
+    status=st.sampled_from([status.value for status in ImageStatus]),
+    bytes_=st.one_of(st.none(), st.integers(min_value=0, max_value=10**9)),
+    error=st.one_of(st.none(), st.text(max_size=50)),
+)
+
+_work_entries = st.builds(
+    WorkEntry,
+    id=st.integers(min_value=0, max_value=10**9),
+    type=st.sampled_from(["illust", "manga", "ugoira"]),
+    title=st.text(max_size=50),
+    author=_json_dict,
+    posted_at=st.text(max_size=30),
+    nsfw=_json_dict,
+    work_tags=st.lists(_json_dict, max_size=3),
+    bookmark_tags=st.one_of(st.none(), st.lists(st.text(max_size=20), max_size=3)),
+    page_count=st.integers(min_value=0, max_value=20),
+    images=st.lists(_image_entries, max_size=3),
+)
+
+_manifests = st.builds(
+    Manifest,
+    schema_version=st.integers(min_value=0, max_value=10),
+    generated_at=st.text(max_size=30),
+    source=_json_dict,
+    works=st.lists(_work_entries, max_size=3),
+    errors=st.lists(_json_dict, max_size=3),
+)
+
+# Errors shaped like real ``{"work_id": ..., "message": ...}`` records, needed
+# to exercise merge()'s work_id-keyed union rule precisely.
+_merge_errors = st.lists(
+    st.fixed_dictionaries(
+        {
+            "work_id": st.one_of(st.none(), st.integers(min_value=0, max_value=100)),
+            "message": st.text(max_size=20),
+        }
+    ),
+    max_size=5,
+)
+
+
+@given(image=_image_entries)
+def test_image_entry_round_trip_property(image: ImageEntry) -> None:
+    assert ImageEntry.from_dict(image.to_dict()) == image
+
+
+@given(work=_work_entries)
+def test_work_entry_round_trip_property(work: WorkEntry) -> None:
+    assert WorkEntry.from_dict(work.to_dict()) == work
+
+
+@given(manifest=_manifests)
+def test_manifest_round_trip_via_json_property(manifest: Manifest) -> None:
+    # Through real JSON text (not just to_dict/from_dict) so unicode/None
+    # handling is exercised the same way write_atomic/load_or_init use it.
+    text = json.dumps(manifest.to_dict(), ensure_ascii=False)
+    restored = Manifest.from_dict(json.loads(text))
+    assert restored == manifest
+
+
+@given(
+    existing_works=st.lists(_work_entries, max_size=5, unique_by=lambda w: w.id),
+    new_works=st.lists(_work_entries, max_size=5, unique_by=lambda w: w.id),
+)
+def test_merge_result_ids_are_union_with_no_duplicates(
+    existing_works: list[WorkEntry], new_works: list[WorkEntry]
+) -> None:
+    existing = _manifest_with(existing_works)
+    incoming = _manifest_with(new_works)
+
+    result = merge(existing, incoming)
+
+    result_ids = [work.id for work in result.works]
+    expected_ids = {work.id for work in existing_works} | {
+        work.id for work in new_works
+    }
+    assert set(result_ids) == expected_ids
+    assert len(result_ids) == len(expected_ids)
+
+
+@given(
+    existing_works=st.lists(_work_entries, max_size=5, unique_by=lambda w: w.id),
+    new_works=st.lists(_work_entries, max_size=5, unique_by=lambda w: w.id),
+)
+def test_merge_preserves_existing_order_then_appends_new_only(
+    existing_works: list[WorkEntry], new_works: list[WorkEntry]
+) -> None:
+    existing = _manifest_with(existing_works)
+    incoming = _manifest_with(new_works)
+
+    result = merge(existing, incoming)
+
+    existing_ids = [work.id for work in existing_works]
+    existing_id_set = set(existing_ids)
+    new_only_ids = [work.id for work in new_works if work.id not in existing_id_set]
+    assert [work.id for work in result.works] == existing_ids + new_only_ids
+
+
+@given(
+    existing_works=st.lists(_work_entries, max_size=5, unique_by=lambda w: w.id),
+    new_works=st.lists(_work_entries, max_size=5, unique_by=lambda w: w.id),
+)
+def test_merge_new_record_wins_for_shared_ids(
+    existing_works: list[WorkEntry], new_works: list[WorkEntry]
+) -> None:
+    existing = _manifest_with(existing_works)
+    incoming = _manifest_with(new_works)
+
+    result = merge(existing, incoming)
+
+    new_by_id = {work.id: work for work in new_works}
+    existing_by_id = {work.id: work for work in existing_works}
+    result_by_id = {work.id: work for work in result.works}
+
+    # An id present in `new` always takes the new record...
+    for work_id, new_work in new_by_id.items():
+        assert result_by_id[work_id] == new_work
+    # ...and an id present only in `existing` survives completely unchanged.
+    for work_id, old_work in existing_by_id.items():
+        if work_id not in new_by_id:
+            assert result_by_id[work_id] == old_work
+
+
+@given(existing_works=st.lists(_work_entries, max_size=5, unique_by=lambda w: w.id))
+def test_merge_with_empty_new_preserves_works_but_takes_new_metadata(
+    existing_works: list[WorkEntry],
+) -> None:
+    existing = _manifest_with(existing_works)
+    empty_new = new_manifest(
+        user_id="new-user",
+        visibility="private",
+        generated_at="2099-01-01T00:00:00+00:00",
+        works=[],
+        errors=[],
+    )
+
+    result = merge(existing, empty_new)
+
+    assert result.works == existing_works
+    assert result.generated_at == "2099-01-01T00:00:00+00:00"
+    assert result.source == {"user_id": "new-user", "visibility": "private"}
+
+
+@given(existing_errors=_merge_errors, new_errors=_merge_errors)
+def test_merge_errors_union_by_work_id_property(
+    existing_errors: list[dict[str, object]], new_errors: list[dict[str, object]]
+) -> None:
+    existing = _manifest_with([], errors=existing_errors)
+    incoming = _manifest_with([], errors=new_errors)
+
+    result = merge(existing, incoming)
+
+    new_ids = {error["work_id"] for error in new_errors if error["work_id"] is not None}
+    kept_existing = [
+        error
+        for error in existing_errors
+        if error["work_id"] is None or error["work_id"] not in new_ids
+    ]
+    assert result.errors == kept_existing + new_errors

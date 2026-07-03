@@ -169,3 +169,47 @@ shipped code):
   add a `pixi run audit` task so dependency-vuln scans can run on demand.
 
 Fixing both restores on-demand `bandit` + `pip-audit` runs for future reviews.
+
+## Progress indicator (`backup` / `backup-following`)
+
+### 10. Tighten `ProgressReporter.unit` to `Literal["works", "users"]`
+*Source: final quality review (Nit, cosmetic).*
+
+`ProgressReporter.unit` and the `unit` values computed in `cli.py` are plain
+`str`. Nothing currently constrains them, so Pyright can't catch a typo (e.g.
+`"work"` instead of `"works"`) at the type level. Switching to
+`Literal["works", "users"]` on the field and the call sites would close that
+gap. Low risk, low value — left as plain `str` since the two literal values
+are only ever produced by the two `cli.py` call sites, both already tested.
+
+### 11. Deduplicate reporter construction between `backup` and `backup_following`
+*Source: final quality review (Nit, refactor).*
+
+The block that resolves `stream`/`is_tty`/`ascii_only`, calls
+`_resolve_reporter_mode(...)`, and constructs `ProgressReporter(...)` is
+near-identical (~10 lines) in both `backup()` and `backup_following()` in
+`cli.py`, differing only in how `total`/`unit` are computed. A shared
+`_build_reporter(...)` helper taking the resolved `total`/`unit` would remove
+the duplication. Left inline since each command's `total`/`unit` logic differs
+enough that extracting the whole block felt like premature abstraction for two
+call sites; revisit if a third command needs the same wiring.
+
+### 12. `_sanitize_display_text` doesn't cover visual-spoofing code points
+*Source: security review of the Hypothesis property tests for this sanitizer. Robustness, not an injection hole.*
+
+`_sanitize_display_text` (`backup.py`) strips exactly Unicode category `Cc`
+(`\x00-\x1f`, `\x7f-\x9f`) from `user.name` before it reaches a terminal. This
+fully neutralizes ANSI/OSC/CSI escape-sequence injection (no C0/C1 lead byte
+can survive), which was the original threat this function was written for. It
+does not strip other code points some terminals render specially for visual
+spoofing rather than control-sequence injection -- e.g. U+202E (RTL override)
+and other `Cf` format/bidi-control characters, or zero-width characters
+(Trojan-Source-style deception, not escape injection). A malicious display
+name using these could still visually misrepresent itself in verbose/dry-run
+output, though it cannot execute terminal control sequences. Confirmed via a
+Hypothesis property test (`test_sanitize_display_text_never_yields_control_chars`)
+that the sanitizer does exactly what it promises for `Cc`; this item is about
+whether the promise should be broader. Fix would be extending the strip set to
+`Cf` (and/or zero-width) categories, but do it as a deliberate scope decision
+(does `work.title`'s `!r` protection need the same treatment?) rather than
+inline.

@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 
+import attrs.exceptions
 import pytest
 
 from pixiv_bookmark_backup.core import (
@@ -12,6 +13,8 @@ from pixiv_bookmark_backup.core import (
     ExitCode,
     FollowingConfig,
     FollowingRunSummary,
+    ProgressEvent,
+    ProgressKind,
     RequestPacer,
     RunSummary,
     decide_exit_code,
@@ -260,6 +263,73 @@ def test_login_exit_codes_are_distinct_members() -> None:
     assert ExitCode.LOGIN_DRIVER is ExitCode(7)
     assert ExitCode.LOGIN_FAILED is ExitCode(8)
     assert ExitCode.CONFIG_WRITE is ExitCode(9)
+
+
+def test_progress_event_defaults() -> None:
+    event = ProgressEvent(kind=ProgressKind.WORK)
+    assert event.kind is ProgressKind.WORK
+    assert event.works_total == 0
+    assert event.files_downloaded == 0
+    assert event.files_skipped == 0
+    assert event.files_failed == 0
+    assert event.bytes_downloaded == 0
+    assert event.users_total == 0
+    assert event.index == 0
+    assert event.work_id is None
+    assert event.title is None
+    assert event.page_count is None
+    assert event.user_id is None
+    assert event.user_name is None
+    assert event.planned == ()
+    assert event.line is None
+
+
+def test_progress_event_is_frozen() -> None:
+    event = ProgressEvent(kind=ProgressKind.WORK)
+    with pytest.raises(attrs.exceptions.FrozenInstanceError):
+        event.index = 5  # type: ignore[misc]
+
+
+def test_progress_event_planned_default_is_empty_tuple() -> None:
+    first = ProgressEvent(kind=ProgressKind.WORK)
+    second = ProgressEvent(kind=ProgressKind.WORK)
+    assert first.planned == ()
+    assert second.planned == ()
+
+
+def test_progress_event_all_fields_round_trip() -> None:
+    event = ProgressEvent(
+        kind=ProgressKind.WORK_PLANNED,
+        works_total=42,
+        files_downloaded=10,
+        files_skipped=3,
+        files_failed=1,
+        bytes_downloaded=2048,
+        users_total=7,
+        index=4,
+        work_id=123456,
+        title="A Title",
+        page_count=5,
+        user_id="999",
+        user_name="An Artist",
+        planned=("page1.jpg", "page2.jpg"),
+        line="Planned 5 pages for work 123456",
+    )
+    assert event.kind is ProgressKind.WORK_PLANNED
+    assert event.works_total == 42
+    assert event.files_downloaded == 10
+    assert event.files_skipped == 3
+    assert event.files_failed == 1
+    assert event.bytes_downloaded == 2048
+    assert event.users_total == 7
+    assert event.index == 4
+    assert event.work_id == 123456
+    assert event.title == "A Title"
+    assert event.page_count == 5
+    assert event.user_id == "999"
+    assert event.user_name == "An Artist"
+    assert event.planned == ("page1.jpg", "page2.jpg")
+    assert event.line == "Planned 5 pages for work 123456"
 
 
 # ---------------------------------------------------------------------------

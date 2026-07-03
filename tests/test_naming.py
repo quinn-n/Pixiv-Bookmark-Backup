@@ -5,9 +5,13 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from pixiv_bookmark_backup.manifest import ImageEntry, WorkEntry
 from pixiv_bookmark_backup.naming import (
+    _AUTHOR_ID_BYTE_CAP,
+    _LINK_BYTE_LIMIT,
     author_dir_name,
     ext_from_url,
     image_filename,
@@ -448,3 +452,97 @@ def test_safe_basename_degenerate_basename_uses_placeholder(path: str) -> None:
     # (``Path("sub/.").name`` is ``"sub"``, a valid name, so it is NOT degenerate
     # and is excluded here.)
     assert safe_basename(path) == "_"
+
+
+# --- property-based tests --------------------------------------------------
+#
+# The example-based tests above pin known-tricky cases; these generate
+# adversarial titles/authors/paths (control bytes, separators, emoji, empty
+# strings) to check the security invariants promised by the docstrings hold
+# for *any* input, not just the cases someone thought to write down.
+
+_ASCII_CONTROL_AND_DEL = frozenset(chr(c) for c in range(0x20)) | {"\x7f"}
+_SEPARATORS_AND_RESERVED = frozenset('/\\:*?"<>|')
+_PLACEHOLDER = "PLACE"
+
+
+@given(text=st.text(max_size=60), budget=st.integers(min_value=-20, max_value=300))
+def test_sanitize_component_never_yields_control_separator_or_reserved_chars(
+    text: str, budget: int
+) -> None:
+    result = sanitize_component(text, placeholder=_PLACEHOLDER, byte_budget=budget)
+    assert not any(c in _ASCII_CONTROL_AND_DEL for c in result)
+    assert not any(c in _SEPARATORS_AND_RESERVED for c in result)
+
+
+@given(text=st.text(max_size=60), budget=st.integers(min_value=-20, max_value=300))
+def test_sanitize_component_never_meaningless_or_traversing(
+    text: str, budget: int
+) -> None:
+    result = sanitize_component(text, placeholder=_PLACEHOLDER, byte_budget=budget)
+    assert result not in ("", ".", "..")
+
+
+@given(text=st.text(max_size=60), budget=st.integers(min_value=-20, max_value=300))
+def test_sanitize_component_respects_byte_budget_unless_placeholder(
+    text: str, budget: int
+) -> None:
+    # The placeholder itself is caller-trusted and not budget-capped (see
+    # docstring); every other result must fit the (clamped) budget.
+    result = sanitize_component(text, placeholder=_PLACEHOLDER, byte_budget=budget)
+    if result != _PLACEHOLDER:
+        assert len(result.encode("utf-8")) <= max(0, budget)
+
+
+@given(text=st.text(max_size=60))
+def test_sanitize_component_is_idempotent_at_large_budget(text: str) -> None:
+    # Once cleaned, re-sanitizing (with room to spare) is a no-op: the
+    # function is a stable projection onto "safe" strings.
+    once = sanitize_component(text, placeholder=_PLACEHOLDER, byte_budget=1000)
+    twice = sanitize_component(once, placeholder=_PLACEHOLDER, byte_budget=1000)
+    assert once == twice
+
+
+@given(path=st.text(max_size=60))
+def test_safe_basename_never_control_chars_separators_or_degenerate(
+    path: str,
+) -> None:
+    result = safe_basename(path)
+    assert not any(c in _ASCII_CONTROL_AND_DEL for c in result)
+    assert "/" not in result
+    assert result not in ("", ".", "..")
+
+
+@given(
+    author_id=st.one_of(
+        st.integers(min_value=-(10**6), max_value=10**6), st.text(max_size=30)
+    ),
+    name=st.text(max_size=200),
+    account=st.text(max_size=200),
+)
+def test_author_dir_name_property_within_limit_and_ends_with_sanitized_id(
+    author_id: object, name: str, account: str
+) -> None:
+    work = _work_entry(author_id=author_id, name=name, account=account)
+    result = author_dir_name(work)
+
+    assert len(result.encode("utf-8")) <= _LINK_BYTE_LIMIT
+    assert "/" not in result
+    assert not any(c in _ASCII_CONTROL_AND_DEL for c in result)
+
+    expected_id = sanitize_component(
+        str(author_id), placeholder="0", byte_budget=_AUTHOR_ID_BYTE_CAP
+    )
+    assert result.endswith(f"_{expected_id}")
+
+
+@given(title=st.text(max_size=200), path=st.text(max_size=200))
+def test_titled_link_name_property_within_limit_and_ends_with_basename(
+    title: str, path: str
+) -> None:
+    work = _work_entry(title=title)
+    image = _image_entry(path)
+    result = titled_link_name(image, work)
+
+    assert len(result.encode("utf-8")) <= _LINK_BYTE_LIMIT
+    assert result.endswith(f"_{safe_basename(path)}")

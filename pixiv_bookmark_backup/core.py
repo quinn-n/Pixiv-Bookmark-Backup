@@ -112,7 +112,7 @@ class FollowingConfig:
     """
 
     output_dir: Path = field(converter=Path)
-    follows: str = field(default="public", validator=in_(("public", "private", "all")))
+    follows: str = field(default="public", validator=in_(VISIBILITIES))
     dry_run: bool = field(default=False, validator=instance_of(bool))
     limit: int | None = field(
         default=None, validator=optional([instance_of(int), ge(1)])

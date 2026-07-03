@@ -39,8 +39,20 @@ Options (pick one or both):
 - In `run_following`, when `--only`/`--exclude` is set but no followed user
   matched, emit a `"no followed users matched --only"` warning on stderr.
 
-### 2. Consider renaming `--follows` to `--follow-visibility`
+### 2. Consider renaming `--follows` to `--follow-visibility` — DONE
 *Source: cli-ux review (design observation). CLI-contract change — route through the planner.*
+
+Done: `backup-following`'s option was hard-renamed `--follows` → `--follow-visibility`
+(no backward-compat alias). A design pass justified the hard rename: the tool is
+pre-1.0 and unpublished with no CHANGELOG or evidence of external scripting, and the
+JSON manifest/summary key was *already* `follow_visibility`, so the rename reduces net
+inconsistency rather than introducing a migration. The internal
+`FollowingConfig.follows` field was renamed to match (see item #3) and the local
+`_follow_passes` parameter in `backup.py` followed. Help text/examples and `README.md`
+were updated; regression tests assert the new flag plumbs through, the old `--follows`
+spelling now exits 2 ("No such option"), and an out-of-range choice still exits 2.
+
+Original report below.
 
 `--follow-visibility` would be self-documenting and parallel `backup`'s
 `--visibility`. The current help text was clarified to disambiguate
@@ -50,8 +62,16 @@ pass rather than be done inline.
 
 ## Core
 
-### 3. Use the `VISIBILITIES` constant in `FollowingConfig.follows`
+### 3. Use the `VISIBILITIES` constant in `FollowingConfig.follows` — DONE
 *Source: multiple quality reviews (Nit, cosmetic).*
+
+Done: bundled with the item #2 rename, since both touch the same field definition
+line. `FollowingConfig.follow_visibility` (renamed from `follows`) now validates with
+`validator=in_(VISIBILITIES)` instead of the inline `("public", "private", "all")`
+tuple, removing the duplication and keeping it consistent with `BackupConfig` and the
+click options. `VISIBILITIES` was already imported in `core.py`.
+
+Original report below.
 
 `FollowingConfig.follows` validates with an inline `("public", "private", "all")`
 tuple, duplicating the module-level `VISIBILITIES` constant that `BackupConfig`

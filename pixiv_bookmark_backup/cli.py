@@ -549,7 +549,7 @@ def _emit_summary(
     help="Directory to write the backup into (one subdirectory per author).",
 )
 @click.option(
-    "--follows",
+    "--follow-visibility",
     type=click.Choice(VISIBILITIES),
     default="public",
     show_default=True,
@@ -677,7 +677,7 @@ def _emit_summary(
 def backup_following(
     ctx: click.Context,
     output_dir: Path,
-    follows: str,
+    follow_visibility: str,
     refresh_token: str | None,
     config: Path | None,
     limit: int | None,
@@ -721,7 +721,7 @@ def backup_following(
 
     \b
       # Back up everyone you follow (public + private), 20 newest works each
-      pixiv-bookmark-backup backup-following --follows all --per-user-limit 20
+      pixiv-bookmark-backup backup-following --follow-visibility all --per-user-limit 20
 
     \b
       # Back up just two creators you follow, into ./out
@@ -764,7 +764,7 @@ def backup_following(
 
     run_config = FollowingConfig(
         output_dir=output_dir,
-        follows=follows,
+        follow_visibility=follow_visibility,
         dry_run=dry_run,
         limit=limit,
         per_user_limit=per_user_limit,
@@ -784,7 +784,7 @@ def backup_following(
     if not quiet:
         verb = "Would back up" if dry_run else "Backing up"
         click.echo(
-            f"{verb} works from your {follows} follows into {output_dir}",
+            f"{verb} works from your {follow_visibility} follows into {output_dir}",
             err=True,
         )
 
@@ -867,7 +867,7 @@ def _emit_following_summary(
             "schema": JSON_FOLLOWING_SUMMARY_SCHEMA,
             "mode": "following",
             "following_of": summary.following_of,
-            "follow_visibility": config.follows,
+            "follow_visibility": config.follow_visibility,
             "output_dir": str(config.output_dir),
             "users_total": summary.users_total,
             "users_with_works": summary.users_with_works,

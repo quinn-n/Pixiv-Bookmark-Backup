@@ -105,11 +105,17 @@ class FakePixivClient:
         self._works_by_restrict = works_by_restrict
         self._self_id = self_id
         self.download_calls: list[str] = []
+        # Track API activity so a test can prove a corrupt-manifest run fails
+        # fast (pre-flight) without authenticating or listing anything.
+        self.authenticate_calls = 0
+        self.list_calls = 0
 
     def authenticate(self, refresh_token: str) -> str:
+        self.authenticate_calls += 1
         return self._self_id
 
     def iter_bookmarks(self, user_id: str, restrict: str) -> Iterator[BookmarkWork]:
+        self.list_calls += 1
         yield from self._works_by_restrict.get(restrict, [])
 
     def iter_following(  # pragma: no cover
@@ -1096,6 +1102,11 @@ def test_corrupt_manifest_fails_loud_exit_2(
     assert "Traceback" not in result.output
     # No summary line reached stdout.
     assert "Backed up" not in result.stdout
+    # Fail FAST: the corrupt manifest is caught up front, before any API work --
+    # nothing was authenticated, listed, or downloaded.
+    assert client.authenticate_calls == 0
+    assert client.list_calls == 0
+    assert client.download_calls == []
     # The corrupt file is left in place; nothing moved aside.
     assert (out / "details.json").read_text(encoding="utf-8") == "this is not json {{{"
     assert not (out / "details.json.bak").exists()

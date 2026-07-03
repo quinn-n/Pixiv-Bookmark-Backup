@@ -434,33 +434,55 @@ def _flush_manifest(
     works: list[Any],
     errors: list[dict[str, Any]],
     clock: Callable[[], str],
-    warn: Callable[[str], None],
+    existing: Manifest,
 ) -> None:
     """Merge ``works``/``errors`` into ``details.json`` and write it atomically.
 
-    Loads any existing manifest. A *schema-mismatched* (or unreadable-``OSError``)
-    file is moved aside to ``details.json.bak`` and the run starts from a fresh
-    empty manifest; that move is *announced* via ``warn`` (naming the ``.bak``)
-    so the user is told their manifest was set aside. A *corrupt* existing file
-    (malformed/deeply-nested/non-object JSON) instead raises
-    :class:`~pixiv_bookmark_backup.manifest.ManifestLoadError` from
-    :func:`_load_existing_manifest`, which propagates (the file is left untouched)
-    for the CLI to map to a clean non-zero exit. The output directory is created
-    if needed. No-op callers (dry-run) never reach here.
+    ``existing`` is the manifest already loaded and reconciled up front by
+    :func:`_preflight_manifest` (empty when the file was missing, schema-
+    mismatched, or unreadable -- in which cases the old file was already moved
+    aside and announced there), so this flush never re-reads or re-moves the
+    file: it just merges the fresh run over ``existing`` and writes atomically.
+    The output directory is created if needed. No-op callers (dry-run) never
+    reach here.
     """
 
     details_path = config.output_dir / MANIFEST_NAME
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
+    new = new_manifest(target, config.visibility, clock(), works, errors)
+    final = merge(existing, new)
+    write_atomic(details_path, final)
+
+
+def _preflight_manifest(
+    output_dir: Path,
+    warn: Callable[[str], None],
+) -> Manifest:
+    """Validate and reconcile the existing ``details.json`` *before* downloading.
+
+    The fail-fast entry point for the resume loaders: called at the very start of
+    :func:`run` / :func:`run_following` -- before any authentication, listing, or
+    download -- so a corrupt / deeply-nested / non-object manifest surfaces
+    immediately as :class:`~pixiv_bookmark_backup.manifest.ManifestLoadError`
+    (which the CLI maps to a clean exit 2) having done **zero** API work, and the
+    corrupt file is left untouched on disk.
+
+    Returns the existing manifest for the run to merge into at flush time (an
+    empty manifest when the file is missing). On a *schema-mismatch* (or the
+    :class:`OSError` I/O-recovery path) the old file is moved aside to
+    ``details.json.bak`` and the move is announced *once* here via ``warn``; the
+    returned empty manifest is what the run builds on, and the later flush does
+    not move or warn again.
+    """
+
+    details_path = output_dir / MANIFEST_NAME
     existing, schema_mismatch = _load_existing_manifest(details_path)
     if schema_mismatch and details_path.exists():
         bak_path = details_path.with_name(MANIFEST_BACKUP_NAME)
         os.replace(details_path, bak_path)
         warn(_manifest_moved_aside_message(details_path, bak_path))
-
-    new = new_manifest(target, config.visibility, clock(), works, errors)
-    final = merge(existing, new)
-    write_atomic(details_path, final)
+    return existing
 
 
 def _manifest_moved_aside_message(details_path: Path, bak_path: Path) -> str:
@@ -550,15 +572,23 @@ def run(
         BackupUsageError: For an invalid request (e.g. another user's private
             bookmarks) discovered after auth (CLI -> 2).
         ManifestLoadError: If an existing ``details.json`` is corrupt / not a
-            JSON object (raised from the flush; CLI -> 2). The corrupt file is
-            left untouched. If this occurs while flushing a *partial* manifest
-            during ``KeyboardInterrupt`` handling it takes precedence over the
-            interrupt (the user sees the exit-2 corrupt-file message, not exit
-            130, and the partial run is not persisted).
+            JSON object. Raised up front by the pre-flight check *before* any
+            authentication, listing, or download (CLI -> 2), so a corrupt resume
+            fails fast with zero API work; the corrupt file is left untouched.
         KeyboardInterrupt: Re-raised after flushing a partial manifest
-            (CLI -> 130), unless that flush itself raises ``ManifestLoadError``
-            (see above).
+            (CLI -> 130). The pre-flight already validated the manifest, so this
+            flush cannot raise ``ManifestLoadError``.
     """
+
+    # Fail fast: validate/reconcile the existing manifest up front, BEFORE any
+    # authentication, listing, or download, so a corrupt details.json exits
+    # cleanly (CLI -> 2) having done zero API work. ``existing`` is threaded to
+    # the flush so it is neither re-read nor re-moved later. Dry-run never
+    # reads/writes the manifest, so it is skipped (existing stays None, and the
+    # ``existing is not None`` guards below double as the not-dry-run guard).
+    existing: Manifest | None = None
+    if not config.dry_run:
+        existing = _preflight_manifest(config.output_dir, warn)
 
     self_id = client.authenticate(auth.refresh_token)
     target = config.user_id if config.user_id is not None else self_id
@@ -589,12 +619,12 @@ def run(
         counters.works_failed += 1
     except KeyboardInterrupt:
         # Flush whatever was gathered before re-raising (CLI -> exit 130).
-        if not config.dry_run:
-            _flush_manifest(config, str(target), works, errors, clock, warn)
+        if existing is not None:
+            _flush_manifest(config, str(target), works, errors, clock, existing)
         raise
 
-    if not config.dry_run:
-        _flush_manifest(config, str(target), works, errors, clock, warn)
+    if existing is not None:
+        _flush_manifest(config, str(target), works, errors, clock, existing)
 
     return counters.to_summary()
 
@@ -703,13 +733,12 @@ def run_following(
       user's works -- propagates (CLI -> 4). Once some works are recorded a
       listing failure is caught, noted as a partial-run error, and the manifest
       is still flushed (CLI -> 6).
-    * :class:`~pixiv_bookmark_backup.manifest.ManifestLoadError` is raised from
-      the flush if an existing ``details.json`` is corrupt / not a JSON object;
-      it propagates and the corrupt file is left untouched (CLI -> 2). If it is
-      raised while flushing a partial manifest during ``KeyboardInterrupt``
-      handling it takes precedence over the interrupt (exit 2, not 130).
-    * ``KeyboardInterrupt`` flushes a partial manifest and re-raises (CLI -> 130),
-      unless that flush itself raises ``ManifestLoadError`` (see above).
+    * :class:`~pixiv_bookmark_backup.manifest.ManifestLoadError` is raised up
+      front by the pre-flight check if an existing ``details.json`` is corrupt /
+      not a JSON object -- *before* any authentication, listing, or download, so
+      a corrupt resume fails fast with zero API work (CLI -> 2); the corrupt file
+      is left untouched.
+    * ``KeyboardInterrupt`` flushes a partial manifest and re-raises (CLI -> 130).
 
     Args:
         config: The validated run parameters.
@@ -733,6 +762,13 @@ def run_following(
     Returns:
         The accumulated :class:`~pixiv_bookmark_backup.core.FollowingRunSummary`.
     """
+
+    # Fail fast: validate/reconcile the existing manifest up front, BEFORE any
+    # authentication, listing, or download (see run() for the rationale). Dry-run
+    # is skipped; the ``existing is not None`` guards below double as not-dry-run.
+    existing: Manifest | None = None
+    if not config.dry_run:
+        existing = _preflight_manifest(config.output_dir, warn)
 
     self_id = client.authenticate(auth.refresh_token)
 
@@ -777,12 +813,12 @@ def run_following(
         counters.works_failed += 1
         truncated = True
     except KeyboardInterrupt:
-        if not config.dry_run:
-            _flush_following_manifest(config, self_id, works, errors, clock, warn)
+        if existing is not None:
+            _flush_following_manifest(config, self_id, works, errors, clock, existing)
         raise
 
-    if not config.dry_run:
-        _flush_following_manifest(config, self_id, works, errors, clock, warn)
+    if existing is not None:
+        _flush_following_manifest(config, self_id, works, errors, clock, existing)
 
     if not truncated:
         _warn_unmatched_filters(config, matched_requested, warn)
@@ -1034,15 +1070,13 @@ def _flush_following_manifest(
     works: list[Any],
     errors: list[dict[str, Any]],
     clock: Callable[[], str],
-    warn: Callable[[str], None],
+    existing: Manifest,
 ) -> None:
     """Merge a following run's ``works``/``errors`` into ``details.json``.
 
-    Identical to :func:`_flush_manifest` (same corrupt-vs-mismatch policy: a
-    schema-mismatched/unreadable file is moved aside to ``details.json.bak`` and
-    *announced* via ``warn``; a corrupt file raises
-    :class:`~pixiv_bookmark_backup.manifest.ManifestLoadError`) except the
-    manifest is built with
+    Identical to :func:`_flush_manifest` (``existing`` is the manifest already
+    loaded and reconciled up front by :func:`_preflight_manifest`, so this flush
+    neither re-reads nor re-moves the file) except the manifest is built with
     :func:`~pixiv_bookmark_backup.manifest.new_following_manifest` so its
     ``source`` block is following-shaped. The manifest stays at the output root
     (not in any per-author subdirectory).
@@ -1050,12 +1084,6 @@ def _flush_following_manifest(
 
     details_path = config.output_dir / MANIFEST_NAME
     config.output_dir.mkdir(parents=True, exist_ok=True)
-
-    existing, schema_mismatch = _load_existing_manifest(details_path)
-    if schema_mismatch and details_path.exists():
-        bak_path = details_path.with_name(MANIFEST_BACKUP_NAME)
-        os.replace(details_path, bak_path)
-        warn(_manifest_moved_aside_message(details_path, bak_path))
 
     new = new_following_manifest(
         following_of, config.follow_visibility, clock(), works, errors

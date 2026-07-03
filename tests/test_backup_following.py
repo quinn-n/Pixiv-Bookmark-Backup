@@ -955,7 +955,7 @@ def test_corrupt_manifest_fails_loud_and_is_left_in_place(
 ) -> None:
     _patch_downloads(monkeypatch)
     # A corrupt (unparseable) existing manifest must fail loud on resume, not be
-    # silently discarded and regenerated.
+    # silently discarded and regenerated -- and fail FAST, before any API work.
     details = tmp_path / "details.json"
     details.write_text("}} not json {{", encoding="utf-8")
     client = FakeFollowingClient(
@@ -967,6 +967,10 @@ def test_corrupt_manifest_fails_loud_and_is_left_in_place(
 
     assert str(details) in str(excinfo.value)
     assert "not valid JSON" in str(excinfo.value)
+    # Fail fast: caught up front, before authenticating or listing anything.
+    assert client.auth_calls == []
+    assert client.following_calls == []
+    assert client.works_calls == []
     # Left untouched: not moved aside, not regenerated.
     assert details.read_text(encoding="utf-8") == "}} not json {{"
     assert not (tmp_path / "details.json.bak").exists()

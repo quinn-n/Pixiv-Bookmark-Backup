@@ -134,7 +134,11 @@ disk**, never silently discarded. `OSError` from opening the file is deliberatel
 I/O-recovery path. The `backup` and `backup-following` click commands map
 `ManifestLoadError` → `click.UsageError` (exit 2), mirroring the `search`
 command exactly — clean stderr message, no traceback, no partial summary on
-stdout.
+stdout. Detection is **fail-fast**: a `_preflight_manifest` check runs at the
+very start of `run()`/`run_following()`, *before* any authentication, listing,
+or download, so a corrupt resume exits 2 immediately having done zero API work
+(the reconciled existing manifest is threaded to the flush so it is neither
+re-read nor re-moved).
 
 A genuine `schema_version` mismatch keeps the safe move-aside-to-`details.json.bak`
 + regenerate behavior (a routine tool-version bump must not block resume) but is

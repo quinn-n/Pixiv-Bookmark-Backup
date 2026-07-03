@@ -864,13 +864,12 @@ def test_keyboard_interrupt_flushes_partial_and_reraises(
     assert {work["id"] for work in manifest["works"]} == {100}
 
 
-def test_keyboard_interrupt_with_corrupt_manifest_surfaces_load_error(
+def test_corrupt_manifest_fails_fast_before_any_api_work(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # When a KeyboardInterrupt fires but the existing details.json is corrupt,
-    # the interrupt-path flush raises ManifestLoadError, which takes precedence
-    # over the KeyboardInterrupt (CLI -> exit 2, corrupt file left in place). Lock
-    # in that precedence rather than leaving it incidental.
+    # The corrupt manifest is caught by the up-front pre-flight, BEFORE any
+    # authentication or listing -- so even a client scripted to blow up during
+    # listing is never reached. Proves fail-fast: zero API work, file untouched.
     _patch_downloads(monkeypatch)
     details = tmp_path / "details.json"
     details.write_text("this is not json {{{", encoding="utf-8")
@@ -881,6 +880,9 @@ def test_keyboard_interrupt_with_corrupt_manifest_surfaces_load_error(
         _run(_config(tmp_path), client)
 
     assert "not valid JSON" in str(excinfo.value)
+    # Nothing was authenticated or listed -- the failure preceded all API work.
+    assert client.auth_calls == []
+    assert client.iter_calls == []
     # The corrupt file is untouched and no partial manifest was persisted.
     assert details.read_text(encoding="utf-8") == "this is not json {{{"
     assert not (tmp_path / "details.json.bak").exists()

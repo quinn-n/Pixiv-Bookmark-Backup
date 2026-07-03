@@ -1412,3 +1412,56 @@ def test_layout_by_author_with_count(runner: CliRunner, tmp_path: Path) -> None:
     assert result.stdout.strip() == "2"  # only the integer on stdout
     assert (links / "alice_art_1" / "101_p0.png").is_symlink()  # links still made
     assert "(layout: by-author)" in result.stderr
+
+
+# -- malformed manifest (missing author.id, DEFERRED #8) ----------------
+
+
+def _linkable_missing_author_id() -> dict[str, Any]:
+    """A linkable manifest whose first matched work drops ``author.id``."""
+
+    data = _linkable_manifest()
+    del data["works"][0]["author"]["id"]
+    return data
+
+
+def test_missing_author_id_exits_2_plain_search(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    # A hand-edited manifest missing author.id must fail cleanly at load time as
+    # a UsageError (exit 2), not crash later in format_work_line's unknown-author
+    # fallback -- even for a plain search with no --symlink-dir.
+    backup = _write_linkable(tmp_path / "backup", _linkable_missing_author_id())
+    result = runner.invoke(cli, ["search", "touhou", "-i", str(backup)])
+    assert result.exit_code == 2
+    assert "Traceback" not in result.stderr
+    assert "author.id" in result.stderr
+    assert result.stdout == ""
+
+
+def test_missing_author_id_exits_2_by_author_layout(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    # The originating bug: --layout by-author subscripts author['id']. The load
+    # guard must fire first, so the run exits 2 (not the symlink exit 10) and
+    # creates no links.
+    backup = _write_linkable(tmp_path / "backup", _linkable_missing_author_id())
+    links = tmp_path / "links"
+    result = runner.invoke(
+        cli,
+        [
+            "search",
+            "touhou",
+            "-i",
+            str(backup),
+            "--symlink-dir",
+            str(links),
+            "--layout",
+            "by-author",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "Traceback" not in result.stderr
+    assert "author.id" in result.stderr
+    assert result.stdout == ""
+    assert not links.exists()  # failed before any symlink was attempted

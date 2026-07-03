@@ -622,6 +622,7 @@ def run_following(
     clock: Callable[[], str] = _utcnow,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
+    warn: Callable[[str], None] = lambda _m: None,
 ) -> FollowingRunSummary:
     """Back up the works of every followed user and return a summary.
 
@@ -655,6 +656,10 @@ def run_following(
             deterministic pacing tests.
         sleep: Sleep callable the request-pacer uses to space out processed
             works; injectable for deterministic pacing tests.
+        warn: Sink for one-off human-readable warnings (e.g. an ``--only`` value
+            that matched no followed user); defaults to a no-op. The CLI wires
+            this to ``click.echo(..., err=True)`` so warnings reach stderr
+            without this click-agnostic core importing click.
 
     Returns:
         The accumulated :class:`~pixiv_bookmark_backup.core.FollowingRunSummary`.
@@ -668,16 +673,25 @@ def run_following(
     only_set = set(config.only)
     exclude_set = set(config.exclude)
     seen_users: set[str] = set()
+    # Requested --only/--exclude IDs actually seen in the follow list. The
+    # difference against config.only/config.exclude is what matched nobody.
+    matched_requested: set[str] = set()
     pacer = RequestPacer(config.time_per_request, monotonic, sleep)
 
+    # Whether follow-list enumeration stopped early (--limit/--max-users cap or a
+    # partial ApiError). When it did, an unseen requested ID may simply be past
+    # the cut-off rather than genuinely unfollowed, so the "matched nobody"
+    # warning is suppressed to avoid false positives.
+    truncated = False
     try:
-        _iterate_following(
+        truncated = _iterate_following(
             config,
             client,
             self_id,
             only_set,
             exclude_set,
             seen_users,
+            matched_requested,
             counters,
             works,
             errors,
@@ -692,6 +706,7 @@ def run_following(
         # Some works are already recorded -> degrade to a partial run.
         errors.append({"reason": f"listing interrupted: {err}"})
         counters.works_failed += 1
+        truncated = True
     except KeyboardInterrupt:
         if not config.dry_run:
             _flush_following_manifest(config, self_id, works, errors, clock)
@@ -699,6 +714,9 @@ def run_following(
 
     if not config.dry_run:
         _flush_following_manifest(config, self_id, works, errors, clock)
+
+    if not truncated:
+        _warn_unmatched_filters(config, matched_requested, warn)
 
     return counters.to_following_summary(self_id)
 
@@ -710,12 +728,13 @@ def _iterate_following(
     only_set: set[str],
     exclude_set: set[str],
     seen_users: set[str],
+    matched_requested: set[str],
     counters: _FollowingCounters,
     works: list[Any],
     errors: list[dict[str, Any]],
     progress: Callable[[ProgressEvent], None],
     pacer: RequestPacer,
-) -> None:
+) -> bool:
     """Iterate followed users across the follow passes and process each.
 
     Applies ``--only``/``--exclude`` (compared by ``str(user.id)``), dedups users
@@ -725,11 +744,21 @@ def _iterate_following(
     stop signal -- is delegated to :func:`_process_following_user`.
     ``ApiError`` from the follow-list listing and ``KeyboardInterrupt`` propagate
     to :func:`run_following`, which owns recovery.
+
+    Records every requested ``--only``/``--exclude`` ID that appears in the
+    follow list into ``matched_requested`` (before any dedup/cap ``continue`` or
+    early ``return``, so an excluded or capped-away match still counts as
+    "seen"). Returns ``True`` when enumeration stopped early because of a
+    ``--max-users`` / ``--limit`` cap, and ``False`` when both follow passes were
+    exhausted -- the caller uses this to suppress the "matched nobody" warning on
+    a truncated run.
     """
 
     for restrict in _follow_passes(config.follows):
         for user in client.iter_following(self_id, restrict):
             uid = str(user.id)
+            if uid in only_set or uid in exclude_set:
+                matched_requested.add(uid)
             if uid in seen_users:
                 continue
             if exclude_set and uid in exclude_set:
@@ -740,11 +769,11 @@ def _iterate_following(
                 config.max_users is not None
                 and counters.users_total >= config.max_users
             ):
-                return
+                return True
             if config.limit is not None and counters.works_total >= config.limit:
                 # The global work budget is already spent -> don't list (or even
                 # count) any further users.
-                return
+                return True
 
             seen_users.add(uid)
             counters.users_total += 1
@@ -762,7 +791,44 @@ def _iterate_following(
             if _process_following_user(
                 config, client, uid, counters, works, errors, progress, pacer
             ):
-                return
+                return True
+
+    return False
+
+
+def _warn_unmatched_filters(
+    config: FollowingConfig,
+    matched_requested: set[str],
+    warn: Callable[[str], None],
+) -> None:
+    """Warn (once, on the ``warn`` sink) if an ``--only``/``--exclude`` value
+    matched no followed user.
+
+    ``matched_requested`` holds the requested IDs actually seen in the follow
+    list, so the order-preserving, deduped difference against ``config.only``
+    (else ``config.exclude`` -- the two are mutually exclusive at the CLI) is the
+    set of IDs that hit nobody. Naming them turns an otherwise-silent empty or
+    unfiltered result into an actionable hint. No-op when nothing is unmatched.
+    """
+
+    if config.only:
+        flag, requested = "--only", config.only
+    elif config.exclude:
+        flag, requested = "--exclude", config.exclude
+    else:
+        return
+
+    unmatched = [
+        uid for uid in dict.fromkeys(requested) if uid not in matched_requested
+    ]
+    if not unmatched:
+        return
+
+    ids = ", ".join(unmatched)
+    warn(
+        f"no followed user matched {flag} for {ids}; check the ID(s) name "
+        "accounts you actually follow."
+    )
 
 
 def _process_following_user(

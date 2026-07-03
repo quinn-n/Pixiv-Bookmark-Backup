@@ -235,6 +235,233 @@ def test_success_end_to_end_per_author_layout(
     assert client.download_calls
 
 
+def test_only_matching_nobody_warns_on_stderr(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Following user 10, but --only names 999 (nobody) -> full miss.
+    client = FakeFollowingClient(
+        {"public": [_make_user(10)]}, {"10": [_make_work(101, author_id=10)]}
+    )
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup-following",
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--config",
+            _missing_config(tmp_path),
+            "--only",
+            "999",
+        ],
+        env=_token_env(),
+    )
+
+    # No user matched -> 0 works -> the existing exit 5, plus the new warning.
+    assert result.exit_code == 5, result.output
+    assert "Warning: no followed user matched --only for 999" in result.stderr
+
+
+def test_only_partial_miss_warns_only_for_unmatched_id(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 10 is followed (and backed up), 999 matches nobody -> exit 0 with a warning
+    # naming only 999.
+    client = FakeFollowingClient(
+        {"public": [_make_user(10)]}, {"10": [_make_work(101, author_id=10)]}
+    )
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup-following",
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--config",
+            _missing_config(tmp_path),
+            "--only",
+            "10",
+            "--only",
+            "999",
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Warning: no followed user matched --only for 999" in result.stderr
+    # The matched ID must not be named as unmatched.
+    assert "for 10" not in result.stderr
+    assert "10, 999" not in result.stderr
+
+
+def test_exclude_matching_nobody_warns_on_stderr(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 10 is followed and backed up; --exclude 999 excludes nobody -> warning.
+    client = FakeFollowingClient(
+        {"public": [_make_user(10)]}, {"10": [_make_work(101, author_id=10)]}
+    )
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup-following",
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--config",
+            _missing_config(tmp_path),
+            "--exclude",
+            "999",
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Warning: no followed user matched --exclude for 999" in result.stderr
+
+
+def test_only_full_match_does_not_warn(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = FakeFollowingClient(
+        {"public": [_make_user(10)]}, {"10": [_make_work(101, author_id=10)]}
+    )
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup-following",
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--config",
+            _missing_config(tmp_path),
+            "--only",
+            "10",
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "matched --only" not in result.stderr
+
+
+def test_unmatched_warning_suppressed_when_run_truncated_by_limit(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # --limit stops enumeration after the first work of user 10, before 999
+    # could ever be observed. Suppress the warning to avoid a false positive.
+    client = FakeFollowingClient(
+        {"public": [_make_user(10)]},
+        {
+            "10": [
+                _make_work(101, author_id=10),
+                _make_work(102, author_id=10),
+            ]
+        },
+    )
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup-following",
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--config",
+            _missing_config(tmp_path),
+            "--only",
+            "10",
+            "--only",
+            "999",
+            "--limit",
+            "1",
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "matched --only" not in result.stderr
+
+
+def test_unmatched_warning_suppressed_when_run_truncated_by_max_users(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # --max-users stops enumeration after user 10, before 999 could be observed.
+    # 10 and 20 both match --only, so the cap genuinely trips (truncated run) and
+    # the warning for 999 is suppressed.
+    client = FakeFollowingClient(
+        {"public": [_make_user(10), _make_user(20)]},
+        {
+            "10": [_make_work(101, author_id=10)],
+            "20": [_make_work(201, author_id=20)],
+        },
+    )
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup-following",
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--config",
+            _missing_config(tmp_path),
+            "--only",
+            "10",
+            "--only",
+            "20",
+            "--only",
+            "999",
+            "--max-users",
+            "1",
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "matched --only" not in result.stderr
+
+
+def test_unmatched_warning_suppressed_when_follow_list_errors_midway(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The follow-list listing fails partway (after user 10's works are recorded),
+    # degrading to a partial run (exit 6). Because enumeration was truncated, the
+    # never-observed 999 must not trigger a "matched nobody" warning.
+    class _FollowListFailsClient(FakeFollowingClient):
+        def iter_following(self, user_id: str, restrict: str) -> Iterator[FollowedUser]:
+            yield _make_user(10)
+            raise ApiError("follow-list listing interrupted")
+
+    client = _FollowListFailsClient(
+        {"public": []}, {"10": [_make_work(101, author_id=10)]}
+    )
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup-following",
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--config",
+            _missing_config(tmp_path),
+            "--only",
+            "10",
+            "--only",
+            "999",
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 6, result.output
+    assert "matched --only" not in result.stderr
+
+
 def test_json_summary_is_clean_stdout(
     runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -386,6 +613,47 @@ def test_only_and_exclude_mutually_exclusive(runner: CliRunner, tmp_path: Path) 
     )
     assert result.exit_code == 2
     assert "--only and --exclude are mutually exclusive" in result.stderr
+
+
+@pytest.mark.parametrize("flag", ["--only", "--exclude"])
+def test_non_numeric_user_id_is_exit_2(
+    runner: CliRunner, tmp_path: Path, flag: str
+) -> None:
+    result = runner.invoke(
+        cli,
+        [
+            "backup-following",
+            "--config",
+            _missing_config(tmp_path),
+            flag,
+            "abc",
+        ],
+        env=_token_env(),
+    )
+    assert result.exit_code == 2
+    # Teaching BadParameter naming the offending value and the option.
+    assert "'abc' is not a valid Pixiv user ID" in result.stderr
+    assert flag in result.stderr
+
+
+def test_non_numeric_user_id_rejected_among_valid_ones(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    result = runner.invoke(
+        cli,
+        [
+            "backup-following",
+            "--config",
+            _missing_config(tmp_path),
+            "--only",
+            "10",
+            "--only",
+            "1.5",
+        ],
+        env=_token_env(),
+    )
+    assert result.exit_code == 2
+    assert "'1.5' is not a valid Pixiv user ID" in result.stderr
 
 
 def test_missing_token_is_usage_error(runner: CliRunner, tmp_path: Path) -> None:
@@ -546,8 +814,15 @@ def _install_run_following_emitting(
     *,
     summary: FollowingRunSummary | None = None,
     raises: BaseException | None = None,
+    warn_message: str | None = None,
 ) -> None:
-    """Patch ``cli.run_following`` to emit ``events`` before returning/raising."""
+    """Patch ``cli.run_following`` to emit ``events`` before returning/raising.
+
+    When ``warn_message`` is given, the fake invokes the injected ``warn``
+    callback with it *after* emitting the progress events (i.e. while the live
+    bar is still on screen), mirroring how the real orchestrator emits the
+    unmatched-filter warning from inside the run.
+    """
 
     def fake_run(
         config: Any,
@@ -555,10 +830,13 @@ def _install_run_following_emitting(
         client: Any,
         *,
         progress: Any = None,
+        warn: Any = None,
         **_kw: Any,
     ) -> FollowingRunSummary:
         for event in events:
             progress(event)
+        if warn_message is not None and warn is not None:
+            warn(warn_message)
         if raises is not None:
             raise raises
         return summary if summary is not None else _summary()
@@ -753,6 +1031,34 @@ def test_tty_draws_bar_and_finishes_cleanly(
     assert "\r" in result.stderr
     assert result.stderr.endswith("\n")
     assert not result.stderr.rstrip("\n").endswith("\r")
+
+
+def test_tty_bar_warning_prints_on_its_own_clean_line(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # In BAR mode the unmatched-filter warning is emitted from inside the run,
+    # while the dangling bar line is still on screen. It must clear that line
+    # first so the warning is not appended onto the spinner.
+    _force_tty(monkeypatch)
+    _install_run_following_emitting(
+        monkeypatch,
+        _work_events(4),
+        summary=_summary(works_total=4, works_succeeded=4),
+        warn_message="no followed user matched --only for 999",
+    )
+
+    result = runner.invoke(
+        cli,
+        ["backup-following", "--config", _missing_config(tmp_path), "--only", "999"],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    marker = "Warning: no followed user matched --only for 999"
+    assert marker in result.stderr
+    # The warning must start on a fresh line (bar cleared), never glued onto the
+    # carriage-return-redrawn spinner line.
+    assert result.stderr[result.stderr.index(marker) - 1] == "\n"
 
 
 def test_tty_bar_counts_users_when_max_users_set(

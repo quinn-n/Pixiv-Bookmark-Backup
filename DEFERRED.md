@@ -5,8 +5,25 @@ of their originating change. Each is safe to ship without, but worth doing later
 
 ## `backup-following` command
 
-### 1. Validate / warn on `--only` and `--exclude` user IDs
+### 1. Validate / warn on `--only` and `--exclude` user IDs — DONE
 *Source: cli-ux review (Should-fix, Medium). Behavior change.*
+
+Implemented both options. `--only`/`--exclude` values are validated as Pixiv
+user IDs (non-negative integers) at parse time via a shared click callback
+(`_validate_user_ids` in `cli.py`), so `--only abc` now fails fast with a
+teaching `click.BadParameter` (exit 2) instead of being silently accepted. And
+when an `--only`/`--exclude` ID matches no followed user, a warning naming the
+unmatched IDs is emitted on stderr: the click-agnostic `run_following` gained an
+injectable `warn` callback (mirroring `progress`/`clock`/`sleep`), while
+`_iterate_following` records which requested IDs were observed and reports
+whether enumeration was truncated by `--limit`/`--max-users`/a partial `ApiError`
+so the warning is suppressed on a truncated run (avoiding false positives). This
+also surfaces the previously-silent partial-miss case (e.g. `--only 111 999`
+where only 111 is followed, which used to exit 0 with no signal). Exit codes,
+stdout, and the JSON summary are unchanged; the warning is stderr-only. Kept here
+for history.
+
+Original report below.
 
 Today `--only`/`--exclude` accept arbitrary strings. Two rough edges:
 

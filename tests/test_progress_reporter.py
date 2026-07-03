@@ -11,6 +11,8 @@ from __future__ import annotations
 import io
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from pixiv_bookmark_backup.core import ProgressEvent, ProgressKind
 from pixiv_bookmark_backup.progress_reporter import (
@@ -22,6 +24,7 @@ from pixiv_bookmark_backup.progress_reporter import (
     THROTTLE_INTERVAL,
     ProgressReporter,
     ReporterMode,
+    _pluralize,
 )
 
 
@@ -409,6 +412,19 @@ def test_bar_determinate_ratio_stays_plural_at_one() -> None:
     clock.advance(FIRST_DRAW_DELAY)
     reporter.handle(work_event(works_total=1))
     assert "1/50 works" in stream.getvalue()
+
+
+@given(
+    n=st.integers(min_value=0, max_value=10_000),
+    singular=st.sampled_from(["work", "user", "file"]),
+)
+def test_pluralize_matches_singular_iff_count_is_one(n: int, singular: str) -> None:
+    # Property, not just the n=0/1/2 examples above: for ANY non-negative
+    # count, the singular form appears iff n == 1, and n is always echoed
+    # verbatim as the leading token.
+    result = _pluralize(n, singular)
+    expected = f"{n} {singular}" if n == 1 else f"{n} {singular}s"
+    assert result == expected
 
 
 def test_milestone_singular_at_one() -> None:

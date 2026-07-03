@@ -210,8 +210,19 @@ than a distinct image. Only worth addressing if/when naming stops guaranteeing
 uniqueness: options are a deterministic de-dup suffix, or per-work subdirectories.
 No action needed while the flat ID-prefixed scheme is the only one.
 
-### 8. Surface a clean error for a structurally malformed manifest in `--layout by-author`
+### 8. Surface a clean error for a structurally malformed manifest in `--layout by-author` — DONE
 *Source: security review of the `--layout` feature (out of scope, robustness/UX not security). Low priority.*
+
+Done: `load_manifest_strict` now validates author IDs at load time via a plain
+`_require_author_ids` helper that raises a teaching `ManifestLoadError` naming
+the offending work when any `author` object lacks `id`. The `search` command
+maps that to a clean stderr message and exit 2 (no traceback, no links created),
+covering both the `--layout by-author` path and `core.format_work_line`'s
+unknown-author fallback before either can crash. The message interpolates the
+untrusted id/title with `!r` so control bytes can't reach the terminal. Kept
+here for history.
+
+Original report below.
 
 `naming.author_dir_name` reads `work.author["id"]` by direct subscript (matching
 the `data["..."]` convention throughout `manifest.py`'s `from_dict` methods). A
@@ -228,8 +239,18 @@ missing that key loads cleanly and only crashes later, at link time.
 
 ## Tooling
 
-### 9. Fix the `bandit` pixi task and the `pip-audit` environment
+### 9. Fix the `bandit` pixi task and the `pip-audit` environment — DONE
 *Source: security review of the `--symlink-dir` feature (environment defects, not code). Infra.*
+
+Done: added `pip-audit` and `filelock` to the `dev` feature (both conda-forge)
+plus a `pixi run audit` task, so dependency-vuln scans run cleanly again. The
+`bandit` "double-append" could not be reproduced for the bare `pixi run bandit`
+(it runs clean on pixi 0.72.0 with a single `-r <dir>`); the reported error only
+occurs when `-r pixiv_bookmark_backup` is passed *again* on top of the task, so
+the task was left as-is with a clarifying comment (and a security-reviewer note)
+to stop anyone re-adding the redundant target. Kept here for history.
+
+Original report below.
 
 Two security-tooling gaps surfaced when scanners were run (neither affects any
 shipped code):
@@ -247,8 +268,15 @@ Fixing both restores on-demand `bandit` + `pip-audit` runs for future reviews.
 
 ## Progress indicator (`backup` / `backup-following`)
 
-### 10. Tighten `ProgressReporter.unit` to `Literal["works", "users"]`
+### 10. Tighten `ProgressReporter.unit` to `Literal["works", "users"]` — DONE
 *Source: final quality review (Nit, cosmetic).*
+
+Done: `ProgressReporter.unit` and the `unit` value computed in `cli.py` are now
+typed `Literal["works", "users"]`, later factored into a shared `ProgressUnit`
+alias in `progress_reporter.py` and reused at every site, so a typo like
+`"work"` is a type error. Kept here for history.
+
+Original report below.
 
 `ProgressReporter.unit` and the `unit` values computed in `cli.py` are plain
 `str`. Nothing currently constrains them, so Pyright can't catch a typo (e.g.
@@ -346,3 +374,18 @@ consistency question. Left out of item #12's fix since it was scoped to
 `Cf`; worth folding into `_SANITIZED_CATEGORIES` (as `{"Cc", "Cf", "Zl",
 "Zp"}`) if a future review wants a broader "never lets untrusted text
 reshape terminal output" guarantee.
+
+## `search` command (follow-ups)
+
+### 15. `format_work_line` interpolates `work.id` without `!r`
+*Source: security review of the `search --layout by-author` malformed-manifest fix (item #8). Robustness / latent injection.*
+
+`core.format_work_line` (`core.py:625`) interpolates `work.id` into terminal
+output without the `!r` repr-escaping that neutralizes control bytes. Because
+`WorkEntry.id` carries no runtime type enforcement, a hand-edited/corrupt
+manifest could smuggle ANSI/control bytes through the id into stderr. The item
+#8 fix added a load-time author-id guard that preempts this for the `search`
+read path and applied `!r` to `work.id` in the new manifest error message, but
+the original `format_work_line` sink itself is unchanged. Apply `!r` to
+`work.id` there (a normal int still renders bare as `123`) to close the sink
+directly, independent of the load-time guard.

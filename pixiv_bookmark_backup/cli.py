@@ -185,6 +185,32 @@ def _parse_since(
         ) from None
 
 
+def _validate_user_ids(
+    ctx: click.Context,
+    param: click.Parameter,
+    value: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Validate every ``--only``/``--exclude`` value is a Pixiv user ID.
+
+    Pixiv user IDs are always non-negative integers, and the follow-list filter
+    compares them by ``str(user.id)`` (a plain decimal string), so a non-numeric
+    value like ``abc`` can never match any followed user. Rejecting it at parse
+    time (both options are ``multiple=True``, so ``value`` is the full tuple)
+    turns a silently-ineffective filter into a teaching
+    :class:`click.BadParameter` (exit code 2) instead of a confusing empty run.
+    """
+
+    for raw in value:
+        if not (raw.isascii() and raw.isdigit()):
+            raise click.BadParameter(
+                f"{raw!r} is not a valid Pixiv user ID; user IDs are whole "
+                "numbers (e.g. 12345).",
+                ctx=ctx,
+                param=param,
+            )
+    return value
+
+
 @click.group()
 @click.version_option(__version__, prog_name="pixiv-bookmark-backup")
 def cli() -> None:
@@ -549,12 +575,14 @@ def _emit_summary(
     "--only",
     multiple=True,
     metavar="USER_ID",
+    callback=_validate_user_ids,
     help="Only back up these followed user IDs (repeatable).",
 )
 @click.option(
     "--exclude",
     multiple=True,
     metavar="USER_ID",
+    callback=_validate_user_ids,
     help="Skip these followed user IDs (repeatable).",
 )
 @click.option(
@@ -779,7 +807,13 @@ def backup_following(
 
     try:
         try:
-            summary = run_following(run_config, auth, client, progress=reporter.handle)
+            summary = run_following(
+                run_config,
+                auth,
+                client,
+                progress=reporter.handle,
+                warn=lambda msg: click.echo(f"Warning: {msg}", err=True),
+            )
         finally:
             # finish() lives in this INNER finally so it runs before any outer
             # except body: on KeyboardInterrupt the dangling bar line is erased

@@ -235,6 +235,158 @@ def test_success_end_to_end_per_author_layout(
     assert client.download_calls
 
 
+def test_only_matching_nobody_warns_on_stderr(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Following user 10, but --only names 999 (nobody) -> full miss.
+    client = FakeFollowingClient(
+        {"public": [_make_user(10)]}, {"10": [_make_work(101, author_id=10)]}
+    )
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup-following",
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--config",
+            _missing_config(tmp_path),
+            "--only",
+            "999",
+        ],
+        env=_token_env(),
+    )
+
+    # No user matched -> 0 works -> the existing exit 5, plus the new warning.
+    assert result.exit_code == 5, result.output
+    assert "Warning: no followed user matched --only for 999" in result.stderr
+
+
+def test_only_partial_miss_warns_only_for_unmatched_id(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 10 is followed (and backed up), 999 matches nobody -> exit 0 with a warning
+    # naming only 999.
+    client = FakeFollowingClient(
+        {"public": [_make_user(10)]}, {"10": [_make_work(101, author_id=10)]}
+    )
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup-following",
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--config",
+            _missing_config(tmp_path),
+            "--only",
+            "10",
+            "--only",
+            "999",
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Warning: no followed user matched --only for 999" in result.stderr
+    # The matched ID must not be named as unmatched.
+    assert "for 10" not in result.stderr
+    assert "10, 999" not in result.stderr
+
+
+def test_exclude_matching_nobody_warns_on_stderr(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 10 is followed and backed up; --exclude 999 excludes nobody -> warning.
+    client = FakeFollowingClient(
+        {"public": [_make_user(10)]}, {"10": [_make_work(101, author_id=10)]}
+    )
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup-following",
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--config",
+            _missing_config(tmp_path),
+            "--exclude",
+            "999",
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Warning: no followed user matched --exclude for 999" in result.stderr
+
+
+def test_only_full_match_does_not_warn(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = FakeFollowingClient(
+        {"public": [_make_user(10)]}, {"10": [_make_work(101, author_id=10)]}
+    )
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup-following",
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--config",
+            _missing_config(tmp_path),
+            "--only",
+            "10",
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "matched --only" not in result.stderr
+
+
+def test_unmatched_warning_suppressed_when_run_truncated_by_limit(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # --limit stops enumeration after the first work of user 10, before 999
+    # could ever be observed. Suppress the warning to avoid a false positive.
+    client = FakeFollowingClient(
+        {"public": [_make_user(10)]},
+        {
+            "10": [
+                _make_work(101, author_id=10),
+                _make_work(102, author_id=10),
+            ]
+        },
+    )
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup-following",
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--config",
+            _missing_config(tmp_path),
+            "--only",
+            "10",
+            "--only",
+            "999",
+            "--limit",
+            "1",
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "matched --only" not in result.stderr
+
+
 def test_json_summary_is_clean_stdout(
     runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -386,6 +538,47 @@ def test_only_and_exclude_mutually_exclusive(runner: CliRunner, tmp_path: Path) 
     )
     assert result.exit_code == 2
     assert "--only and --exclude are mutually exclusive" in result.stderr
+
+
+@pytest.mark.parametrize("flag", ["--only", "--exclude"])
+def test_non_numeric_user_id_is_exit_2(
+    runner: CliRunner, tmp_path: Path, flag: str
+) -> None:
+    result = runner.invoke(
+        cli,
+        [
+            "backup-following",
+            "--config",
+            _missing_config(tmp_path),
+            flag,
+            "abc",
+        ],
+        env=_token_env(),
+    )
+    assert result.exit_code == 2
+    # Teaching BadParameter naming the offending value and the option.
+    assert "'abc' is not a valid Pixiv user ID" in result.stderr
+    assert flag in result.stderr
+
+
+def test_non_numeric_user_id_rejected_among_valid_ones(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    result = runner.invoke(
+        cli,
+        [
+            "backup-following",
+            "--config",
+            _missing_config(tmp_path),
+            "--only",
+            "10",
+            "--only",
+            "1.5",
+        ],
+        env=_token_env(),
+    )
+    assert result.exit_code == 2
+    assert "'1.5' is not a valid Pixiv user ID" in result.stderr
 
 
 def test_missing_token_is_usage_error(runner: CliRunner, tmp_path: Path) -> None:

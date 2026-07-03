@@ -105,11 +105,17 @@ class FakePixivClient:
         self._works_by_restrict = works_by_restrict
         self._self_id = self_id
         self.download_calls: list[str] = []
+        # Track API activity so a test can prove a corrupt-manifest run fails
+        # fast (pre-flight) without authenticating or listing anything.
+        self.authenticate_calls = 0
+        self.list_calls = 0
 
     def authenticate(self, refresh_token: str) -> str:
+        self.authenticate_calls += 1
         return self._self_id
 
     def iter_bookmarks(self, user_id: str, restrict: str) -> Iterator[BookmarkWork]:
+        self.list_calls += 1
         yield from self._works_by_restrict.get(restrict, [])
 
     def iter_following(  # pragma: no cover
@@ -1068,3 +1074,103 @@ def test_time_per_request_absent_from_json_payload(
     # The summary schema is unchanged: the pacing knob is not a JSON field.
     assert payload["schema"] == 1
     assert "time_per_request" not in payload
+
+
+# -- resume manifest: corrupt fails loud, schema mismatch warns ---------
+
+
+def test_corrupt_manifest_fails_loud_exit_2(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "details.json").write_text("this is not json {{{", encoding="utf-8")
+    client = FakePixivClient({"public": [_make_work(100, pages=1)]})
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        ["backup", "--output-dir", str(out), "--config", _missing_config(tmp_path)],
+        env=_token_env(),
+    )
+
+    # Clean, teaching exit -- not a traceback, not a silent regenerate.
+    assert result.exit_code == 2
+    assert "not valid JSON" in result.stderr
+    assert "rename or delete it" in result.stderr
+    assert str(out / "details.json") in result.stderr
+    assert "Traceback" not in result.output
+    # No summary line reached stdout.
+    assert "Backed up" not in result.stdout
+    # Fail FAST: the corrupt manifest is caught up front, before any API work --
+    # nothing was authenticated, listed, or downloaded.
+    assert client.authenticate_calls == 0
+    assert client.list_calls == 0
+    assert client.download_calls == []
+    # The corrupt file is left in place; nothing moved aside.
+    assert (out / "details.json").read_text(encoding="utf-8") == "this is not json {{{"
+    assert not (out / "details.json.bak").exists()
+
+
+def test_schema_mismatch_regenerates_and_warns_on_stderr(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "out"
+    out.mkdir()
+    details = out / "details.json"
+    details.write_text(
+        json.dumps({"schema_version": 999, "generated_at": "", "source": {}}),
+        encoding="utf-8",
+    )
+    client = FakePixivClient({"public": [_make_work(100, pages=1)]})
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        ["backup", "--output-dir", str(out), "--config", _missing_config(tmp_path)],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    # The regenerate still happens...
+    assert (out / "details.json.bak").exists()
+    manifest = json.loads(details.read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == 1
+    # ...but is now announced on stderr, naming the .bak file.
+    assert "Warning:" in result.stderr
+    assert str(out / "details.json.bak") in result.stderr
+    # The run summary still lands on stdout.
+    assert "Backed up 1/1 works" in result.stdout
+
+
+def test_schema_mismatch_left_intact_when_run_fails_after_preflight(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The move-aside is deferred to a successful flush: if the run fails after
+    # pre-flight (here, auth is rejected) the schema-mismatched details.json is
+    # left completely in place -- not moved, no .bak, no regenerate -- so nothing
+    # is lost.
+    out = tmp_path / "out"
+    out.mkdir()
+    details = out / "details.json"
+    original = json.dumps({"schema_version": 999, "generated_at": "", "source": {}})
+    details.write_text(original, encoding="utf-8")
+    client = FakePixivClient({"public": [_make_work(100, pages=1)]})
+
+    def _reject(_token: str) -> str:
+        raise AuthRejected("Pixiv rejected the refresh token")
+
+    monkeypatch.setattr(client, "authenticate", _reject)
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        ["backup", "--output-dir", str(out), "--config", _missing_config(tmp_path)],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 3
+    # Nothing was written or moved: the mismatched manifest is byte-for-byte intact.
+    assert details.read_text(encoding="utf-8") == original
+    assert not (out / "details.json.bak").exists()
+    assert client.download_calls == []

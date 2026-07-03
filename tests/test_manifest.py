@@ -16,6 +16,7 @@ from pixiv_bookmark_backup.manifest import (
     SCHEMA_VERSION,
     ImageEntry,
     Manifest,
+    ManifestLoadError,
     WorkEntry,
     build_work_entry,
     derive_nsfw,
@@ -504,6 +505,79 @@ def test_load_or_init_flags_schema_mismatch(tmp_path: Path) -> None:
     assert mismatch is True
     assert manifest.schema_version == SCHEMA_VERSION
     assert manifest.works == []
+
+
+def test_load_or_init_corrupt_json_raises_manifest_load_error(tmp_path: Path) -> None:
+    path = tmp_path / "details.json"
+    path.write_text("this is not json {{{", encoding="utf-8")
+
+    with pytest.raises(ManifestLoadError) as excinfo:
+        load_or_init(path)
+
+    message = str(excinfo.value)
+    assert str(path) in message
+    assert "not valid JSON" in message
+    assert "rename or delete it" in message
+    # Fail-loud: the corrupt file is left in place, not moved aside.
+    assert path.read_text(encoding="utf-8") == "this is not json {{{"
+    assert not (tmp_path / "details.json.bak").exists()
+
+
+def test_load_or_init_empty_file_raises_manifest_load_error(tmp_path: Path) -> None:
+    # A 0-byte details.json is treated as corrupt JSON (json.load raises).
+    path = tmp_path / "details.json"
+    path.write_text("", encoding="utf-8")
+
+    with pytest.raises(ManifestLoadError):
+        load_or_init(path)
+
+
+def test_load_or_init_deeply_nested_raises_manifest_load_error(tmp_path: Path) -> None:
+    # CPython's recursive JSON decoder overflows the stack on a deeply-nested
+    # document; load_or_init maps the RecursionError to a teaching error.
+    path = tmp_path / "details.json"
+    path.write_text("[" * 100_000 + "]" * 100_000, encoding="utf-8")
+
+    with pytest.raises(ManifestLoadError) as excinfo:
+        load_or_init(path)
+
+    message = str(excinfo.value)
+    assert str(path) in message
+    assert "too deeply nested" in message
+    assert path.exists()
+
+
+@pytest.mark.parametrize("document", ["[]", '"a string"', "123", "true", "null"])
+def test_load_or_init_non_object_raises_manifest_load_error(
+    tmp_path: Path, document: str
+) -> None:
+    path = tmp_path / "details.json"
+    path.write_text(document, encoding="utf-8")
+
+    with pytest.raises(ManifestLoadError) as excinfo:
+        load_or_init(path)
+
+    message = str(excinfo.value)
+    assert str(path) in message
+    assert "not a manifest object" in message
+    assert path.read_text(encoding="utf-8") == document
+
+
+def test_load_or_init_missing_required_key_still_raises_key_error(
+    tmp_path: Path,
+) -> None:
+    # Out of scope for the fail-loud change: a structurally-valid dict with a
+    # matching schema but missing required keys keeps raising the raw KeyError
+    # from Manifest.from_dict, exactly as before (deliberately NOT a
+    # ManifestLoadError here -- only the read-only strict loader wraps that).
+    path = tmp_path / "details.json"
+    path.write_text(
+        json.dumps({"schema_version": SCHEMA_VERSION, "works": []}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(KeyError):
+        load_or_init(path)
 
 
 # --------------------------------------------------------------------------- #

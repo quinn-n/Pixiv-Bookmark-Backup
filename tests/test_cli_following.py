@@ -95,14 +95,21 @@ class FakeFollowingClient:
         self._works_by_user = works_by_user
         self._self_id = self_id
         self.download_calls: list[str] = []
+        # Track API activity so a test can prove a corrupt-manifest run fails
+        # fast (pre-flight) without authenticating or listing anything.
+        self.authenticate_calls = 0
+        self.list_calls = 0
 
     def authenticate(self, refresh_token: str) -> str:
+        self.authenticate_calls += 1
         return self._self_id
 
     def iter_following(self, user_id: str, restrict: str) -> Iterator[FollowedUser]:
+        self.list_calls += 1
         yield from self._following_by_restrict.get(restrict, [])
 
     def iter_user_works(self, user_id: str) -> Iterator[BookmarkWork]:
+        self.list_calls += 1
         yield from self._works_by_user.get(user_id, [])
 
     def iter_bookmarks(  # pragma: no cover
@@ -1303,3 +1310,119 @@ def test_time_per_request_absent_from_json_payload(
     # The summary schema is unchanged: the pacing knob is not a JSON field.
     assert payload["schema"] == 1
     assert "time_per_request" not in payload
+
+
+# -- resume manifest: corrupt fails loud, schema mismatch warns ---------
+
+
+def test_corrupt_manifest_fails_loud_exit_2(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "details.json").write_text("this is not json {{{", encoding="utf-8")
+    client = FakeFollowingClient(
+        {"public": [_make_user(10)]}, {"10": [_make_work(101, author_id=10)]}
+    )
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup-following",
+            "--output-dir",
+            str(out),
+            "--config",
+            _missing_config(tmp_path),
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 2
+    assert "not valid JSON" in result.stderr
+    assert "rename or delete it" in result.stderr
+    assert str(out / "details.json") in result.stderr
+    assert "Traceback" not in result.output
+    assert "Backed up" not in result.stdout
+    # Fail FAST: caught up front, before any API work -- nothing authenticated,
+    # listed, or downloaded.
+    assert client.authenticate_calls == 0
+    assert client.list_calls == 0
+    assert client.download_calls == []
+    assert (out / "details.json").read_text(encoding="utf-8") == "this is not json {{{"
+    assert not (out / "details.json.bak").exists()
+
+
+def test_schema_mismatch_regenerates_and_warns_on_stderr(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "out"
+    out.mkdir()
+    details = out / "details.json"
+    details.write_text(
+        json.dumps({"schema_version": 999, "generated_at": "", "source": {}}),
+        encoding="utf-8",
+    )
+    client = FakeFollowingClient(
+        {"public": [_make_user(10)]}, {"10": [_make_work(101, author_id=10)]}
+    )
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup-following",
+            "--output-dir",
+            str(out),
+            "--config",
+            _missing_config(tmp_path),
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert (out / "details.json.bak").exists()
+    manifest = json.loads(details.read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == 1
+    assert "Warning:" in result.stderr
+    assert str(out / "details.json.bak") in result.stderr
+    assert "Backed up 1/1 works" in result.stdout
+
+
+def test_schema_mismatch_left_intact_when_run_fails_after_preflight(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The move-aside is deferred to a successful flush: if the run fails after
+    # pre-flight (here, auth is rejected) the schema-mismatched details.json is
+    # left in place -- not moved, no .bak, no regenerate.
+    out = tmp_path / "out"
+    out.mkdir()
+    details = out / "details.json"
+    original = json.dumps({"schema_version": 999, "generated_at": "", "source": {}})
+    details.write_text(original, encoding="utf-8")
+    client = FakeFollowingClient(
+        {"public": [_make_user(10)]}, {"10": [_make_work(101, author_id=10)]}
+    )
+
+    def _reject(_token: str) -> str:
+        raise AuthRejected("Pixiv rejected the refresh token")
+
+    monkeypatch.setattr(client, "authenticate", _reject)
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup-following",
+            "--output-dir",
+            str(out),
+            "--config",
+            _missing_config(tmp_path),
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 3
+    assert details.read_text(encoding="utf-8") == original
+    assert not (out / "details.json.bak").exists()
+    assert client.download_calls == []

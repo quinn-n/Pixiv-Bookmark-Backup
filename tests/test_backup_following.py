@@ -38,6 +38,7 @@ from pixiv_bookmark_backup.core import (
     decide_exit_code,
 )
 from pixiv_bookmark_backup.downloader import ImageResult
+from pixiv_bookmark_backup.manifest import ManifestLoadError
 from pixiv_bookmark_backup.models import (
     Author,
     BookmarkWork,
@@ -917,24 +918,62 @@ def test_follow_list_apierror_after_some_works_degrades_to_partial(
     )
 
 
-def test_corrupt_manifest_is_backed_up_and_regenerated(
+def test_schema_mismatch_is_backed_up_regenerated_and_warns(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _patch_downloads(monkeypatch)
     # A pre-existing manifest with a mismatched schema is moved aside to .bak and
-    # the run starts fresh rather than crashing.
-    (tmp_path / "details.json").write_text(
+    # the run starts fresh rather than crashing -- and the move is now announced.
+    details = tmp_path / "details.json"
+    details.write_text(
         json.dumps({"schema_version": 999, "generated_at": "", "source": {}}),
         encoding="utf-8",
     )
     client = FakeFollowingClient(
         {"public": [_make_user(10)]}, {"10": [_make_work(1, author_id=10)]}
     )
-    _run(_config(tmp_path), client)
-    assert (tmp_path / "details.json.bak").exists()
+    warnings: list[str] = []
+    run_following(
+        _config(tmp_path),
+        _auth(),
+        client,
+        clock=lambda: FIXED_CLOCK,
+        warn=warnings.append,
+    )
+    bak = tmp_path / "details.json.bak"
+    assert bak.exists()
     manifest = _read_manifest(tmp_path)
     assert manifest["schema_version"] == 1
     assert {work["id"] for work in manifest["works"]} == {1}
+    assert len(warnings) == 1
+    assert str(bak) in warnings[0]
+    assert str(details) in warnings[0]
+
+
+def test_corrupt_manifest_fails_loud_and_is_left_in_place(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_downloads(monkeypatch)
+    # A corrupt (unparseable) existing manifest must fail loud on resume, not be
+    # silently discarded and regenerated -- and fail FAST, before any API work.
+    details = tmp_path / "details.json"
+    details.write_text("}} not json {{", encoding="utf-8")
+    client = FakeFollowingClient(
+        {"public": [_make_user(10)]}, {"10": [_make_work(1, author_id=10)]}
+    )
+
+    with pytest.raises(ManifestLoadError) as excinfo:
+        _run(_config(tmp_path), client)
+
+    assert str(details) in str(excinfo.value)
+    assert "not valid JSON" in str(excinfo.value)
+    # Fail fast: caught up front, before authenticating or listing anything.
+    assert client.auth_calls == []
+    assert client.following_calls == []
+    assert client.works_calls == []
+    # Left untouched: not moved aside, not regenerated.
+    assert details.read_text(encoding="utf-8") == "}} not json {{"
+    assert not (tmp_path / "details.json.bak").exists()
 
 
 def test_image_failure_marks_work_failed_partial(

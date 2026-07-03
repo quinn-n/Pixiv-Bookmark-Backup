@@ -364,6 +364,16 @@ def merge(existing: Manifest, new: Manifest) -> Manifest:
     )
 
 
+#: Recovery hint appended to every corrupt-manifest :class:`ManifestLoadError`
+#: raised by :func:`load_or_init`, so the teaching message names a concrete next
+#: step. Kept generic ("rename or delete it") so this module stays self-contained
+#: and does not depend on ``backup.py``'s ``.bak`` naming.
+_RESUME_RECOVERY_HINT = (
+    "The manifest looks corrupt or hand-edited; rename or delete it to start a "
+    "fresh backup, then re-run."
+)
+
+
 def load_or_init(path: Path) -> tuple[Manifest, bool]:
     """Load an existing manifest at ``path`` or return a fresh empty one.
 
@@ -371,18 +381,53 @@ def load_or_init(path: Path) -> tuple[Manifest, bool]:
     an empty manifest (no works, no errors, current :data:`SCHEMA_VERSION`) with
     ``schema_mismatch`` ``False``.
 
-    When the file exists and parses, ``schema_mismatch`` is
+    When the file exists and parses to a ``dict``, ``schema_mismatch`` is
     ``data["schema_version"] != SCHEMA_VERSION``. On a *matching* schema the
     parsed manifest is returned; on a *mismatch* an empty manifest is returned
     (so the caller never tries to interpret a foreign layout) -- the caller is
-    responsible for writing the ``.bak`` and regenerating.
+    responsible for writing the ``.bak``, announcing it, and regenerating.
+
+    Unlike the read-only :func:`load_manifest_strict`, this resume loader is
+    *tolerant of a schema mismatch* (a routine tool-version bump, not an error)
+    but is **fail-loud on a corrupt read**: malformed JSON
+    (:class:`json.JSONDecodeError`), a pathologically deep document
+    (:class:`RecursionError`), or a successfully-parsed but non-``dict``
+    top-level document each raise a teaching :class:`ManifestLoadError` naming
+    ``path`` -- so a hand-edited/corrupt ``details.json`` is reported cleanly
+    (and left untouched on disk) instead of being silently discarded and
+    regenerated (see DEFERRED item #5). An :class:`OSError` from opening the file
+    is *not* caught here; it propagates so the caller's I/O-recovery path can
+    handle it. A structurally-valid ``dict`` with a matching schema but missing
+    required keys still raises the underlying ``KeyError`` from
+    :meth:`Manifest.from_dict` (deliberately out of scope).
     """
 
     if not path.exists():
         return _empty_manifest(), False
 
-    with path.open("r", encoding="utf-8") as handle:
-        data = json.load(handle)
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except json.JSONDecodeError as exc:
+        raise ManifestLoadError(
+            f"{path} is not valid JSON: {exc}. {_RESUME_RECOVERY_HINT}"
+        ) from exc
+    except RecursionError as exc:
+        # CPython's JSON decoder is recursive, so a deeply-nested (possibly
+        # hostile) document overflows the stack. Map it to a clean load error
+        # instead of leaking a raw RecursionError traceback.
+        raise ManifestLoadError(
+            f"{path} is too deeply nested to parse as JSON. {_RESUME_RECOVERY_HINT}"
+        ) from exc
+
+    if not isinstance(data, dict):
+        # A valid-JSON but non-object document (list/str/number) would otherwise
+        # blow up later on ``data.get(...)`` / ``Manifest.from_dict``; fail loud
+        # here with a teaching message instead.
+        raise ManifestLoadError(
+            f"{path} is not a manifest object: got {type(data).__name__}. "
+            f"{_RESUME_RECOVERY_HINT}"
+        )
 
     schema_mismatch = data.get("schema_version") != SCHEMA_VERSION
     if schema_mismatch:

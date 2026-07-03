@@ -23,6 +23,7 @@ from pixiv_bookmark_backup.progress_reporter import (
     MILESTONE_INTERVAL,
     THROTTLE_INTERVAL,
     ProgressReporter,
+    ProgressUnit,
     ReporterMode,
     _pluralize,
 )
@@ -48,7 +49,7 @@ def make_reporter(
     *,
     show_planned: bool = False,
     total: int | None = None,
-    unit: str = "works",
+    unit: ProgressUnit = "works",
     ascii_only: bool = True,
 ) -> ProgressReporter:
     return ProgressReporter(

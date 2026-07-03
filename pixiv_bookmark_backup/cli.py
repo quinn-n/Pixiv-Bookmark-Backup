@@ -162,6 +162,39 @@ def _stream_is_ascii_only(stream: TextIO) -> bool:
     return False
 
 
+def _build_reporter(
+    *,
+    quiet: bool,
+    verbose: int,
+    dry_run: bool,
+    total: int | None,
+    unit: str,
+) -> ProgressReporter:
+    """Build the :class:`ProgressReporter` shared by ``backup`` and
+    ``backup_following``.
+
+    Resolves terminal state at command-invocation time, never at import: under
+    ``CliRunner`` ``sys.stderr`` is swapped per invocation, so a call-time
+    lookup is what sees the active stream. ``is_tty`` selects ``BAR`` vs
+    ``MILESTONE``; ``ascii_only`` selects the spinner alphabet. ``total`` and
+    ``unit`` describe the bar's denominator and are left to the caller, since
+    each command has its own rule for what counts as determinate.
+    """
+
+    stream = sys.stderr
+    mode, show_planned = _resolve_reporter_mode(
+        quiet=quiet, verbose=verbose, dry_run=dry_run, is_tty=stream.isatty()
+    )
+    return ProgressReporter(
+        stream=stream,
+        mode=mode,
+        show_planned=show_planned,
+        total=total,
+        unit=unit,
+        ascii_only=_stream_is_ascii_only(stream),
+    )
+
+
 def _parse_since(
     ctx: click.Context,
     param: click.Parameter,
@@ -430,22 +463,10 @@ def backup(
             err=True,
         )
 
-    # Resolve terminal state at command-invocation time, never at import: under
-    # CliRunner sys.stderr is swapped per invocation, so a call-time lookup is
-    # what sees the active stream. is_tty selects BAR vs MILESTONE; ascii_only
-    # selects the spinner alphabet. --limit is the only determinate denominator
-    # for this command, so it is the bar's total (works).
-    stream = sys.stderr
-    mode, show_planned = _resolve_reporter_mode(
-        quiet=quiet, verbose=verbose, dry_run=dry_run, is_tty=stream.isatty()
-    )
-    reporter = ProgressReporter(
-        stream=stream,
-        mode=mode,
-        show_planned=show_planned,
-        total=limit,
-        unit="works",
-        ascii_only=_stream_is_ascii_only(stream),
+    # --limit is the only determinate denominator for this command, so it is
+    # the bar's total (works).
+    reporter = _build_reporter(
+        quiet=quiet, verbose=verbose, dry_run=dry_run, total=limit, unit="works"
     )
 
     client = Pixivpy3Client()
@@ -782,21 +803,8 @@ def backup_following(
         total = None
         unit = "works"
 
-    # Resolve terminal state at command-invocation time, never at import: under
-    # CliRunner sys.stderr is swapped per invocation, so a call-time lookup is
-    # what sees the active stream. is_tty selects BAR vs MILESTONE; ascii_only
-    # selects the spinner alphabet.
-    stream = sys.stderr
-    mode, show_planned = _resolve_reporter_mode(
-        quiet=quiet, verbose=verbose, dry_run=dry_run, is_tty=stream.isatty()
-    )
-    reporter = ProgressReporter(
-        stream=stream,
-        mode=mode,
-        show_planned=show_planned,
-        total=total,
-        unit=unit,
-        ascii_only=_stream_is_ascii_only(stream),
+    reporter = _build_reporter(
+        quiet=quiet, verbose=verbose, dry_run=dry_run, total=total, unit=unit
     )
 
     client = Pixivpy3Client()

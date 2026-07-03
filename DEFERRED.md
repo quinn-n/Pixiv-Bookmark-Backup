@@ -199,17 +199,18 @@ Fixing both restores on-demand `bandit` + `pip-audit` runs for future reviews.
 gap. Low risk, low value — left as plain `str` since the two literal values
 are only ever produced by the two `cli.py` call sites, both already tested.
 
-### 11. Deduplicate reporter construction between `backup` and `backup_following`
+### 11. Deduplicate reporter construction between `backup` and `backup_following` — DONE
 *Source: final quality review (Nit, refactor).*
 
-The block that resolves `stream`/`is_tty`/`ascii_only`, calls
-`_resolve_reporter_mode(...)`, and constructs `ProgressReporter(...)` is
-near-identical (~10 lines) in both `backup()` and `backup_following()` in
-`cli.py`, differing only in how `total`/`unit` are computed. A shared
-`_build_reporter(...)` helper taking the resolved `total`/`unit` would remove
-the duplication. Left inline since each command's `total`/`unit` logic differs
-enough that extracting the whole block felt like premature abstraction for two
-call sites; revisit if a third command needs the same wiring.
+Implemented: a shared `_build_reporter(*, quiet, verbose, dry_run, total, unit)`
+helper now lives in `cli.py` (right after `_stream_is_ascii_only`) and resolves
+`stream`/`is_tty`/`ascii_only`, calls `_resolve_reporter_mode(...)`, and
+constructs `ProgressReporter(...)`. Both `backup()` and `backup_following()`
+call it, passing only their own already-resolved `total`/`unit` (`backup`
+passes `total=limit, unit="works"`; `backup_following` keeps its own
+`total`/`unit` branching on `limit`/`max_users` untouched and passes the
+result through). No behavior change; `pixi run check` stays green at the same
+708 passed / 2 skipped / 99% coverage baseline.
 
 ### 12. `_sanitize_display_text` doesn't cover visual-spoofing code points
 *Source: security review of the Hypothesis property tests for this sanitizer. Robustness, not an injection hole.*

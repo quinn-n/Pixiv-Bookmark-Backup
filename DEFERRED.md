@@ -136,9 +136,12 @@ I/O-recovery path. The `backup` and `backup-following` click commands map
 command exactly — clean stderr message, no traceback, no partial summary on
 stdout. Detection is **fail-fast**: a `_preflight_manifest` check runs at the
 very start of `run()`/`run_following()`, *before* any authentication, listing,
-or download, so a corrupt resume exits 2 immediately having done zero API work
-(the reconciled existing manifest is threaded to the flush so it is neither
-re-read nor re-moved).
+or download, so a corrupt resume exits 2 immediately having done zero API work.
+Pre-flight only *reads* — the schema-mismatch `.bak` move-aside, the stderr
+warning, and the regenerate are **deferred to a successful flush** (the reconciled
+`(existing, schema_mismatch)` is threaded through), so a run that fails after
+pre-flight (auth/network) leaves the on-disk `details.json` untouched and creates
+no `.bak`.
 
 A genuine `schema_version` mismatch keeps the safe move-aside-to-`details.json.bak`
 + regenerate behavior (a routine tool-version bump must not block resume) but is

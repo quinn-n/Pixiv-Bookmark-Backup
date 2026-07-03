@@ -1387,3 +1387,42 @@ def test_schema_mismatch_regenerates_and_warns_on_stderr(
     assert "Warning:" in result.stderr
     assert str(out / "details.json.bak") in result.stderr
     assert "Backed up 1/1 works" in result.stdout
+
+
+def test_schema_mismatch_left_intact_when_run_fails_after_preflight(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The move-aside is deferred to a successful flush: if the run fails after
+    # pre-flight (here, auth is rejected) the schema-mismatched details.json is
+    # left in place -- not moved, no .bak, no regenerate.
+    out = tmp_path / "out"
+    out.mkdir()
+    details = out / "details.json"
+    original = json.dumps({"schema_version": 999, "generated_at": "", "source": {}})
+    details.write_text(original, encoding="utf-8")
+    client = FakeFollowingClient(
+        {"public": [_make_user(10)]}, {"10": [_make_work(101, author_id=10)]}
+    )
+
+    def _reject(_token: str) -> str:
+        raise AuthRejected("Pixiv rejected the refresh token")
+
+    monkeypatch.setattr(client, "authenticate", _reject)
+    _install_client(monkeypatch, client)
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup-following",
+            "--output-dir",
+            str(out),
+            "--config",
+            _missing_config(tmp_path),
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 3
+    assert details.read_text(encoding="utf-8") == original
+    assert not (out / "details.json.bak").exists()
+    assert client.download_calls == []

@@ -805,6 +805,15 @@ def backup_following(
     # records the start timestamp.
     reporter.handle(ProgressEvent(kind=ProgressKind.RUN_START))
 
+    def _warn(msg: str) -> None:
+        # The warning is emitted from inside run_following, which is still inside
+        # the live bar. Clear the dangling bar line first (finish() is
+        # idempotent, so the inner finally calling it again is harmless) so the
+        # warning prints on its own clean line instead of being appended onto
+        # the spinner.
+        reporter.finish()
+        click.echo(f"Warning: {msg}", err=True)
+
     try:
         try:
             summary = run_following(
@@ -812,7 +821,7 @@ def backup_following(
                 auth,
                 client,
                 progress=reporter.handle,
-                warn=lambda msg: click.echo(f"Warning: {msg}", err=True),
+                warn=_warn,
             )
         finally:
             # finish() lives in this INNER finally so it runs before any outer

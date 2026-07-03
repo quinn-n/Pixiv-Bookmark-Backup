@@ -194,8 +194,33 @@ the duplication. Left inline since each command's `total`/`unit` logic differs
 enough that extracting the whole block felt like premature abstraction for two
 call sites; revisit if a third command needs the same wiring.
 
-### 12. `_sanitize_display_text` doesn't cover visual-spoofing code points
+### 12. `_sanitize_display_text` doesn't cover visual-spoofing code points — DONE
 *Source: security review of the Hypothesis property tests for this sanitizer. Robustness, not an injection hole.*
+
+Fixed: `_sanitize_display_text` now strips Unicode categories `Cc` **and** `Cf`
+(`"".join(c for c in s if unicodedata.category(c) not in {"Cc", "Cf"})`,
+replacing the old `re.sub` over a fixed C0/C1 byte range). Verified empirically
+against the installed Python's `unicodedata` (version 16.0.0) that every
+commonly-cited bidi-override and zero-width character -- U+202E/U+202D
+(RTL/LTR override), U+2066-U+2069 (directional isolates), U+200B/U+200C/U+200D
+(zero-width space/ZWNJ/ZWJ), U+FEFF, U+2060 (word joiner), U+00AD (soft
+hyphen), U+061C (Arabic letter mark), U+200E/U+200F (LRM/RLM) -- is category
+`Cf`, so stripping `Cf` alone covers both the bidi-override and zero-width
+spoofing vectors named below; no separate zero-width-specific logic was
+needed. `work.title` was deliberately left unchanged: `repr()` (used via
+`work.title!r`) was verified to already backslash-escape every `Cc`/`Cf`
+character it encounters (e.g. `repr("a‮b") == "'a\\u202eb'"`), so its
+existing protection already defeats the same spoofing vectors for titles --
+adding sanitization there would be redundant. Regression coverage: the
+existing `test_sanitize_display_text_never_yields_control_chars` (`Cc`)
+property test is preserved unchanged; a new
+`test_sanitize_display_text_never_yields_format_chars` property test and a new
+concrete `test_user_event_line_strips_rtl_override` example test (U+202E,
+mirroring the existing ESC-byte example) cover `Cf`; the identity test's
+blacklist was extended from `("Cc", "Cs")` to `("Cc", "Cf", "Cs")`. Kept here
+for history.
+
+Original report below.
 
 `_sanitize_display_text` (`backup.py`) strips exactly Unicode category `Cc`
 (`\x00-\x1f`, `\x7f-\x9f`) from `user.name` before it reaches a terminal. This
@@ -213,3 +238,35 @@ whether the promise should be broader. Fix would be extending the strip set to
 `Cf` (and/or zero-width) categories, but do it as a deliberate scope decision
 (does `work.title`'s `!r` protection need the same treatment?) rather than
 inline.
+
+### 13. A lone Unicode surrogate in `user.name` can crash a verbose run
+*Source: security review of item #12's `Cc`/`Cf` fix. Pre-existing gap, not introduced by that change.*
+
+`_sanitize_display_text` (and the `Cc`-only sanitizer it replaced) does not
+strip Unicode category `Cs` (lone/unpaired surrogates, e.g. `U+D800`).
+`json.loads('"\\ud800abc"')` happily produces a Python `str` containing one
+(a malformed or adversarial Pixiv API response could do the same for a
+display name), and `click.echo()` on a string containing a lone surrogate
+raises an unhandled `UnicodeEncodeError` -- crashing a `--verbose`
+`backup-following` run instead of degrading gracefully. `Cs` was deliberately
+left out of item #12's fix (that item was scoped to visual-spoofing code
+points, not encoding crashes), but it is a real, concrete robustness gap
+directly adjacent to the same sanitizer. Fix: either strip `Cs` in
+`_sanitize_display_text` (broadening its docstring accordingly) or replace
+lone surrogates with `U+FFFD REPLACEMENT CHARACTER` so a malformed name still
+displays as *something* rather than crashing the run.
+
+### 14. `Zl`/`Zp` line/paragraph separators pass through `_sanitize_display_text` unstripped
+*Source: security review of item #12's `Cc`/`Cf` fix. Low priority, robustness.*
+
+`U+2028 LINE SEPARATOR` and `U+2029 PARAGRAPH SEPARATOR` (categories `Zl`/`Zp`)
+are not stripped by `_sanitize_display_text`, so a Pixiv display name
+containing one could still visually reflow a verbose/dry-run `line` across
+what looks like multiple lines in some terminals/loggers. They sit right next
+to the bidi-override/zero-width threat model item #12 addressed, and
+`work.title`'s `!r`/repr protection already escapes both (confirmed:
+`repr(chr(0x2028)) == "'\\u2028'"`), so the practical risk is low and mostly a
+consistency question. Left out of item #12's fix since it was scoped to
+`Cf`; worth folding into `_SANITIZED_CATEGORIES` (as `{"Cc", "Cf", "Zl",
+"Zp"}`) if a future review wants a broader "never lets untrusted text
+reshape terminal output" guarantee.

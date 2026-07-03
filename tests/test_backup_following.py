@@ -15,6 +15,7 @@ from __future__ import annotations
 import io
 import json
 import tempfile
+import unicodedata
 from collections.abc import Callable, Iterator
 from datetime import date
 from pathlib import Path
@@ -1361,6 +1362,32 @@ _C0_C1_CONTROL = frozenset(chr(c) for c in range(0x20)) | frozenset(
 )
 
 
+def test_user_event_line_strips_rtl_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Concrete visual-spoofing counterpart to the ESC-byte example above.
+
+    U+202E (RIGHT-TO-LEFT OVERRIDE) is a Unicode ``Cf`` format character, not a
+    ``Cc`` control byte -- it can't execute a terminal escape sequence, but a
+    Pixiv display name embedding it could still make text render reversed /
+    visually misleading (Trojan-Source-style deception) in verbose/dry-run
+    output. It must be stripped from the emitted ``ProgressEvent.line`` the
+    same as a control byte is.
+    """
+    _patch_downloads(monkeypatch)
+    following = {"public": [_make_user(10, name="evil‮user")]}
+    client = FakeFollowingClient(following, {"10": []})
+
+    events = _run_events(_config(tmp_path), client)
+
+    user_events = [e for e in events if e.kind == ProgressKind.USER]
+    assert len(user_events) == 1
+    line = user_events[0].line
+    assert line is not None
+    assert "‮" not in line  # the RTL override char is gone
+    assert line == "user 10 (eviluser)"
+
+
 @given(text=st.text(max_size=80))
 def test_sanitize_display_text_never_yields_control_chars(text: str) -> None:
     # Property, not just the single ESC-byte example above: for ANY input,
@@ -1369,10 +1396,22 @@ def test_sanitize_display_text_never_yields_control_chars(text: str) -> None:
     assert not any(c in _C0_C1_CONTROL for c in result)
 
 
+@given(text=st.text(alphabet=st.characters(categories=("Cf",)), max_size=80))
+def test_sanitize_display_text_never_yields_format_chars(text: str) -> None:
+    # Property version of the RTL-override example above: for ANY Cf
+    # (format/bidi-control/zero-width) character, not just U+202E, none
+    # survives sanitization.
+    result = backup._sanitize_display_text(text)
+    assert not any(unicodedata.category(c) == "Cf" for c in result)
+
+
 @given(
-    text=st.text(alphabet=st.characters(blacklist_categories=("Cc", "Cs")), max_size=80)
+    text=st.text(
+        alphabet=st.characters(blacklist_categories=("Cc", "Cf", "Cs")), max_size=80
+    )
 )
 def test_sanitize_display_text_is_identity_without_control_chars(text: str) -> None:
-    # A display name that never had control bytes must pass through unchanged
-    # -- the sanitizer should not mangle ordinary (including non-ASCII) names.
+    # A display name that never had control/format chars must pass through
+    # unchanged -- the sanitizer should not mangle ordinary (including
+    # non-ASCII) names.
     assert backup._sanitize_display_text(text) == text

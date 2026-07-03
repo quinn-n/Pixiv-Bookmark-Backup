@@ -14,7 +14,7 @@ import datetime
 import json
 import sys
 from pathlib import Path
-from typing import Literal, TextIO
+from typing import TextIO
 
 import click
 
@@ -65,7 +65,7 @@ from .manifest import (
     resolve_manifest_path,
 )
 from .pixiv_client import ApiError, AuthRejected, Pixivpy3Client
-from .progress_reporter import ProgressReporter, ReporterMode
+from .progress_reporter import ProgressReporter, ProgressUnit, ReporterMode
 
 #: Version stamped as the first key of the ``--json`` summary object, so a
 #: scripting consumer can detect the payload shape and adapt across releases.
@@ -743,7 +743,7 @@ def backup_following(
     # works; otherwise --max-users bounds the run in users; with neither the bar
     # is indeterminate (spinner + running counts).
     total: int | None
-    unit: Literal["works", "users"]
+    unit: ProgressUnit
     if limit is not None:
         total = limit
         unit = "works"

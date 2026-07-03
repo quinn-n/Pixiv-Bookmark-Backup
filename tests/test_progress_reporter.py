@@ -9,7 +9,6 @@ involved -- exactly what the injected-dependency design in
 from __future__ import annotations
 
 import io
-from typing import Literal
 
 import pytest
 from hypothesis import given
@@ -24,6 +23,7 @@ from pixiv_bookmark_backup.progress_reporter import (
     MILESTONE_INTERVAL,
     THROTTLE_INTERVAL,
     ProgressReporter,
+    ProgressUnit,
     ReporterMode,
     _pluralize,
 )
@@ -49,7 +49,7 @@ def make_reporter(
     *,
     show_planned: bool = False,
     total: int | None = None,
-    unit: Literal["works", "users"] = "works",
+    unit: ProgressUnit = "works",
     ascii_only: bool = True,
 ) -> ProgressReporter:
     return ProgressReporter(

@@ -23,6 +23,9 @@ from attrs import define, field
 
 from pixiv_bookmark_backup.core import ProgressEvent, ProgressKind
 
+#: What the determinate progress ``total`` counts: ``"works"`` or ``"users"``.
+ProgressUnit = Literal["works", "users"]
+
 #: Spinner frames used when the stream cannot render Unicode.
 ASCII_FRAMES: tuple[str, ...] = ("-", "\\", "|", "/")
 
@@ -106,7 +109,7 @@ class ProgressReporter:
     total: int | None
     """Determinate denominator (e.g. ``--limit``), or ``None`` if unknown."""
 
-    unit: Literal["works", "users"]
+    unit: ProgressUnit
     """What ``total`` counts: ``"works"`` or ``"users"``."""
 
     ascii_only: bool

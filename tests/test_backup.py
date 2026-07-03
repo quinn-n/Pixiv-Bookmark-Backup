@@ -794,6 +794,42 @@ def test_corrupt_manifest_backs_up_and_regenerates(
     assert {work["id"] for work in manifest["works"]} == {100}
 
 
+def test_load_existing_manifest_unreadable_file_flags_mismatch(
+    tmp_path: Path,
+) -> None:
+    # An OSError while reading (here IsADirectoryError, a subclass) is caught by
+    # the wrapper and reported as a mismatch with a fresh empty manifest, so the
+    # caller backs the bad path up and regenerates rather than crashing.
+    unreadable = tmp_path / "details.json"
+    unreadable.mkdir()
+
+    manifest, mismatch = backup._load_existing_manifest(unreadable)
+
+    assert mismatch is True
+    assert manifest.works == []
+    assert manifest.errors == []
+
+
+def test_deeply_nested_manifest_backs_up_and_regenerates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A deeply-nested details.json makes CPython's JSON decoder raise
+    # RecursionError. Resume must move it aside to .bak and regenerate a fresh
+    # manifest, matching the corrupt-JSON case, instead of crashing.
+    _patch_downloads(monkeypatch)
+    details = tmp_path / "details.json"
+    details.write_text("[" * 100_000 + "]" * 100_000, encoding="utf-8")
+    works = {"public": [_make_work(100, pages=1)]}
+    client = FakePixivClient(works)
+
+    _run(_config(tmp_path), client)
+
+    assert (tmp_path / "details.json.bak").exists()
+    manifest = _read_manifest(tmp_path)
+    assert manifest["schema_version"] == 1
+    assert {work["id"] for work in manifest["works"]} == {100}
+
+
 # -- SIGINT / KeyboardInterrupt -----------------------------------------
 
 

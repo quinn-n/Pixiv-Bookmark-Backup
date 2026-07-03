@@ -936,6 +936,26 @@ def test_corrupt_manifest_is_backed_up_and_regenerated(
     assert {work["id"] for work in manifest["works"]} == {1}
 
 
+def test_deeply_nested_manifest_is_backed_up_and_regenerated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_downloads(monkeypatch)
+    # A deeply-nested details.json makes CPython's JSON decoder raise
+    # RecursionError; the following resume path shares _load_existing_manifest,
+    # so it too must move the file aside to .bak and regenerate, not crash.
+    (tmp_path / "details.json").write_text(
+        "[" * 100_000 + "]" * 100_000, encoding="utf-8"
+    )
+    client = FakeFollowingClient(
+        {"public": [_make_user(10)]}, {"10": [_make_work(1, author_id=10)]}
+    )
+    _run(_config(tmp_path), client)
+    assert (tmp_path / "details.json.bak").exists()
+    manifest = _read_manifest(tmp_path)
+    assert manifest["schema_version"] == 1
+    assert {work["id"] for work in manifest["works"]} == {1}
+
+
 def test_image_failure_marks_work_failed_partial(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

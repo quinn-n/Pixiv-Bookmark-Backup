@@ -506,6 +506,54 @@ def test_load_or_init_flags_schema_mismatch(tmp_path: Path) -> None:
     assert manifest.works == []
 
 
+def test_load_or_init_corrupt_json_flags_mismatch(tmp_path: Path) -> None:
+    # A truncated/malformed details.json must degrade like a schema mismatch
+    # (empty manifest + mismatch True) rather than propagating a JSONDecodeError.
+    path = tmp_path / "details.json"
+    path.write_text("{ bad", encoding="utf-8")
+
+    manifest, mismatch = load_or_init(path)
+
+    assert mismatch is True
+    assert manifest.schema_version == SCHEMA_VERSION
+    assert manifest.works == []
+    assert manifest.errors == []
+
+
+def test_load_or_init_deeply_nested_json_flags_mismatch(tmp_path: Path) -> None:
+    # CPython's JSON decoder recurses, so a deeply-nested document raises
+    # RecursionError. load_or_init must catch it and degrade like a mismatch
+    # instead of surfacing a raw traceback. json bails around depth 1000, so
+    # this construction is fast and deterministic.
+    path = tmp_path / "details.json"
+    path.write_text("[" * 100_000 + "]" * 100_000, encoding="utf-8")
+
+    manifest, mismatch = load_or_init(path)
+
+    assert mismatch is True
+    assert manifest.schema_version == SCHEMA_VERSION
+    assert manifest.works == []
+    assert manifest.errors == []
+
+
+@pytest.mark.parametrize("payload", ["[]", '"foo"', "null", "42"])
+def test_load_or_init_non_object_json_flags_mismatch(
+    tmp_path: Path, payload: str
+) -> None:
+    # Valid JSON whose top-level value is not an object has no schema_version to
+    # read; load_or_init must treat it as a mismatch rather than raising an
+    # AttributeError from calling .get on a list/str/int/None.
+    path = tmp_path / "details.json"
+    path.write_text(payload, encoding="utf-8")
+
+    manifest, mismatch = load_or_init(path)
+
+    assert mismatch is True
+    assert manifest.schema_version == SCHEMA_VERSION
+    assert manifest.works == []
+    assert manifest.errors == []
+
+
 # --------------------------------------------------------------------------- #
 # write_atomic
 # --------------------------------------------------------------------------- #

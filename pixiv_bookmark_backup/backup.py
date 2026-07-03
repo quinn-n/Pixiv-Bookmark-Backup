@@ -30,7 +30,6 @@ returned :class:`~pixiv_bookmark_backup.core.RunSummary`.
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import time
@@ -440,16 +439,20 @@ def _flush_manifest(
 def _load_existing_manifest(details_path: Path) -> tuple[Manifest, bool]:
     """Load ``details.json`` defensively, treating corruption as a mismatch.
 
-    Returns ``(existing, schema_mismatch)``. A corrupt file (unparseable JSON or
-    an OS read error) is reported as a mismatch with a fresh empty manifest, so
-    the caller backs the bad file up and regenerates rather than crashing.
+    Returns ``(existing, schema_mismatch)``. Parse faults (unparseable,
+    deeply-nested, or non-object JSON) are already reported as a mismatch by
+    :func:`~pixiv_bookmark_backup.manifest.load_or_init` itself, which returns a
+    fresh empty manifest with ``schema_mismatch`` ``True``. This wrapper adds
+    only the I/O case: an unreadable file (:class:`OSError`) is handled the same
+    way, so the caller backs the bad file up and regenerates rather than
+    crashing.
     """
 
     try:
         return load_or_init(details_path)
-    except (json.JSONDecodeError, OSError):
-        # A corrupt or unreadable file is handled like a schema mismatch: start
-        # fresh and let the caller move the bad file aside.
+    except OSError:
+        # An unreadable file (e.g. a permission error) is handled like a schema
+        # mismatch: start fresh and let the caller move the bad file aside.
         return new_manifest(None, "", "", [], []), True
 
 

@@ -82,8 +82,31 @@ asserting the subcommand dispatches rather than binding to `USER_ID`.
 
 ## Manifest loading
 
-### 5. Harden `load_or_init` against a corrupt or deeply-nested manifest
+### 5. Harden `load_or_init` against a corrupt or deeply-nested manifest — DONE
 *Source: security review of the `search` feature (out of scope there). Behavior change.*
+
+Implemented (policy **(b)**: move aside to `.bak` and regenerate). `load_or_init`
+in `manifest.py` now wraps `json.load` in `except (json.JSONDecodeError,
+RecursionError)` and adds an `isinstance(data, dict)` guard, returning
+`(_empty_manifest(), True)` — the exact shape it already returns for a real
+`schema_version` mismatch — for a corrupt/truncated, deeply-nested, or
+non-object `details.json`. So all three now degrade like a schema mismatch: the
+resume caller (`_flush_manifest` / `_flush_following_manifest`) moves the bad
+file to `details.json.bak` and regenerates, rather than crashing with a raw
+traceback. This centralizes the parse-fault policy in the loader that owns the
+schema-mismatch concept; `backup.py`'s `_load_existing_manifest` wrapper shrank
+to catching only `OSError` (an I/O concern, deliberately left unmoved so its
+current behavior is unchanged), and the now-unused `json` import was dropped
+from `backup.py`. Structurally-valid-but-wrong-shape documents (matching
+`schema_version` but missing required keys → `KeyError` from
+`Manifest.from_dict`) were left out of scope, as item #5 named only
+`RecursionError`/`JSONDecodeError`. Coverage: `tests/test_manifest.py` gained
+unit tests for the corrupt-JSON, deeply-nested (`RecursionError`), and
+non-object cases; `tests/test_backup.py` and `tests/test_backup_following.py`
+gained end-to-end deeply-nested tests asserting `.bak` is written and a fresh v1
+manifest is regenerated on resume. Kept here for history.
+
+Original report below.
 
 `load_or_init` in `manifest.py` (the resume-oriented loader used by `backup` /
 `backup-following`) calls `json.load(handle)` with no exception handling. Two

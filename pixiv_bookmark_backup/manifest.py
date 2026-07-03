@@ -376,13 +376,32 @@ def load_or_init(path: Path) -> tuple[Manifest, bool]:
     parsed manifest is returned; on a *mismatch* an empty manifest is returned
     (so the caller never tries to interpret a foreign layout) -- the caller is
     responsible for writing the ``.bak`` and regenerating.
+
+    A corrupt / truncated document (:class:`json.JSONDecodeError`), a
+    deeply-nested one (:class:`RecursionError` -- CPython's JSON decoder is
+    recursive), or well-formed JSON whose top-level value is not an object
+    (e.g. a JSON array) is treated exactly like a schema mismatch: an empty
+    manifest with ``schema_mismatch`` ``True`` is returned instead of
+    propagating a raw traceback, so the resume caller moves the bad file aside
+    to ``.bak`` and regenerates. An :class:`OSError` while reading is left to
+    propagate (an I/O concern, not a parse fault, handled by the caller).
     """
 
     if not path.exists():
         return _empty_manifest(), False
 
     with path.open("r", encoding="utf-8") as handle:
-        data = json.load(handle)
+        try:
+            data = json.load(handle)
+        except (json.JSONDecodeError, RecursionError):
+            # Corrupt/truncated or deeply-nested JSON: degrade like a schema
+            # mismatch so the caller backs the file up and regenerates.
+            return _empty_manifest(), True
+
+    if not isinstance(data, dict):
+        # Valid JSON that is not an object (array/string/number/null) has no
+        # schema_version to read; treat it as a mismatch too.
+        return _empty_manifest(), True
 
     schema_mismatch = data.get("schema_version") != SCHEMA_VERSION
     if schema_mismatch:

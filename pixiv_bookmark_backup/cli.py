@@ -37,6 +37,7 @@ from .core import (
     NSFW_MODES,
     SEARCH_FIELDS,
     SORT_KEYS,
+    UGOIRA_MODES,
     VISIBILITIES,
     BackupConfig,
     ExitCode,
@@ -85,7 +86,7 @@ JSON_LOGIN_SCHEMA = 1
 #: scripting consumer can detect the payload shape and adapt across releases.
 #: Separate from the backup schemas because ``search`` reports matches and the
 #: echoed query rather than a download run.
-JSON_SEARCH_SCHEMA = 1
+JSON_SEARCH_SCHEMA = 2
 
 
 def _build_login() -> LoginFlow:
@@ -1251,6 +1252,16 @@ def _emit_login_result(
     help="NSFW handling: include (default), exclude (SFW only), or only.",
 )
 @click.option(
+    "--ugoira",
+    type=click.Choice(UGOIRA_MODES),
+    default="include",
+    show_default=True,
+    help=(
+        "Ugoira (animated) handling: include (default, all types), "
+        "exclude (drop ugoira), or only."
+    ),
+)
+@click.option(
     "--sort",
     type=click.Choice(SORT_KEYS),
     default="posted",
@@ -1338,6 +1349,7 @@ def search(
     blacklist_tag: tuple[str, ...],
     blacklist_author: tuple[str, ...],
     nsfw: str,
+    ugoira: str,
     sort: str,
     limit: int | None,
     symlink_dir: Path | None,
@@ -1356,9 +1368,9 @@ def search(
     KEYWORD against the work's tag surfaces (work tags, bookmark tags, and the
     translated tag names). With multiple keywords, any match keeps a work (OR);
     pass --match-all to require every keyword (AND). Narrow results with --field
-    (which surfaces to match on), filter by --author or --nsfw, and drop works
-    with --blacklist-tag / --blacklist-author. With no KEYWORD it lists every
-    work that passes the filters (browse mode).
+    (which surfaces to match on), filter by --author, --nsfw, or --ugoira, and
+    drop works with --blacklist-tag / --blacklist-author. With no KEYWORD it
+    lists every work that passes the filters (browse mode).
 
     Point at a backup with -i: an existing directory is treated as a backup root
     (its details.json is loaded), otherwise the path is used as the manifest file
@@ -1404,6 +1416,10 @@ def search(
       # Browse only NSFW works ordered by id, and just count the JSON hits
       pixiv-bookmark-backup search --nsfw only --sort id --count
       pixiv-bookmark-backup search touhou --json
+
+    \b
+      # Browse only ugoira (animated) works, newest first
+      pixiv-bookmark-backup search --ugoira only
     """
 
     if quiet and verbose:
@@ -1445,6 +1461,7 @@ def search(
         blacklist_tags=blacklist_tag,
         blacklist_authors=blacklist_author,
         nsfw=nsfw,
+        ugoira=ugoira,
         sort=sort,
         limit=limit,
         count=count,
@@ -1564,9 +1581,10 @@ def _emit_search_result(
     per-category link tallies is added to the payload; its ``"linked"`` entries
     are link-dir-relative POSIX names (nested ``subdir/basename`` under the
     ``"by-author"`` layout, bare basenames otherwise). It is absent entirely
-    otherwise, so ``JSON_SEARCH_SCHEMA`` stays ``1`` (the default output is
-    byte-identical to before this feature; the sub-object appears only with
-    ``--symlink-dir``).
+    otherwise; the ``symlink`` sub-object appears only under ``--symlink-dir``.
+
+    The ``query`` object always carries the echoed ``ugoira`` mode, so
+    ``JSON_SEARCH_SCHEMA`` is ``2``.
     """
 
     payload = {
@@ -1581,6 +1599,7 @@ def _emit_search_result(
             "blacklist_tags": list(config.blacklist_tags),
             "blacklist_authors": list(config.blacklist_authors),
             "nsfw": config.nsfw,
+            "ugoira": config.ugoira,
             "sort": config.sort,
             "limit": config.limit,
         },

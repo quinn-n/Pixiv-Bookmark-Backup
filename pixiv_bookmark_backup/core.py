@@ -28,6 +28,9 @@ SEARCH_FIELDS = ("work", "bookmark", "translated")
 #: NSFW filter modes for ``search``: keep all, drop NSFW, or keep only NSFW.
 NSFW_MODES = ("include", "exclude", "only")
 
+#: Ugoira filter modes for ``search``: keep all, drop ugoira, or keep only ugoira.
+UGOIRA_MODES = ("include", "exclude", "only")
+
 #: Sort keys for ``search`` results.
 SORT_KEYS = ("posted", "id", "title")
 
@@ -341,7 +344,7 @@ class SearchConfig:
     to pass around. ``input_path`` is coerced to a :class:`~pathlib.Path` so
     callers may pass a plain string. The command is read-only and offline. This
     is the single config the CLI builds and threads through the run: the query
-    fields (keywords, filters, blacklists, nsfw, sort, limit) drive the pure
+    fields (keywords, filters, blacklists, nsfw, ugoira, sort, limit) drive the pure
     search functions, while ``count``/``json_output``/``verbosity``/``quiet``
     are presentation state the CLI reads when emitting results. The CLI layer is
     responsible for loading the manifest and normalizing options before
@@ -361,6 +364,7 @@ class SearchConfig:
     blacklist_tags: tuple[str, ...] = field(factory=tuple)
     blacklist_authors: tuple[str, ...] = field(factory=tuple)
     nsfw: str = field(default="include", validator=in_(NSFW_MODES))
+    ugoira: str = field(default="include", validator=in_(UGOIRA_MODES))
     sort: str = field(default="posted", validator=in_(SORT_KEYS))
     limit: int | None = field(
         default=None, validator=optional([instance_of(int), ge(1)])
@@ -532,6 +536,21 @@ def nsfw_ok(work: WorkEntry, config: SearchConfig) -> bool:
     return True
 
 
+def ugoira_ok(work: WorkEntry, config: SearchConfig) -> bool:
+    """Return whether ``work`` passes the ``--ugoira`` tri-state filter.
+
+    ``include`` keeps everything, ``exclude`` drops ugoira (animated) works, and
+    ``only`` keeps *only* ugoira works. A work is ugoira when its
+    ``work.type`` is ``"ugoira"``.
+    """
+
+    if config.ugoira == "exclude":
+        return work.type != "ugoira"
+    if config.ugoira == "only":
+        return work.type == "ugoira"
+    return True
+
+
 def _posted_sort_key(work: WorkEntry) -> float:
     """Return a POSIX-timestamp sort key for ``work``'s posted time.
 
@@ -571,9 +590,9 @@ def run_search(
 
     A work survives when it satisfies *all* of: the keyword predicate
     (:func:`is_keyword_match`), the author allow-filter (:func:`author_ok`), not
-    being blacklisted (:func:`blacklisted`), and the NSFW filter
-    (:func:`nsfw_ok`). Survivors are sorted by ``config.sort`` and paired with
-    their :func:`matched_fields`.
+    being blacklisted (:func:`blacklisted`), the NSFW filter
+    (:func:`nsfw_ok`), and the ugoira filter (:func:`ugoira_ok`). Survivors are
+    sorted by ``config.sort`` and paired with their :func:`matched_fields`.
 
     Returns ``(matches, works_scanned)`` where ``works_scanned`` is the total
     number of input works. ``--limit`` is deliberately *not* applied here: the
@@ -588,6 +607,7 @@ def run_search(
         and author_ok(work, config)
         and not blacklisted(work, config)
         and nsfw_ok(work, config)
+        and ugoira_ok(work, config)
     ]
     ordered = sort_works(survivors, config.sort)
     matches = [

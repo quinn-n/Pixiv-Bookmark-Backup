@@ -148,7 +148,15 @@ def test_help_lists_command_offline_and_exit_codes(runner: CliRunner) -> None:
     assert "offline" in out
     assert "Exit codes:" in out
     assert "0 success" in out
-    for flag in ("--field", "--exact", "--match-all", "--nsfw", "--count", "--json"):
+    for flag in (
+        "--field",
+        "--exact",
+        "--match-all",
+        "--nsfw",
+        "--ugoira",
+        "--count",
+        "--json",
+    ):
         assert flag in out
 
 
@@ -265,13 +273,14 @@ def test_json_is_clean_single_object(runner: CliRunner, tmp_path: Path) -> None:
     assert "Matched 2 / 3 works" in result.stderr
     payload = json.loads(result.stdout)  # exactly one JSON object
 
-    assert payload["schema"] == 1
+    assert payload["schema"] == 2
     assert payload["input"] == str(backup / MANIFEST_NAME)
     assert payload["query"]["keywords"] == ["touhou"]
     assert payload["query"]["fields"] == ["work"]
     assert payload["query"]["exact"] is True
     assert payload["query"]["match_all"] is False
     assert payload["query"]["nsfw"] == "include"
+    assert payload["query"]["ugoira"] == "include"
     assert payload["query"]["sort"] == "posted"
     assert payload["works_scanned"] == 3
     assert payload["match_count"] == 2
@@ -332,6 +341,90 @@ def test_nsfw_exclude(runner: CliRunner, tmp_path: Path) -> None:
     result = runner.invoke(cli, ["search", "-i", str(backup), "--nsfw", "exclude"])
     assert result.exit_code == 0, result.output
     assert sorted(_ids_in(result.stdout)) == [101, 303]
+
+
+def _ugoira_manifest_dict() -> dict[str, Any]:
+    """A manifest mixing one ugoira work (id 505) with two illust works.
+
+    Kept separate from :func:`_manifest_dict` so tests that depend on the shared
+    id set ``[101, 202, 303]`` are unaffected.
+    """
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": "2023-01-02T03:04:05+09:00",
+        "source": {"user_id": "42", "visibility": "public"},
+        "works": [
+            _work(
+                404,
+                title="Still Waters",
+                author_id=1,
+                author_name="Alice",
+                author_account="alice_art",
+                posted_at="2024-01-01T00:00:00+09:00",
+                is_nsfw=False,
+                work_tags=[{"name": "scenery", "translated_name": "landscape"}],
+                bookmark_tags=None,
+                work_type="illust",
+            ),
+            _work(
+                505,
+                title="Waving Flag",
+                author_id=1,
+                author_name="Alice",
+                author_account="alice_art",
+                posted_at="2024-02-01T00:00:00+09:00",
+                is_nsfw=False,
+                work_tags=[{"name": "scenery", "translated_name": "landscape"}],
+                bookmark_tags=None,
+                work_type="ugoira",
+            ),
+            _work(
+                606,
+                title="Quiet Hill",
+                author_id=2,
+                author_name="Bob",
+                author_account="bob_draws",
+                posted_at="2024-03-01T00:00:00+09:00",
+                is_nsfw=False,
+                work_tags=[{"name": "scenery", "translated_name": "landscape"}],
+                bookmark_tags=None,
+                work_type="illust",
+            ),
+        ],
+        "errors": [],
+    }
+
+
+def test_ugoira_only_narrows_results(runner: CliRunner, tmp_path: Path) -> None:
+    backup = _write_manifest(tmp_path / "backup", _ugoira_manifest_dict())
+    result = runner.invoke(cli, ["search", "-i", str(backup), "--ugoira", "only"])
+    assert result.exit_code == 0, result.output
+    assert _ids_in(result.stdout) == [505]
+
+
+def test_ugoira_exclude_drops_ugoira(runner: CliRunner, tmp_path: Path) -> None:
+    backup = _write_manifest(tmp_path / "backup", _ugoira_manifest_dict())
+    result = runner.invoke(cli, ["search", "-i", str(backup), "--ugoira", "exclude"])
+    assert result.exit_code == 0, result.output
+    assert sorted(_ids_in(result.stdout)) == [404, 606]
+
+
+def test_ugoira_invalid_choice_exits_2(runner: CliRunner, tmp_path: Path) -> None:
+    backup = _write_manifest(tmp_path / "backup", _ugoira_manifest_dict())
+    result = runner.invoke(cli, ["search", "-i", str(backup), "--ugoira", "bogus"])
+    assert result.exit_code == 2
+    assert "Invalid value" in result.output
+
+
+def test_json_ugoira_filter_echoed(runner: CliRunner, tmp_path: Path) -> None:
+    backup = _write_manifest(tmp_path / "backup", _ugoira_manifest_dict())
+    result = runner.invoke(
+        cli, ["search", "-i", str(backup), "--ugoira", "only", "--json"]
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["query"]["ugoira"] == "only"
 
 
 def test_exact_narrows_to_whole_tag(runner: CliRunner, tmp_path: Path) -> None:
@@ -1254,7 +1347,9 @@ def test_layout_by_author_json_reports_nested_names(
     )
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
-    assert payload["schema"] == 1  # unchanged by the layout addition
+    # Base schema is 2 (from the ugoira query key); the layout/symlink
+    # sub-object is still gated on --symlink-dir and does not bump the schema.
+    assert payload["schema"] == 2
     sym = payload["symlink"]
     assert sym["layout"] == "by-author"
     # linked entries are link-dir-relative and NESTED under the author subdir.

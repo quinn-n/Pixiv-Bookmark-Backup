@@ -100,6 +100,7 @@ pixiv-bookmark-backup backup-following -o ./out --only 123 --only 456
 pixiv-bookmark-backup search touhou original
 pixiv-bookmark-backup search touhou --symlink-dir ./review --layout by-author
 pixiv-bookmark-backup search --nsfw only --sort id --count
+pixiv-bookmark-backup search --ugoira only --sort id
 ```
 
 `search` never touches the network or requires a token — it only reads the

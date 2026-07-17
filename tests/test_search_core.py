@@ -11,6 +11,7 @@ from pixiv_bookmark_backup.core import (
     NSFW_MODES,
     SEARCH_FIELDS,
     SORT_KEYS,
+    UGOIRA_MODES,
     SearchConfig,
     SearchMatch,
     author_ok,
@@ -22,6 +23,7 @@ from pixiv_bookmark_backup.core import (
     nsfw_ok,
     run_search,
     sort_works,
+    ugoira_ok,
 )
 from pixiv_bookmark_backup.manifest import WorkEntry
 
@@ -73,6 +75,7 @@ def test_search_config_defaults(tmp_path: Path) -> None:
     assert config.exact is False
     assert config.match_all is False
     assert config.nsfw == "include"
+    assert config.ugoira == "include"
     assert config.sort == "posted"
     assert config.limit is None
     assert config.count is False
@@ -86,6 +89,11 @@ def test_search_config_input_path_is_coerced() -> None:
 def test_search_config_rejects_bad_nsfw(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         SearchConfig(input_path=tmp_path, nsfw="maybe")
+
+
+def test_search_config_rejects_bad_ugoira(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        SearchConfig(input_path=tmp_path, ugoira="maybe")
 
 
 def test_search_config_rejects_bad_sort(tmp_path: Path) -> None:
@@ -120,6 +128,7 @@ def test_search_config_allows_limit_none(tmp_path: Path) -> None:
 def test_module_constants_are_stable() -> None:
     assert SEARCH_FIELDS == ("work", "bookmark", "translated")
     assert NSFW_MODES == ("include", "exclude", "only")
+    assert UGOIRA_MODES == ("include", "exclude", "only")
     assert SORT_KEYS == ("posted", "id", "title")
 
 
@@ -346,6 +355,29 @@ def test_nsfw_tristate(
 
 
 # --------------------------------------------------------------------------- #
+# Ugoira tri-state
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("work_type", "mode", "expected"),
+    [
+        ("ugoira", "include", True),
+        ("illust", "include", True),
+        ("ugoira", "exclude", False),
+        ("illust", "exclude", True),
+        ("ugoira", "only", True),
+        ("illust", "only", False),
+    ],
+)
+def test_ugoira_tristate(
+    tmp_path: Path, work_type: str, mode: str, expected: bool
+) -> None:
+    work = _work(type_=work_type)
+    assert ugoira_ok(work, _config(tmp_path, ugoira=mode)) is expected
+
+
+# --------------------------------------------------------------------------- #
 # Sorting
 # --------------------------------------------------------------------------- #
 
@@ -411,6 +443,23 @@ def test_run_search_filters_and_sorts(tmp_path: Path) -> None:
     # Newest first: keep_b before keep_a.
     assert [m.work.id for m in matches] == [20, 10]
     assert all(isinstance(m, SearchMatch) for m in matches)
+
+
+def test_run_search_applies_ugoira_filter(tmp_path: Path) -> None:
+    ugoira_a = _work(work_id=10, type_="ugoira", work_tags=[("cat", None)])
+    ugoira_b = _work(work_id=20, type_="ugoira", work_tags=[("cat", None)])
+    illust = _work(work_id=30, type_="illust", work_tags=[("cat", None)])
+    works = [ugoira_a, ugoira_b, illust]
+
+    only_matches, _ = run_search(
+        works, _config(tmp_path, keywords=("cat",), ugoira="only", sort="id")
+    )
+    assert [m.work.id for m in only_matches] == [10, 20]
+
+    exclude_matches, _ = run_search(
+        works, _config(tmp_path, keywords=("cat",), ugoira="exclude", sort="id")
+    )
+    assert [m.work.id for m in exclude_matches] == [30]
 
 
 def test_run_search_browse_mode_returns_all_sorted(tmp_path: Path) -> None:

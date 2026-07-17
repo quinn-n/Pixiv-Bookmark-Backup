@@ -67,6 +67,7 @@ default = { features = ["dev"], solve-group = "default" }
 login = { features = ["login", "dev"], solve-group = "default" }
 
 [tool.pixi.tasks]
+pixiv-bookmark-backup = "pixiv-bookmark-backup"
 fmt = "black ."
 fmt-check = "black --check --diff ."
 lint = "flake8"

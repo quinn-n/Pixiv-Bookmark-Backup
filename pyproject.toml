@@ -69,6 +69,10 @@ login = { features = ["login", "dev"], solve-group = "default" }
 
 [tool.pixi.tasks]
 pixiv-bookmark-backup = "pixiv-bookmark-backup"
+backup = "pixiv-bookmark-backup backup"
+backup-following = "pixiv-bookmark-backup backup-following"
+login = { cmd = "pixiv-bookmark-backup login", default-environment = "login" }
+search = "pixiv-bookmark-backup search"
 fmt = "black ."
 fmt-check = "black --check --diff ."
 lint = "flake8"

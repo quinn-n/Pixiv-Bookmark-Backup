@@ -38,18 +38,20 @@ Run the CLI through pixi so it uses the project environment:
 pixi run pixiv-bookmark-backup --help
 ```
 
-(Every example below assumes a `pixi run` prefix if you're working from a
-clone rather than an installed package.)
+Each subcommand also has its own `pixi run` shortcut — `pixi run backup`,
+`pixi run backup-following`, `pixi run login`, and `pixi run search` — which
+are used in the examples below.
 
 ## Authentication
 
 Backing up bookmarks requires a Pixiv **refresh token**. The `login` command
 drives the Pixiv OAuth flow for you, but its browser driver (`gppt` +
-Playwright) is optional and lives on its own pixi environment, so run it with
-`-e login`:
+Playwright) is optional and lives on its own pixi environment. The
+`pixi run login` task already targets that environment, so no `-e login` flag
+is needed:
 
 ```bash
-pixi run -e login pixiv-bookmark-backup login
+pixi run login
 ```
 
 This opens a browser, completes the OAuth flow, and saves the token to
@@ -59,7 +61,7 @@ headless/CI use:
 
 ```bash
 PIXIV_USERNAME=me@example.com PIXIV_PASSWORD=... \
-    pixi run -e login pixiv-bookmark-backup login --headless
+    pixi run login --headless
 ```
 
 Alternatively, supply a token directly to any command via `--refresh-token`,
@@ -72,35 +74,35 @@ file (`--config` / `PIXIV_BOOKMARK_BACKUP_CONFIG`).
 ### Back up your own bookmarks
 
 ```bash
-pixiv-bookmark-backup backup
+pixi run backup
 ```
 
 ```bash
 # Preview without writing anything
-pixiv-bookmark-backup backup --dry-run
+pixi run backup --dry-run
 
 # Everything (public + private), into ./out
-pixiv-bookmark-backup backup -o ./out --visibility all
+pixi run backup -o ./out --visibility all
 
 # Another user's public bookmarks, newest first, capped at 50
-pixiv-bookmark-backup backup 12345 --limit 50 --since 2025-01-01
+pixi run backup 12345 --limit 50 --since 2025-01-01
 ```
 
 ### Back up everyone you follow
 
 ```bash
-pixiv-bookmark-backup backup-following --dry-run
-pixiv-bookmark-backup backup-following --follow-visibility all --per-user-limit 20
-pixiv-bookmark-backup backup-following -o ./out --only 123 --only 456
+pixi run backup-following --dry-run
+pixi run backup-following --follow-visibility all --per-user-limit 20
+pixi run backup-following -o ./out --only 123 --only 456
 ```
 
 ### Search a local backup
 
 ```bash
-pixiv-bookmark-backup search touhou original
-pixiv-bookmark-backup search touhou --symlink-dir ./review --layout by-author
-pixiv-bookmark-backup search --nsfw only --sort id --count
-pixiv-bookmark-backup search --ugoira only --sort id
+pixi run search touhou original
+pixi run search touhou --symlink-dir ./review --layout by-author
+pixi run search --nsfw only --sort id --count
+pixi run search --ugoira only --sort id
 ```
 
 `search` never touches the network or requires a token — it only reads the

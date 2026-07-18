@@ -550,7 +550,7 @@ def test_iter_bookmarks_error_without_refresh_token_raises_apierror() -> None:
     assert api.auth_calls == []
 
 
-# -- suspicious-truncation diagnostics ----------------------------------
+# -- unparsable-next_url diagnostics ------------------------------------
 
 
 class _JsonDict(dict):  # type: ignore[type-arg]
@@ -593,44 +593,38 @@ def _full_page(start: int) -> list[SimpleNamespace]:
     ]
 
 
-def test_iter_bookmarks_warns_on_full_page_then_null_next_url() -> None:
-    # The current field bug: a full 30-item page is followed by an
-    # empty, non-error-shaped page with next_url None. The run must not raise
-    # and must yield everything it can, but it should warn that the stop looks
-    # incomplete instead of reporting a false clean success.
+def test_iter_bookmarks_no_warn_on_full_page_then_empty_null_next_url() -> None:
+    # Regression for the false-positive field report: an account whose total is
+    # an exact multiple of the 30-item page size terminates as N full pages
+    # followed by a genuinely empty page with next_url None -- Pixiv's standard
+    # "no more data" signal. A falsy next_url is always a normal end and must
+    # never warn, regardless of the previous page's item count.
     warnings: list[str] = []
     api = _DictResultApi(user_id=SELF_ID)
     api.pages = [
         (_full_page(1), "https://next?page=2"),
+        (_full_page(31), "https://next?page=3"),
+        (_full_page(61), "https://next?page=4"),
         ([], None),
     ]
     client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0, warn=warnings.append)
     works = list(client.iter_bookmarks(SELF_ID, "public"))
-    # Everything the API offered was still yielded; no exception.
-    assert [w.id for w in works] == list(range(1, 31))
-    assert len(warnings) == 1
-    msg = warnings[0]
-    assert "incomplete" in msg.lower() or "unexpected" in msg.lower()
-    # Diagnostic content: pages/items seen (present only in the count text, not
-    # the boilerplate) and the raw response's top-level keys. "illusts" appears
-    # ONLY in the top-level-keys dump -- never in the message boilerplate or the
-    # "Bookmark listing" context -- so this genuinely proves the keys branch
-    # fired with real content, which is the whole point of the diagnostic.
-    assert "across 2 page(s)" in msg
-    assert "top-level keys" in msg
-    assert "illusts" in msg
+    # Everything the API offered was yielded, no exception, and no false warning.
+    assert [w.id for w in works] == list(range(1, 91))
+    assert warnings == []
 
 
-def test_iter_bookmarks_warns_when_full_page_has_falsy_next_url_directly() -> None:
+def test_iter_bookmarks_no_warn_when_full_page_has_falsy_next_url_directly() -> None:
     # A single full page whose next_url is already None (no trailing empty page)
-    # is equally suspicious: a full page should normally be followed by more.
+    # is also a normal end: a falsy next_url is Pixiv's unambiguous end-of-data
+    # signal and must never be flagged, whatever the page's item count.
     warnings: list[str] = []
     api = _DictResultApi(user_id=SELF_ID)
     api.pages = [(_full_page(1), None)]
     client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0, warn=warnings.append)
     works = list(client.iter_bookmarks(SELF_ID, "public"))
     assert len(works) == 30
-    assert len(warnings) == 1
+    assert warnings == []
 
 
 def test_iter_bookmarks_no_warn_on_normal_short_final_page() -> None:
@@ -678,7 +672,8 @@ def test_iter_bookmarks_no_warn_on_successful_reauth_recovery() -> None:
 
 def test_iter_bookmarks_warns_when_parse_qs_returns_none_on_full_page() -> None:
     # A full page followed by a truthy next_url whose query string cannot be
-    # parsed also stops pagination -- and is suspicious for the same reason.
+    # parsed stops pagination early: Pixiv said there is more but we cannot get
+    # to it. That has no benign interpretation, so it warns.
     warnings: list[str] = []
 
     class UnparsableDictApi(_DictResultApi):
@@ -691,20 +686,40 @@ def test_iter_bookmarks_warns_when_parse_qs_returns_none_on_full_page() -> None:
     works = list(client.iter_bookmarks(SELF_ID, "public"))
     assert len(works) == 30
     assert len(warnings) == 1
+    assert "could not be parsed" in warnings[0]
 
 
-def test_warn_if_suspicious_reports_error_shape_when_present() -> None:
-    # In practice _fetch_page consumes/raises on any error key before pagination
-    # terminates, so this branch is future-proofing. Exercise it directly: a
-    # suspicious full-page stop whose raw result carries an error surfaces that
-    # error content in the diagnostic (not the top-level keys).
+def test_iter_bookmarks_warns_when_parse_qs_returns_none_on_short_page() -> None:
+    # The unparsable-next_url warning is not gated on page size: even a short
+    # final page whose truthy next_url cannot be parsed warns, because a genuine
+    # end-of-data response never carries a next_url at all.
+    warnings: list[str] = []
+
+    class UnparsableDictApi(_DictResultApi):
+        def parse_qs(self, next_url: str | None) -> dict[str, Any] | None:
+            return None
+
+    api = UnparsableDictApi(user_id=SELF_ID)
+    api.pages = [
+        ([_make_illust(1, single_url="https://x/1.png")], "https://next?page=2")
+    ]
+    client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0, warn=warnings.append)
+    works = list(client.iter_bookmarks(SELF_ID, "public"))
+    assert len(works) == 1
+    assert len(warnings) == 1
+    assert "could not be parsed" in warnings[0]
+
+
+def test_warn_unparsable_next_url_reports_error_shape_when_present() -> None:
+    # The response-shape sketch surfaces an ``error`` body when present (over the
+    # top-level keys). Exercise it directly: a result carrying an error surfaces
+    # that error content in the diagnostic.
     warnings: list[str] = []
     api = FakeApi(user_id=SELF_ID)
     client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0, warn=warnings.append)
     result = SimpleNamespace(error=SimpleNamespace(message="mystery"))
-    client._warn_if_suspicious(
+    client._warn_unparsable_next_url(
         result,
-        page_item_count=30,
         pages_so_far=5,
         items_so_far=150,
         context="Bookmark listing",
@@ -715,10 +730,15 @@ def test_warn_if_suspicious_reports_error_shape_when_present() -> None:
 
 
 def test_warn_defaults_to_noop_and_diagnostics_do_not_crash() -> None:
-    # The default no-op warn must not break the suspicious path (no wiring means
-    # no output, but also no exception).
-    api = _DictResultApi(user_id=SELF_ID)
-    api.pages = [(_full_page(1), None)]
+    # The default no-op warn must not break the diagnostic path (no wiring means
+    # no output, but also no exception). Exercise the one surviving trigger: a
+    # full page with a truthy but unparsable next_url.
+    class UnparsableDictApi(_DictResultApi):
+        def parse_qs(self, next_url: str | None) -> dict[str, Any] | None:
+            return None
+
+    api = UnparsableDictApi(user_id=SELF_ID)
+    api.pages = [(_full_page(1), "https://next?page=2")]
     client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0)
     assert len(list(client.iter_bookmarks(SELF_ID, "public"))) == 30
 
@@ -828,25 +848,29 @@ def test_iter_following_reauths_and_continues_on_expired_token() -> None:
     assert api.auth_calls == ["refresh-secret", "refresh-secret"]
 
 
-def test_iter_following_stops_when_parse_qs_returns_none() -> None:
+def test_iter_following_warns_when_parse_qs_returns_none() -> None:
     # A truthy next_url whose query string cannot be parsed ends pagination
-    # rather than looping forever.
+    # rather than looping forever -- and warns, because Pixiv said there was more
+    # data but it could not be reached. The diagnostic is wired here too.
+    warnings: list[str] = []
+
     class UnparsableApi(FakeApi):
         def parse_qs(self, next_url: str | None) -> dict[str, Any] | None:
             return None
 
     api = UnparsableApi(user_id=SELF_ID)
     api.following_pages = [([_make_user_preview(11)], "https://next?page=2")]
-    client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0)
+    client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0, warn=warnings.append)
     followed = list(client.iter_following(SELF_ID, "public"))
     assert [u.id for u in followed] == [11]
     assert len(api.following_calls) == 1
+    assert len(warnings) == 1
+    assert "Following listing" in warnings[0]
+    assert "could not be parsed" in warnings[0]
 
 
-def test_iter_following_warns_on_full_page_then_null_next_url() -> None:
-    # The suspicious-truncation diagnostic is wired into iter_following too. Here
-    # the fake returns SimpleNamespace pages (no .keys()), exercising the
-    # response-type fallback branch of the shape sketch.
+def test_iter_following_no_warn_on_full_page_then_null_next_url() -> None:
+    # A falsy next_url is a normal end even after a full page: no false warning.
     warnings: list[str] = []
     api = FakeApi(user_id=SELF_ID)
     api.following_pages = [
@@ -856,8 +880,7 @@ def test_iter_following_warns_on_full_page_then_null_next_url() -> None:
     client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0, warn=warnings.append)
     followed = list(client.iter_following(SELF_ID, "public"))
     assert len(followed) == 30
-    assert len(warnings) == 1
-    assert "Following listing" in warnings[0]
+    assert warnings == []
 
 
 def test_iter_following_does_not_warn_on_normal_short_page() -> None:
@@ -948,7 +971,11 @@ def test_iter_user_works_paginates_and_sleeps_between_pages() -> None:
     assert naps == [0.25]
 
 
-def test_iter_user_works_stops_when_parse_qs_returns_none() -> None:
+def test_iter_user_works_warns_when_parse_qs_returns_none() -> None:
+    # A truthy next_url whose query string cannot be parsed ends pagination and
+    # warns: Pixiv said there was more but it could not be reached.
+    warnings: list[str] = []
+
     class UnparsableApi(FakeApi):
         def parse_qs(self, next_url: str | None) -> dict[str, Any] | None:
             return None
@@ -957,14 +984,17 @@ def test_iter_user_works_stops_when_parse_qs_returns_none() -> None:
     api.works_pages = [
         ([_make_illust(1, single_url="https://x/1.png")], "https://next?page=2")
     ]
-    client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0)
+    client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0, warn=warnings.append)
     works = list(client.iter_user_works(OTHER_ID))
     assert [w.id for w in works] == [1]
     assert len(api.works_calls) == 1
+    assert len(warnings) == 1
+    assert f"Works listing for {OTHER_ID}" in warnings[0]
+    assert "could not be parsed" in warnings[0]
 
 
-def test_iter_user_works_warns_on_full_page_then_null_next_url() -> None:
-    # The suspicious-truncation diagnostic is wired into iter_user_works too.
+def test_iter_user_works_no_warn_on_full_page_then_null_next_url() -> None:
+    # A falsy next_url is a normal end even after a full page: no false warning.
     warnings: list[str] = []
     api = FakeApi(user_id=SELF_ID)
     api.works_pages = [
@@ -977,8 +1007,7 @@ def test_iter_user_works_warns_on_full_page_then_null_next_url() -> None:
     client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0, warn=warnings.append)
     works = list(client.iter_user_works(OTHER_ID))
     assert len(works) == 30
-    assert len(warnings) == 1
-    assert f"Works listing for {OTHER_ID}" in warnings[0]
+    assert warnings == []
 
 
 def test_iter_user_works_does_not_warn_on_normal_short_page() -> None:

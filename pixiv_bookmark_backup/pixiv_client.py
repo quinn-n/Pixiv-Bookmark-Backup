@@ -42,14 +42,6 @@ PIXIV_REFERER = "https://www.pixiv.net/"
 #: run forever.
 DEFAULT_TIMEOUT: tuple[float, float] = (10.0, 60.0)
 
-#: Pixiv's fixed listing page size. Every paginated endpoint we call
-#: (``user_bookmarks_illust``/``user_following``/``user_illusts``) returns at
-#: most this many items per page, so a page holding *exactly* this many items is
-#: a full page: pagination should continue past it. If a full page is instead
-#: the *last* page (``next_url`` falsy, or unparsable), the listing stopped
-#: mid-stream -- the silent-truncation signature we surface via ``warn``.
-PIXIV_PAGE_SIZE = 30
-
 #: Number of retries (after the initial attempt) for a mid-pagination listing
 #: recovery in ``_fetch_page`` -- i.e. up to ``1 + this`` total tries. Mirrors
 #: ``downloader.download_image``'s default so both retry policies share a shape.
@@ -197,11 +189,11 @@ class Pixivpy3Client:
         # deterministically; mirrors downloader.download_image's rand collaborator.
         self._rand = rand
         # Injectable diagnostic sink. Called (with a one-line, secret-free
-        # message) when pagination stops in a way that *looks* like a silent
-        # truncation rather than a genuine end-of-data (see
-        # _warn_if_suspicious). Defaults to a no-op so callers that do not wire
-        # it up (tests, library users) see no behaviour change; the CLI points
-        # it at its stderr warning closure.
+        # message) when pagination stops with a truthy but unparsable next_url --
+        # Pixiv said there is more data but we cannot reach it (see
+        # _warn_unparsable_next_url). Defaults to a no-op so callers that do not
+        # wire it up (tests, library users) see no behaviour change; the CLI
+        # points it at its stderr warning closure.
         self._warn = warn
         # Cached during authenticate() so a mid-pagination token expiry can be
         # recovered by re-authing with the same token. None until the first
@@ -317,50 +309,33 @@ class Pixivpy3Client:
             f"(last failure: {last_failure})."
         )
 
-    def _warn_if_suspicious(
+    def _warn_unparsable_next_url(
         self,
         result: Any,
         *,
-        page_item_count: int,
         pages_so_far: int,
         items_so_far: int,
         context: str,
     ) -> None:
-        """Emit a diagnostic ``warn`` when pagination stops mid-stream.
+        """Emit a diagnostic ``warn`` when a non-empty ``next_url`` is unusable.
 
-        Called at each pagination termination point (``next_url`` falsy, or its
-        query string unparsable). Two stops look like a silent truncation:
-
-        * a *full* final page (exactly :data:`PIXIV_PAGE_SIZE` items) that is
-          nonetheless the last -- a full page should have been followed by more;
-        * an *empty* final page reached by following a ``next_url`` (i.e. not the
-          very first page) -- Pixiv handed us a "there is more" pointer that then
-          resolved to nothing. This is the exact field signature: a full page
-          followed by an empty, non-error-shaped page with ``next_url`` null.
-
-        Every other stop is a genuine end-of-data and stays silent to avoid
-        spamming a warning on ordinary runs: a partial final page (fewer than a
-        full page of items) means the list simply ran out, and an empty *first*
-        page is just a zero-item account.
+        Called at the single pagination termination point that has no benign
+        interpretation: Pixiv's response carried a *truthy* ``next_url`` -- an
+        explicit "there is more data" pointer -- but :meth:`parse_qs` could not
+        extract usable query parameters from it, so pagination cannot continue
+        even though the API says it should. A genuine end-of-data response never
+        carries a ``next_url`` at all (a falsy ``next_url`` is Pixiv's normal
+        "no more data" signal and is handled silently by the callers), so this
+        combination always warrants a warning; it is not gated on page size or
+        emptiness.
 
         The message is one line, human-readable, and never contains the
         refresh/access token. It carries how much was yielded so far plus a
         shape sketch of the raw response -- its ``error`` content if present, or
-        else its top-level keys -- so a real run tells us whether the empty stop
-        was an unrecognised error body or a bizarrely-empty-but-normal-shaped
-        one. In practice ``_fetch_page`` has already consumed/raised on any
-        ``error`` key by this point, so the keys branch is the one that fires;
-        the error branch is kept for future-proofing. Building the sketch must
+        else its top-level keys -- to aid diagnosis. Building the sketch must
         never crash the run, so key extraction is defensively guarded (Pixiv
         results subclass ``dict`` and expose ``keys()``; test doubles may not).
         """
-
-        is_first_page = pages_so_far <= 1
-        suspicious = page_item_count >= PIXIV_PAGE_SIZE or (
-            page_item_count == 0 and not is_first_page
-        )
-        if not suspicious:
-            return  # Genuine end-of-data: partial final page or empty account.
 
         error = getattr(result, "error", None)
         if error is not None:
@@ -374,11 +349,10 @@ class Pixivpy3Client:
             shape = f"response type={type(result).__name__}"
 
         self._warn(
-            f"{context} stopped unexpectedly: the last page had {page_item_count} "
-            f"item(s) and no further page, after yielding {items_so_far} item(s) "
-            f"across {pages_so_far} page(s). This looks incomplete (a full page "
-            f"of {PIXIV_PAGE_SIZE} should be followed by more, and a followed "
-            f"next_url should not resolve to nothing); {shape}."
+            f"{context} stopped early: Pixiv returned a next_url pointing to more "
+            f"data, but its query string could not be parsed, so pagination cannot "
+            f"continue -- after yielding {items_so_far} item(s) across "
+            f"{pages_so_far} page(s); {shape}."
         )
 
     def iter_bookmarks(self, user_id: str, restrict: str) -> Iterator[BookmarkWork]:
@@ -408,19 +382,11 @@ class Pixivpy3Client:
                 items_so_far += page_item_count
                 next_url = result.next_url
                 if not next_url:
-                    self._warn_if_suspicious(
-                        result,
-                        page_item_count=page_item_count,
-                        pages_so_far=pages_so_far,
-                        items_so_far=items_so_far,
-                        context="Bookmark listing",
-                    )
                     return
                 qs = self._api.parse_qs(next_url)
                 if not qs:
-                    self._warn_if_suspicious(
+                    self._warn_unparsable_next_url(
                         result,
-                        page_item_count=page_item_count,
                         pages_so_far=pages_so_far,
                         items_so_far=items_so_far,
                         context="Bookmark listing",
@@ -463,19 +429,11 @@ class Pixivpy3Client:
                 items_so_far += page_item_count
                 next_url = result.next_url
                 if not next_url:
-                    self._warn_if_suspicious(
-                        result,
-                        page_item_count=page_item_count,
-                        pages_so_far=pages_so_far,
-                        items_so_far=items_so_far,
-                        context="Following listing",
-                    )
                     return
                 qs = self._api.parse_qs(next_url)
                 if not qs:
-                    self._warn_if_suspicious(
+                    self._warn_unparsable_next_url(
                         result,
-                        page_item_count=page_item_count,
                         pages_so_far=pages_so_far,
                         items_so_far=items_so_far,
                         context="Following listing",
@@ -512,19 +470,11 @@ class Pixivpy3Client:
                 items_so_far += page_item_count
                 next_url = result.next_url
                 if not next_url:
-                    self._warn_if_suspicious(
-                        result,
-                        page_item_count=page_item_count,
-                        pages_so_far=pages_so_far,
-                        items_so_far=items_so_far,
-                        context=f"Works listing for {user_id}",
-                    )
                     return
                 qs = self._api.parse_qs(next_url)
                 if not qs:
-                    self._warn_if_suspicious(
+                    self._warn_unparsable_next_url(
                         result,
-                        page_item_count=page_item_count,
                         pages_so_far=pages_so_far,
                         items_so_far=items_so_far,
                         context=f"Works listing for {user_id}",

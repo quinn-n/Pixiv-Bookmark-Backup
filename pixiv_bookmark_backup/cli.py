@@ -483,9 +483,9 @@ def backup(
         reporter.finish()
         click.echo(f"Warning: {msg}", err=True)
 
-    # Constructed after _warn so the client can surface suspicious-truncation
-    # diagnostics (a full page that is nonetheless the last) through the same
-    # stderr warning path used elsewhere in this command.
+    # Constructed after _warn so the client can surface an unparsable-next_url
+    # diagnostic (Pixiv said there's more data but we can't reach it) through
+    # the same stderr warning path used elsewhere in this command.
     client = Pixivpy3Client(warn=_warn)
 
     try:
@@ -840,9 +840,9 @@ def backup_following(
         reporter.finish()
         click.echo(f"Warning: {msg}", err=True)
 
-    # Constructed after _warn so the client can surface suspicious-truncation
-    # diagnostics (a full page that is nonetheless the last) through the same
-    # stderr warning path used elsewhere in this command.
+    # Constructed after _warn so the client can surface an unparsable-next_url
+    # diagnostic (Pixiv said there's more data but we can't reach it) through
+    # the same stderr warning path used elsewhere in this command.
     client = Pixivpy3Client(warn=_warn)
 
     try:

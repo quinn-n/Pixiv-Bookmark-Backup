@@ -470,8 +470,6 @@ def backup(
         quiet=quiet, verbose=verbose, dry_run=dry_run, total=limit, unit="works"
     )
 
-    client = Pixivpy3Client()
-
     # Anchor the bar's elapsed-time baseline at the actual run start (rather than
     # at reporter construction). No-op in every mode but BAR, where it only
     # records the start timestamp.
@@ -484,6 +482,11 @@ def backup(
         # warning prints on its own clean line instead of after the spinner.
         reporter.finish()
         click.echo(f"Warning: {msg}", err=True)
+
+    # Constructed after _warn so the client can surface an unparsable-next_url
+    # diagnostic (Pixiv said there's more data but we can't reach it) through
+    # the same stderr warning path used elsewhere in this command.
+    client = Pixivpy3Client(warn=_warn)
 
     try:
         try:
@@ -823,8 +826,6 @@ def backup_following(
         quiet=quiet, verbose=verbose, dry_run=dry_run, total=total, unit=unit
     )
 
-    client = Pixivpy3Client()
-
     # Anchor the bar's elapsed-time baseline at the actual run start (rather than
     # at reporter construction). No-op in every mode but BAR, where it only
     # records the start timestamp.
@@ -838,6 +839,11 @@ def backup_following(
         # the spinner.
         reporter.finish()
         click.echo(f"Warning: {msg}", err=True)
+
+    # Constructed after _warn so the client can surface an unparsable-next_url
+    # diagnostic (Pixiv said there's more data but we can't reach it) through
+    # the same stderr warning path used elsewhere in this command.
+    client = Pixivpy3Client(warn=_warn)
 
     try:
         try:

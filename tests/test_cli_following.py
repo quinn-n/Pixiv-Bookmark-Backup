@@ -137,7 +137,9 @@ _: type[PixivClient] = FakeFollowingClient
 def _install_client(
     monkeypatch: pytest.MonkeyPatch, client: FakeFollowingClient
 ) -> None:
-    monkeypatch.setattr(cli_module, "Pixivpy3Client", lambda: client)
+    # The command constructs the real client with warn= (and possibly other
+    # kwargs); swallow any constructor arguments and return the fake regardless.
+    monkeypatch.setattr(cli_module, "Pixivpy3Client", lambda *args, **kwargs: client)
 
 
 def _summary(**overrides: Any) -> FollowingRunSummary:

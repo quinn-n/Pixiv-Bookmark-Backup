@@ -13,6 +13,7 @@ any exception message raised from here.
 
 from __future__ import annotations
 
+import random
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -40,6 +41,17 @@ PIXIV_REFERER = "https://www.pixiv.net/"
 #: ``AppPixivAPI`` bounds both connect and read so a hung server cannot block the
 #: run forever.
 DEFAULT_TIMEOUT: tuple[float, float] = (10.0, 60.0)
+
+#: Number of retries (after the initial attempt) for a mid-pagination listing
+#: recovery in ``_fetch_page`` -- i.e. up to ``1 + this`` total tries. Mirrors
+#: ``downloader.download_image``'s default so both retry policies share a shape.
+FETCH_PAGE_MAX_RETRIES = 3
+
+#: Base backoff unit (seconds) for ``_fetch_page``'s recovery retries. Heavier
+#: than the downloader's 0.5s: a mid-listing re-auth failure is rarer and
+#: usually means Pixiv's anti-bot layer has cut connections after sustained
+#: heavy traffic, which needs more time to recover than a single-image blip.
+FETCH_PAGE_BASE_DELAY = 1.0
 
 
 @frozen
@@ -146,10 +158,11 @@ class _AppApi(Protocol):
 class Pixivpy3Client:
     """:class:`PixivClient` backed by :class:`pixivpy3.AppPixivAPI`.
 
-    All Pixiv interaction funnels through this class. The underlying ``api`` and
-    the ``sleep`` function are injectable so tests can run fully offline and
-    deterministically. ``delay`` is the politeness pause (seconds) taken between
-    bookmark pages while paginating.
+    All Pixiv interaction funnels through this class. The underlying ``api``,
+    the ``sleep`` function, and the ``rand`` jitter source are injectable so
+    tests can run fully offline and deterministically. ``delay`` is the
+    politeness pause (seconds) taken between bookmark pages while paginating;
+    ``rand`` supplies jitter for ``_fetch_page``'s recovery backoff.
 
     When no ``api`` is injected, the default :class:`~pixivpy3.AppPixivAPI` is
     constructed with :data:`DEFAULT_TIMEOUT`, which ``pixivpy3`` forwards to
@@ -164,11 +177,28 @@ class Pixivpy3Client:
         *,
         sleep: Callable[[float], None] = time.sleep,
         delay: float = 0.5,
+        warn: Callable[[str], None] = lambda _msg: None,
+        rand: Callable[[], float] = random.random,
     ) -> None:
         raw: object = api if api is not None else AppPixivAPI(timeout=DEFAULT_TIMEOUT)
         self._api: _AppApi = cast(_AppApi, raw)
         self._sleep = sleep
         self._delay = delay
+        # Injectable [0.0, 1.0) jitter source for _fetch_page's recovery backoff.
+        # Injected (alongside sleep) so tests exercise the retry loop
+        # deterministically; mirrors downloader.download_image's rand collaborator.
+        self._rand = rand
+        # Injectable diagnostic sink. Called (with a one-line, secret-free
+        # message) when pagination stops with a truthy but unparsable next_url --
+        # Pixiv said there is more data but we cannot reach it (see
+        # _warn_unparsable_next_url). Defaults to a no-op so callers that do not
+        # wire it up (tests, library users) see no behaviour change; the CLI
+        # points it at its stderr warning closure.
+        self._warn = warn
+        # Cached during authenticate() so a mid-pagination token expiry can be
+        # recovered by re-authing with the same token. None until the first
+        # authenticate() call (or if the client is used without one).
+        self._refresh_token: str | None = None
 
     # -- public, fully typed surface ------------------------------------
 
@@ -187,7 +217,143 @@ class Pixivpy3Client:
                 "Pixiv rejected the refresh token (it may be expired or "
                 "revoked). Generate a fresh token and try again."
             ) from exc
+        # Cache for mid-pagination re-auth on token expiry (see _fetch_page).
+        self._refresh_token = refresh_token
         return str(self._api.user_id)
+
+    def _fetch_page(self, fetch: Callable[[], Any]) -> Any:
+        """Fetch one listing page, recovering from a mid-pagination failure.
+
+        Pixiv access tokens expire after ~1 hour, so a large backup run commonly
+        outlives its token. When that happens, ``pixivpy3`` does *not* raise:
+        ``parse_result`` never checks the HTTP status, and ``JsonDict``'s
+        attribute access returns ``None`` for any missing key -- so an error body
+        (``{"error": {...}}``) is indistinguishable from a genuinely exhausted
+        list (``illusts``/``next_url`` both ``None``), silently truncating the
+        run. This helper closes that gap: it inspects the response for an
+        ``error`` key *before* the caller reads ``illusts``/``next_url``, and on
+        an error re-authenticates with the cached refresh token and retries the
+        *same* page (never skipping a page).
+
+        Recovery is retried with **exponential backoff plus jitter**, mirroring
+        :func:`~pixiv_bookmark_backup.downloader.download_image`. Two failure
+        modes are both retried within the same budget:
+
+        * The page fetch returns an ``error``-shaped response (token expiry, or a
+          transient server-side error). Rather than classify Pixiv's opaque error
+          bodies (fragile, and we have no stable sample), *any* error page is a
+          re-auth-and-retry.
+        * The re-auth call itself raises :class:`~pixivpy3.PixivError` -- e.g. the
+          field-observed connection reset when Pixiv's anti-bot layer cuts
+          connections after sustained heavy traffic. A single re-auth attempt is
+          not enough to ride out such a transient reset, so it is backed off and
+          retried too.
+
+        Up to :data:`FETCH_PAGE_MAX_RETRIES` recoveries are attempted after the
+        initial fetch (so ``FETCH_PAGE_MAX_RETRIES + 1`` total tries), backing off
+        ``FETCH_PAGE_BASE_DELAY * (2 ** attempt) + rand() * FETCH_PAGE_BASE_DELAY``
+        seconds between them via the injected ``sleep``/``rand``. The attempt
+        budget is a local variable, not state on ``self`` -- so each page recovers
+        independently (a run can outlive its token more than once) while a
+        persistent failure can never loop forever.
+
+        Once the budget is exhausted, an :class:`ApiError` is raised (the CLI's
+        partial-run exit-code contract is unchanged). Its message states how many
+        attempts were made and *what kind* of failure last occurred (an error
+        response, or a network error) but deliberately never embeds the raw
+        underlying ``PixivError`` text -- mirroring :meth:`authenticate`'s static
+        message, so an auth endpoint's HTTP response body is never surfaced.
+
+        Raises:
+            ApiError: If no refresh token was cached, or the failure persists
+                after the full retry budget of re-authentications.
+        """
+
+        result = fetch()
+        if getattr(result, "error", None) is None:
+            return result
+        if self._refresh_token is None:
+            raise ApiError(
+                "Pixiv returned an error response and no refresh token is "
+                "available to re-authenticate."
+            )
+
+        total_tries = FETCH_PAGE_MAX_RETRIES + 1
+        # Tracks how the most recent recovery attempt failed, so the final
+        # give-up message reflects the last concrete failure without embedding
+        # any raw PixivError text. Reset each attempt.
+        last_failure = "an error response"
+        for attempt in range(FETCH_PAGE_MAX_RETRIES):
+            # Back off before each recovery: exponential + jitter, matching
+            # download_image. This also supplies the politeness pause the
+            # same-page retry previously lacked.
+            self._sleep(
+                FETCH_PAGE_BASE_DELAY * (2**attempt)
+                + self._rand() * FETCH_PAGE_BASE_DELAY
+            )
+            try:
+                self._api.auth(refresh_token=self._refresh_token)
+            except PixivError:
+                # Re-auth itself failed at the network level (e.g. a connection
+                # reset). Note the failure kind -- never the raw exception text --
+                # and retry until the budget is spent.
+                last_failure = "a network error"
+                continue
+            result = fetch()
+            if getattr(result, "error", None) is None:
+                return result
+            last_failure = "an error response"
+
+        raise ApiError(
+            f"Pixiv listing recovery failed after {total_tries} attempts "
+            f"(last failure: {last_failure})."
+        )
+
+    def _warn_unparsable_next_url(
+        self,
+        result: Any,
+        *,
+        pages_so_far: int,
+        items_so_far: int,
+        context: str,
+    ) -> None:
+        """Emit a diagnostic ``warn`` when a non-empty ``next_url`` is unusable.
+
+        Called at the single pagination termination point that has no benign
+        interpretation: Pixiv's response carried a *truthy* ``next_url`` -- an
+        explicit "there is more data" pointer -- but :meth:`parse_qs` could not
+        extract usable query parameters from it, so pagination cannot continue
+        even though the API says it should. A genuine end-of-data response never
+        carries a ``next_url`` at all (a falsy ``next_url`` is Pixiv's normal
+        "no more data" signal and is handled silently by the callers), so this
+        combination always warrants a warning; it is not gated on page size or
+        emptiness.
+
+        The message is one line, human-readable, and never contains the
+        refresh/access token. It carries how much was yielded so far plus a
+        shape sketch of the raw response -- its ``error`` content if present, or
+        else its top-level keys -- to aid diagnosis. Building the sketch must
+        never crash the run, so key extraction is defensively guarded (Pixiv
+        results subclass ``dict`` and expose ``keys()``; test doubles may not).
+        """
+
+        error = getattr(result, "error", None)
+        if error is not None:
+            shape = f"error={error!r}"
+        elif hasattr(result, "keys"):
+            try:
+                shape = f"top-level keys={sorted(map(str, result.keys()))}"
+            except Exception:  # pragma: no cover - defensive: never crash a run
+                shape = f"response type={type(result).__name__}"
+        else:
+            shape = f"response type={type(result).__name__}"
+
+        self._warn(
+            f"{context} stopped early: Pixiv returned a next_url pointing to more "
+            f"data, but its query string could not be parsed, so pagination cannot "
+            f"continue -- after yielding {items_so_far} item(s) across "
+            f"{pages_so_far} page(s); {shape}."
+        )
 
     def iter_bookmarks(self, user_id: str, restrict: str) -> Iterator[BookmarkWork]:
         """Yield each bookmarked :class:`BookmarkWork` for ``user_id``.
@@ -201,19 +367,35 @@ class Pixivpy3Client:
         """
 
         fetch_bookmark_tags = str(user_id) == str(self._api.user_id)
+        pages_so_far = 0
+        items_so_far = 0
         try:
-            result = self._api.user_bookmarks_illust(user_id, restrict)
+            result = self._fetch_page(
+                lambda: self._api.user_bookmarks_illust(user_id, restrict)
+            )
             while True:
-                for illust in result.illusts or []:
+                page_items = result.illusts or []
+                page_item_count = len(page_items)
+                pages_so_far += 1
+                for illust in page_items:
                     yield self._to_work(illust, fetch_bookmark_tags)
+                items_so_far += page_item_count
                 next_url = result.next_url
                 if not next_url:
                     return
                 qs = self._api.parse_qs(next_url)
                 if not qs:
+                    self._warn_unparsable_next_url(
+                        result,
+                        pages_so_far=pages_so_far,
+                        items_so_far=items_so_far,
+                        context="Bookmark listing",
+                    )
                     return
                 self._sleep(self._delay)
-                result = self._api.user_bookmarks_illust(**qs)
+                result = self._fetch_page(
+                    lambda qs=qs: self._api.user_bookmarks_illust(**qs)
+                )
         except PixivError as exc:
             raise ApiError(f"Failed to list bookmarks: {exc}") from exc
 
@@ -228,23 +410,37 @@ class Pixivpy3Client:
             ApiError: If listing the follow list fails.
         """
 
+        pages_so_far = 0
+        items_so_far = 0
         try:
-            result = self._api.user_following(user_id, restrict)
+            result = self._fetch_page(
+                lambda: self._api.user_following(user_id, restrict)
+            )
             while True:
-                for preview in result.user_previews or []:
+                page_items = result.user_previews or []
+                page_item_count = len(page_items)
+                pages_so_far += 1
+                for preview in page_items:
                     yield FollowedUser(
                         id=preview.user.id,
                         name=preview.user.name,
                         account=preview.user.account,
                     )
+                items_so_far += page_item_count
                 next_url = result.next_url
                 if not next_url:
                     return
                 qs = self._api.parse_qs(next_url)
                 if not qs:
+                    self._warn_unparsable_next_url(
+                        result,
+                        pages_so_far=pages_so_far,
+                        items_so_far=items_so_far,
+                        context="Following listing",
+                    )
                     return
                 self._sleep(self._delay)
-                result = self._api.user_following(**qs)
+                result = self._fetch_page(lambda qs=qs: self._api.user_following(**qs))
         except PixivError as exc:
             raise ApiError(f"Failed to list following: {exc}") from exc
 
@@ -261,19 +457,31 @@ class Pixivpy3Client:
             ApiError: If listing the user's works fails.
         """
 
+        pages_so_far = 0
+        items_so_far = 0
         try:
-            result = self._api.user_illusts(user_id, "")
+            result = self._fetch_page(lambda: self._api.user_illusts(user_id, ""))
             while True:
-                for illust in result.illusts or []:
+                page_items = result.illusts or []
+                page_item_count = len(page_items)
+                pages_so_far += 1
+                for illust in page_items:
                     yield self._to_work(illust, fetch_bookmark_tags=False)
+                items_so_far += page_item_count
                 next_url = result.next_url
                 if not next_url:
                     return
                 qs = self._api.parse_qs(next_url)
                 if not qs:
+                    self._warn_unparsable_next_url(
+                        result,
+                        pages_so_far=pages_so_far,
+                        items_so_far=items_so_far,
+                        context=f"Works listing for {user_id}",
+                    )
                     return
                 self._sleep(self._delay)
-                result = self._api.user_illusts(**qs)
+                result = self._fetch_page(lambda qs=qs: self._api.user_illusts(**qs))
         except PixivError as exc:
             raise ApiError(f"Failed to list works for {user_id}: {exc}") from exc
 

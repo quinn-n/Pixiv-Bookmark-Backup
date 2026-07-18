@@ -8,3 +8,5 @@ Review the current changes (`git diff` / staged) thoroughly. Run these in parall
 - `cli-ux-reviewer` — help text, error messages, defaults, output/stream design, scriptability.
 
 Consolidate into one prioritized list: **Must fix**, **Should fix**, **Nits**, with file:line and concrete fixes, noting which agent flagged each. Don't change code unless I ask.
+
+Run the heavy gate at low OS priority locally, e.g. `nice -n 10 pixi run check` — never in CI, never swallowing the exit code. See the `low-priority-execution` skill.

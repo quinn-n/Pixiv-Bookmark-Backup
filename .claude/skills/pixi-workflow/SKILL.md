@@ -54,6 +54,8 @@ check     = { depends-on = ["fmt-check", "lint", "typecheck", "test"] }
 ```
 Run with `pixi run <task>` (e.g. `pixi run test`, `pixi run check`). A failing dependency stops the chain. Hide internal tasks with a leading `_`.
 
+Locally, `pixi run` invocations of heavy tasks are prefixed at the call site with the OS low-priority wrapper (e.g. `nice -n 10 pixi run check`) so they don't lag the machine — the task *definitions* stay unwrapped so CI runs full-speed. See the `low-priority-execution` skill.
+
 ## Conventions for this project
 - Standard tasks: `fmt`, `fmt-check`, `lint`, `typecheck` (if mypy), `test`, `check`. Add `audit`/`bandit` for security if those tools are installed.
 - Never `pip install` into the env directly or edit the lockfile by hand — go through `pixi add`.

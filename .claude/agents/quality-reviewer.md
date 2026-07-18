@@ -13,7 +13,7 @@ Via `Bash`, run and report results (don't fix):
 - `pixi run lint` (flake8, plus any configured plugins like flake8-bugbear/isort) — style + likely-bug lint.
 - `pixi run typecheck` (**Pyright**, via basedpyright) — type errors. Pylance has no CLI; Pyright is the engine behind it, so this matches the editor's Pylance diagnostics. If mypy is also configured, run it too.
 - `pixi run test` (and coverage if available) — green suite + coverage on changed lines.
-If a task name differs, discover it from the manifest. Treat any failure as a Must-fix.
+If a task name differs, discover it from the manifest. Treat any failure as a Must-fix. Run the gate at low OS priority locally, e.g. `nice -n 10 pixi run check` (never in CI, never swallowing the exit code — see the `low-priority-execution` skill).
 
 ## Then review by hand (the diff: `git diff` / `--staged`)
 - **Correctness:** edge cases, `None`/empty handling, off-by-one, exception handling, resource cleanup (context managers), mutable default args, late-binding closures.

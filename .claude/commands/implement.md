@@ -14,3 +14,5 @@ Execute the approved plan: **$ARGUMENTS**
 3. `cli-tester` — run the real command via pixi on the integrated feature; verify behaviors, exit codes, and pipe/no-TTY handling.
 4. In parallel: `security-reviewer`, `cli-ux-reviewer`, and a final `quality-reviewer` pass — each returns a verdict. Loop any CHANGES REQUESTED back through `implementer` (or `cli-ux-reviewer` for help-text/format-only) until APPROVED; re-test after.
 5. Route remaining defects to `bug-fixer` (loop through `quality-reviewer` until APPROVED). Summarize parallel tracks, review rounds per track, results, new pixi deps/tasks, and follow-ups.
+
+Run the heavy gate at low OS priority locally, e.g. `nice -n 10 pixi run check` — never in CI, never swallowing the exit code. See the `low-priority-execution` skill.

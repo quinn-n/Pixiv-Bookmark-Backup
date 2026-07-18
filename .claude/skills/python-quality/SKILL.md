@@ -15,6 +15,8 @@ The bar every change must clear, plus how to write code that clears it easily.
 - `pixi run test` — **pytest** (with coverage where set up).
 - `pixi run check` — the aggregate (fmt-check + lint + typecheck + test). **Green `check` is the definition of "ready".** `typecheck` runs Pyright (via `basedpyright`).
 
+Locally, run these as a good neighbor — prefix the runner with the OS low-priority wrapper so the gate doesn't lag the machine (e.g. `nice -n 10 pixi run check`), full-speed in CI. See the `low-priority-execution` skill.
+
 ### black + flake8 harmony
 flake8 must not fight black. Set flake8 `max-line-length` to black's (88) and ignore the rules black handles (e.g. `E203`, `W503`). Keep this in `.flake8`/`setup.cfg`/`[tool.flake8]` so they never conflict.
 

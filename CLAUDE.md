@@ -3,7 +3,7 @@
 This repo builds Python command-line tools. Environment & dependencies are managed with **pixi**, the terminal interface uses **click**, tests use **pytest**, formatting is **black**, linting is **flake8**, type-checking is **Pyright** (the engine behind VS Code's Pylance, run from the CLI as `basedpyright`), and classes are written with **attrs**. This file is your standing instructions — treat it as binding.
 
 ## Golden workflow
-Never jump straight to code for a non-trivial change. Follow: **design → plan → fact-check → implement (parallel tracks) ↔ review loop → run-the-real-CLI test → feature review (security/UX) → fix → re-check.** The `/feature` command runs the whole pipeline; `/plan`, `/implement`, `/review`, `/fix`, `/harden` run pieces; `/setup` bootstraps a new project.
+Never jump straight to code for a non-trivial change. Follow: **design → plan → fact-check → implement (parallel tracks) ↔ review loop → run-the-real-CLI test → feature review (security/UX) → fix → re-check.** The `/feature` command runs the whole pipeline; `/plan`, `/implement`, `/review`, `/fix`, `/harden` run pieces; `/setup` bootstraps a new project. `/features <file.md>` fans the whole pipeline out over **many features at once** — one **git worktree per feature** (named from the change) so they can't collide — and opens **a PR per feature**; it forwards each pipeline's approval gates and any subagent questions back to you, labeled by feature.
 
 ### Parallel implementation
 When the plan's **Parallelization plan** marks tasks as independent (no shared dependency, disjoint `Owns` file sets), implement them **concurrently** — launch one `implementer` per task in the same batch (plus any supporting agents that track needs). Batches run in order; a batch integrates and its review loops pass before the next starts. Never run two tracks that touch the same file concurrently — and treat the shared `pixi` manifest and the click group in `cli.py` as serialization points. Correctness beats concurrency.
@@ -12,12 +12,12 @@ When the plan's **Parallelization plan** marks tasks as independent (no shared d
 Writing the code is not "done." Each implementer track runs a loop: `implementer` produces code + tests with `pixi run check` green → `quality-reviewer` returns **APPROVED** or **CHANGES REQUESTED** → on changes, the same implementer addresses every Must-fix (with a change log) → re-review → repeat until **APPROVED**. The feature-level `security-reviewer` and `cli-ux-reviewer` gate the same way. Loops are capped (~3 rounds); unresolved disagreements escalate to a human. Reviewers approve on "high quality, gate green, no real blockers," not unreachable perfection.
 
 ## Everything runs through pixi
-Run code and tools via `pixi run ...` so they use the project environment — never a stray global `python`/`pip`. Manage dependencies with `pixi add <pkg>` (conda-forge, preferred) or `pixi add --pypi <pkg>`; put dev/test tools on the `dev` feature. **Never hand-edit `pixi.lock`**; commit it. The shared task vocabulary: `pixi run fmt`, `fmt-check`, `lint`, `typecheck` (Pyright), `test`, and `check` (the aggregate gate). See the `pixi-workflow` skill.
+Run code and tools via `pixi run ...` so they use the project environment — never a stray global `python`/`pip`. Manage dependencies with `pixi add <pkg>` (conda-forge, preferred) or `pixi add --pypi <pkg>`; put dev/test tools on the `dev` feature. **Never hand-edit `pixi.lock`**; commit it. The shared task vocabulary: `pixi run fmt`, `fmt-check`, `lint`, `typecheck` (Pyright), `test`, and `check` (the aggregate gate). Locally, prefix these compute-heavy runs with the OS low-priority wrapper (`nice -n 10 pixi run check`) so they don't lag the machine — see the `low-priority-execution` skill. See the `pixi-workflow` skill.
 
 ## Specialized subagents (delegate proactively)
 - **cli-designer** — turns an idea into a command spec (surface, options, exit codes, edge cases). Use before planning.
 - **implementation-planner** — step-by-step plan + pytest test plan + pixi dep/task changes + per-task `Owns` sets + parallelization batches; lists every `[VERIFY]` assumption.
-- **fact-checker** — confirms/refutes `[VERIFY]` items against the *installed* pixi env + current docs *before* coding. If it refutes something, the plan goes **back** to the planner to be revised, then re-checked.
+- **fact-checker** — confirms/refutes `[VERIFY]` items against the *installed* pixi env + current docs *before* coding. The orchestrator fans these out — one fact-checker per independent verification cluster — to resolve them concurrently. If one refutes something, the plan goes **back** to the planner to be revised, then re-checked.
 - **implementer** — executes its assigned slice of the plan, adds deps via pixi, writes pytest tests, stays inside its `Owns` files, and iterates until its reviewer APPROVES. Often one of several running in parallel.
 - **cli-tester** — runs the *real* installed command via pixi to verify behavior, exit codes, and pipe/no-TTY handling.
 - **test-engineer** — backfills meaningful pytest coverage (unit / CLI / integration).
@@ -35,9 +35,10 @@ Delegate context-heavy or specialized work to keep the main session focused. Rev
 - **Security gates.** Run the security-reviewer before committing anything touching subprocess, paths, deserialization, network, or credentials. No `shell=True` with interpolated input; no `pickle`/`yaml.load`/`eval` on untrusted data; no secrets in argv or logs.
 - **Intuitive CLI design is a requirement, not polish.** Clear `--help` with examples, teaching error messages, sensible defaults, scriptable `--json`/`--yes`, and `--dry-run` for destructive actions. See the `cli-design` skill.
 - **Keep the click layer thin.** Parse/validate/format in the command; put logic in plain, testable functions in the core.
+- **Run compute-heavy commands at low OS priority locally.** Prefix test/lint/typecheck/format (and bandit/pip-audit) invocations via pixi with the OS low-priority wrapper — `nice -n 10 …` on Linux, `taskpolicy -b …` on macOS, or a `BelowNormal` shell on Windows — so they don't lag the machine. **Never swallow the command's exit code, and never lower priority in CI.** See the `low-priority-execution` skill.
 
 ## Skills available
-`cli-design` (intuitive, scriptable commands), `python-quality` (the gate + clean/testable code), `pixi-workflow` (envs, deps, tasks), `attrs-classes` (the attrs convention for writing classes). Consult them when relevant.
+`cli-design` (intuitive, scriptable commands), `python-quality` (the gate + clean/testable code), `pixi-workflow` (envs, deps, tasks), `attrs-classes` (the attrs convention for writing classes), `low-priority-execution` (running heavy commands at low OS priority locally). Consult them when relevant.
 
 ## Conventions
 - Match existing patterns, option naming (kebab-case flags), output style, type hints, and docstrings. Read neighbors before writing.

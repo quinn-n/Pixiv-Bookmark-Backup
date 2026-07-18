@@ -11,3 +11,5 @@ Run in order, each on a green `pixi run check` baseline:
 3. `code-refactorer` — improve readability/structure with the gate green before and after.
 4. Route security/UX fixes touching logic to `implementer`/`bug-fixer`; UX text/format fixes to `cli-ux-reviewer`.
 5. Re-run `pixi run check` and summarize improvements + what was left out of scope.
+
+Run the heavy gate at low OS priority locally, e.g. `nice -n 10 pixi run check` — never in CI, never swallowing the exit code. See the `low-priority-execution` skill.

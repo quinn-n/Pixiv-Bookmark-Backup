@@ -9,8 +9,8 @@ Orchestrate the specialized subagents in order, pausing for my approval at each 
 
 1. **Design** — delegate to `cli-designer`. Present the command spec (surface, options, exit codes, edge cases). ⏸ Wait for approval or edits.
 2. **Plan** — delegate to `implementation-planner` using the approved design. It must list new pixi deps/tasks, all `[VERIFY]` assumptions, per-task `Owns` file sets, and a **Parallelization plan** of ordered execution batches.
-3. **Fact-check** — delegate to `fact-checker` to resolve every `[VERIFY]` item against the installed pixi env + current docs.
-   - If anything is **refuted**, send the plan back to `implementation-planner` to revise the affected steps, then re-run `fact-checker`. Repeat until the plan rests only on confirmed facts. ⏸ Present the final plan + test plan + parallelization plan for approval.
+3. **Fact-check (fan out)** — the `[VERIFY]` items are independent lookups, so resolve them in parallel: launch **one `fact-checker` per verification cluster** from the plan in a single turn (multiple Task calls), giving each only its cluster's items, each checking against the installed pixi env + current docs. If the plan lists no clusters, split the items into disjoint groups yourself (one fact-checker each) — or use a single fact-checker when there are only a couple. Merge their verdicts into one report.
+   - If anything is **refuted**, send the plan back to `implementation-planner` to revise the affected steps, then re-run only the relevant `fact-checker`(s). Repeat until the plan rests only on confirmed facts. ⏸ Present the final plan + test plan + parallelization plan for approval.
 4. **Implement in parallel batches, each track gated by a review loop.** Work through the plan's execution batches **in order**. For each batch:
    - Launch **one `implementer` subagent per independent task in the batch, in parallel** (multiple Task calls in a single turn). Give each implementer only its task(s) and its `Owns` file set, and tell it to stay strictly within that scope. Do not put tasks whose `Owns` sets overlap (including the shared `pixi` manifest or the click group in `cli.py`), or whose dependencies haven't completed, in the same batch — serialize those into a later batch.
    - **Run an implement↔review loop per track** (the core requirement — code must *pass* review, not just be written once):
@@ -25,3 +25,5 @@ Orchestrate the specialized subagents in order, pausing for my approval at each 
 8. **Summary** — what was built, which tasks ran in parallel, review rounds per track, gate/test results, new pixi deps & tasks, and outstanding Should-fix/Nit items.
 
 Give a one-paragraph status at each batch/loop (which tracks are running, current verdicts, round counts). Stop and ask if any agent reports a blocker or a loop fails to converge.
+
+Run the heavy gate at low OS priority locally, e.g. `nice -n 10 pixi run check` — never in CI, never swallowing the exit code. See the `low-priority-execution` skill.

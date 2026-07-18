@@ -305,7 +305,7 @@ class Pixivpy3Client:
             last_failure = "an error response"
 
         raise ApiError(
-            f"Pixiv listing recovery failed after {total_tries} attempts "
+            f"Pixiv request recovery failed after {total_tries} attempts "
             f"(last failure: {last_failure})."
         )
 
@@ -575,14 +575,49 @@ class Pixivpy3Client:
     def _fetch_bookmark_tags(self, illust_id: int) -> list[str] | None:
         """Return the authenticated user's registered bookmark tags for a work.
 
-        Returns ``None`` if Pixiv fails to provide the detail (the run is not
-        aborted for this).
+        Routed through :meth:`_fetch_page` so a mid-run token expiry recovers via
+        the same re-auth-with-backoff path as the listing endpoints: an
+        error-shaped detail response (whose missing ``bookmark_detail`` key would
+        otherwise resolve to ``None`` via ``JsonDict.__getattr__``, silently
+        yielding "no tags") triggers re-authentication and a re-fetch instead of
+        returning bad data.
+
+        Fetching a single work's tags is *not* worth aborting a large run over, so
+        this call site degrades gracefully rather than propagating the
+        :class:`ApiError` that :meth:`_fetch_page` raises when its bounded
+        re-auth/retry budget is exhausted -- unlike the listing endpoints, where a
+        failed page means lost works and must abort. Two non-fatal outcomes return
+        ``None`` for just this work:
+
+        * A :class:`~pixivpy3.PixivError` on the detail call -- a transient
+          single-work network blip, or an absent/empty ``bookmark_detail``.
+        * :meth:`_fetch_page` exhausting its budget (:class:`ApiError`). This only
+          fires *after* the bounded re-auth/retry already ran, so it means either
+          this specific work is permanently unreadable (deleted/restricted
+          bookmark -- common on a large, long-lived account) or a systemic token
+          failure. The latter is still backstopped: the next *listing* page's own
+          :meth:`_fetch_page` will abort the run properly. Either way the skip is
+          surfaced via ``warn`` (never silent), and the bounded recovery was still
+          attempted first -- so this is a graceful give-up, not the original
+          silently-return-``None`` defect.
         """
 
         try:
-            detail = self._api.illust_bookmark_detail(illust_id).bookmark_detail
+            result = self._fetch_page(
+                lambda: self._api.illust_bookmark_detail(illust_id)
+            )
         except PixivError:
             return None
+        except ApiError:
+            # Bounded re-auth/retry already ran and still failed for this one
+            # work. Skip its tags (non-fatal) rather than abort the whole run,
+            # but make the skip visible -- silence was the original bug.
+            self._warn(
+                f"Could not fetch bookmark tags for work {illust_id} after "
+                f"re-authenticating; skipping its tags for this run."
+            )
+            return None
+        detail = result.bookmark_detail
         if detail is None:
             return None
         return [tag.name for tag in detail.tags if tag.is_registered]

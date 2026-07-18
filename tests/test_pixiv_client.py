@@ -1114,6 +1114,90 @@ def test_bookmark_tags_none_when_detail_raises() -> None:
     assert work.bookmark_tags is None
 
 
+class _ExpiringDetailApi(FakeApi):
+    """FakeApi whose bookmark-detail endpoint mimics an expired-token error.
+
+    Models Pixiv's expired-token behaviour on ``illust_bookmark_detail``: the
+    call returns an ``{"error": {...}}``-shaped ``SimpleNamespace`` (whose missing
+    ``bookmark_detail`` key resolves to ``None``, indistinguishable from "no tags"
+    by attribute access alone) until ``auth`` has been re-invoked *for recovery*.
+    The gate keys on ``len(auth_calls) >= 2`` -- initial ``authenticate`` plus one
+    ``_fetch_page`` recovery -- so the initial auth cannot pre-satisfy it and the
+    detail call genuinely errors until recovery re-auths.
+    """
+
+    def __init__(self, *, recover: bool = True, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._recover = recover
+
+    def illust_bookmark_detail(self, illust_id: int) -> SimpleNamespace:
+        self.bookmark_detail_calls.append(illust_id)
+        recovered = self._recover and len(self.auth_calls) >= 2
+        if not recovered:
+            # Token expired: error body with ``bookmark_detail`` resolving to
+            # ``None`` -- mirrors pixivpy3's JsonDict, where a missing key on an
+            # error response reads back as ``None`` (so a naive ``.bookmark_detail``
+            # silently yields "no tags" instead of surfacing the failure).
+            return SimpleNamespace(
+                error=SimpleNamespace(user_message="", message="invalid access token"),
+                bookmark_detail=None,
+            )
+        tags = [
+            SimpleNamespace(name=name, is_registered=registered)
+            for name, registered in self.bookmark_detail_tags
+        ]
+        return SimpleNamespace(bookmark_detail=SimpleNamespace(tags=tags))
+
+
+def test_bookmark_tags_reauth_and_recovers_on_expired_token() -> None:
+    # Regression: an expired-token error while fetching a work's personal bookmark
+    # tags previously slipped past recovery -- illust_bookmark_detail was called
+    # DIRECTLY (not via _fetch_page), so the error-shaped response's missing
+    # bookmark_detail resolved to None and the tags came back silently empty with
+    # no re-auth. Routing through _fetch_page must now re-authenticate and return
+    # the real tags.
+    api = _ExpiringDetailApi(user_id=SELF_ID)
+    api.bookmark_detail_tags = [("favorite", True), ("noise", False), ("art", True)]
+    api.pages = [([_make_illust(80, single_url="https://x/p0.png")], None)]
+    client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0)
+    # Cache the refresh token via the normal initial auth.
+    client.authenticate("refresh-secret")
+    work = next(iter(client.iter_bookmarks(SELF_ID, "public")))
+    # Real tags recovered, not a silent empty/None truncation.
+    assert work.bookmark_tags == ["favorite", "art"]
+    # Re-auth happened (initial + one recovery), bounded (not an infinite loop).
+    assert api.auth_calls == ["refresh-secret", "refresh-secret"]
+
+
+def test_bookmark_tags_degrade_to_none_and_warn_when_error_persists() -> None:
+    # A single work whose bookmark-detail keeps erroring even after re-auth (e.g. a
+    # deleted/restricted bookmark -- common on a large, long-lived account) must
+    # NOT abort the whole run. _fetch_bookmark_tags catches _fetch_page's
+    # exhausted-budget ApiError and degrades to None for just this work -- but only
+    # AFTER the bounded re-auth/retry ran, and the skip is surfaced via warn (never
+    # silent). A systemic token failure is still backstopped by the next listing
+    # page's own _fetch_page; here the listing itself is healthy.
+    warnings: list[str] = []
+    api = _ExpiringDetailApi(user_id=SELF_ID, recover=False)
+    api.bookmark_detail_tags = [("favorite", True)]
+    api.pages = [([_make_illust(90, single_url="https://x/p0.png")], None)]
+    client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0, warn=warnings.append)
+    client.authenticate("refresh-secret")
+    # The run completes: the work is still yielded, just without its tags.
+    works = list(client.iter_bookmarks(SELF_ID, "public"))
+    assert [w.id for w in works] == [90]
+    assert works[0].bookmark_tags is None
+    # Bounded recovery was still attempted -- initial auth + FETCH_PAGE_MAX_RETRIES
+    # recovery re-auths -- proving "tried then gracefully gave up", NOT a reversion
+    # to the original silent bug where recovery was never attempted at all.
+    assert api.auth_calls == ["refresh-secret"] * (1 + FETCH_PAGE_MAX_RETRIES)
+    # The skip is visible on the warn sink, names the work, and never leaks raw
+    # Pixiv error text.
+    assert len(warnings) == 1
+    assert "90" in warnings[0]
+    assert "invalid access token" not in warnings[0]
+
+
 # -- ugoira_metadata ----------------------------------------------------
 
 

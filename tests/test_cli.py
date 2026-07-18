@@ -149,9 +149,14 @@ _: type[PixivClient] = FakePixivClient
 
 
 def _install_client(monkeypatch: pytest.MonkeyPatch, client: FakePixivClient) -> None:
-    """Patch ``cli.Pixivpy3Client`` so constructing it returns ``client``."""
+    """Patch ``cli.Pixivpy3Client`` so constructing it returns ``client``.
 
-    monkeypatch.setattr(cli_module, "Pixivpy3Client", lambda: client)
+    The command constructs the real client with ``warn=`` (and could pass other
+    kwargs), so the stub swallows any constructor arguments and returns the
+    pre-built fake regardless.
+    """
+
+    monkeypatch.setattr(cli_module, "Pixivpy3Client", lambda *args, **kwargs: client)
 
 
 def _install_run(

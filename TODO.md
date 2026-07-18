@@ -11,11 +11,19 @@ these block that change from shipping.
   `test_iter_following_reauths_and_continues_on_expired_token`). It shares the
   same `_fetch_page` call sites as the other two generators but has no test
   exercising the error/recovery path.
-- [ ] `_fetch_bookmark_tags` (`pixiv_client.py`) has the same latent defect
-  this fix addressed: it calls `illust_bookmark_detail` directly, not through
-  `_fetch_page`, so a token expiry between pages makes bookmark tags silently
-  come back `None` instead of recovering. Pre-existing, same class of bug,
-  intentionally out of scope for the pagination fix.
+- [x] `_fetch_bookmark_tags` (`pixiv_client.py`) had the same latent defect
+  this fix addressed: it called `illust_bookmark_detail` directly, not through
+  `_fetch_page`, so a token expiry between pages made bookmark tags silently
+  come back `None` instead of recovering. Now routed through `_fetch_page`
+  (re-auth-with-backoff). Because losing one work's personal tags is not worth
+  aborting a large run, `_fetch_bookmark_tags` catches `_fetch_page`'s
+  exhausted-budget `ApiError` and degrades to `None` for just that work *after*
+  the bounded re-auth/retry ran, surfacing a visible per-work `warn` (a
+  systemic token failure is still backstopped by the next listing page's own
+  `_fetch_page`). Regression tests in `tests/test_pixiv_client.py`:
+  `test_bookmark_tags_reauth_and_recovers_on_expired_token` (recovery succeeds)
+  and `test_bookmark_tags_degrade_to_none_and_warn_when_error_persists`
+  (graceful give-up + warn + bounded re-auth still attempted).
 
 ## From security review
 

@@ -1019,6 +1019,42 @@ def test_iter_user_works_does_not_warn_on_normal_short_page() -> None:
     assert warnings == []
 
 
+def test_iter_user_works_reauths_and_continues_on_expired_token() -> None:
+    # The expired-token recovery is shared across all three paginated listings;
+    # this confirms it is wired into iter_user_works too (not just iter_bookmarks
+    # and iter_following).
+    class ExpiringWorksApi(FakeApi):
+        # The token "expires" when page index 1 is first reached: the page errors
+        # until a *further* auth() call re-authenticates. Gating on the auth-call
+        # count (rather than a bool flag) ignores the initial authenticate() and
+        # only recovers once a re-auth happens during iteration.
+        def user_illusts(self, *args: Any, **kwargs: Any) -> SimpleNamespace:
+            self.works_calls.append({"args": args, "kwargs": kwargs})
+            if self._works_index == 1 and len(self.auth_calls) < 2:
+                return SimpleNamespace(
+                    error=SimpleNamespace(message="invalid access token"),
+                    illusts=None,
+                    next_url=None,
+                )
+            illusts, next_url = self.works_pages[self._works_index]
+            self._works_index += 1
+            return SimpleNamespace(illusts=illusts, next_url=next_url)
+
+    api = ExpiringWorksApi(user_id=SELF_ID)
+    api.works_pages = [
+        ([_make_illust(1, single_url="https://x/1.png")], "https://next?page=2"),
+        ([_make_illust(2, single_url="https://x/2.png")], None),
+    ]
+    client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0)
+    # Cache the refresh token via the normal initial auth.
+    client.authenticate("refresh-secret")
+    works = list(client.iter_user_works(OTHER_ID))
+    # Both pages backed up, none skipped or truncated.
+    assert [w.id for w in works] == [1, 2]
+    # Re-auth happened (initial + one recovery), bounded (not an infinite loop).
+    assert api.auth_calls == ["refresh-secret", "refresh-secret"]
+
+
 def test_iter_user_works_wraps_pixiverror_in_apierror() -> None:
     class BoomApi(FakeApi):
         def user_illusts(self, *args: Any, **kwargs: Any) -> SimpleNamespace:

@@ -411,8 +411,41 @@ def test_iter_bookmarks_raises_apierror_when_error_persists_after_reauth() -> No
     # Initial auth + FETCH_PAGE_MAX_RETRIES recovery re-auths before giving up,
     # proving a bounded (not infinite) retry loop.
     assert api.auth_calls == ["refresh-secret"] * (1 + FETCH_PAGE_MAX_RETRIES)
-    # The final give-up message must not embed raw Pixiv error text.
-    assert "server error" not in str(excinfo.value)
+    # The final give-up message surfaces Pixiv's own error body -- it carries no
+    # credentials, unlike a raised PixivError (see the network-error test below).
+    assert "server error" in str(excinfo.value)
+
+
+def test_iter_bookmarks_error_give_up_message_never_leaks_refresh_token() -> None:
+    # The response-error detail is now embedded in the give-up message, so this
+    # locks in the module's core invariant: even a maximally chatty Pixiv error
+    # body can never cause the authenticated credential itself to appear in the
+    # message. The error body also carries a distinctive marker, proving the
+    # detail is surfaced verbatim (not merely absent by coincidence).
+    credential = "used-to-authenticate-do-not-leak-1234567890"
+    marker = "distinctive-diagnostic-marker-98765"
+
+    class PersistentErrorApi(FakeApi):
+        def user_bookmarks_illust(self, *args: Any, **kwargs: Any) -> SimpleNamespace:
+            self.bookmark_calls.append({"args": args, "kwargs": kwargs})
+            return SimpleNamespace(
+                error=SimpleNamespace(
+                    message="invalid access token",
+                    user_message=f"chatty diagnostic detail: {marker}",
+                ),
+                illusts=None,
+                next_url=None,
+            )
+
+    api = PersistentErrorApi(user_id=SELF_ID)
+    client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0)
+    client.authenticate(credential)
+    with pytest.raises(ApiError) as excinfo:
+        list(client.iter_bookmarks(SELF_ID, "public"))
+    message = str(excinfo.value)
+    assert "invalid access token" in message
+    assert marker in message
+    assert credential not in message
 
 
 def test_iter_bookmarks_reauths_after_transient_reauth_network_errors() -> None:
@@ -545,9 +578,11 @@ def test_iter_bookmarks_error_without_refresh_token_raises_apierror() -> None:
 
     api = ImmediateErrorApi(user_id=SELF_ID)
     client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0)
-    with pytest.raises(ApiError):
+    with pytest.raises(ApiError) as excinfo:
         list(client.iter_bookmarks(SELF_ID, "public"))
     assert api.auth_calls == []
+    # Even with nothing to retry, the response's own error detail is surfaced.
+    assert "invalid access token" in str(excinfo.value)
 
 
 # -- unparsable-next_url diagnostics ------------------------------------

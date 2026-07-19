@@ -5,7 +5,11 @@ Back up your Pixiv bookmarks from the command line.
 `pixiv-bookmark-backup` downloads your (or anyone's public) Pixiv bookmarks —
 illustrations, manga, and ugoira (converted to GIF) — to a local directory,
 alongside a `details.json` manifest recording every work and its tags. Re-runs
-are safe: existing files are skipped by default and the manifest is merged.
+are safe: existing image files are skipped by default (`--skip-existing-files`),
+and the manifest is merged. For a faster incremental re-run, `--skip-scanned`
+(opt-in, default off) goes further and skips works already recorded in the
+manifest entirely — avoiding the per-work Pixiv API fetch and its
+`--time-per-request` pacing wait, not just the file download.
 A companion `search` command lets you query that manifest offline, and
 `backup-following` extends the same backup to everyone you follow.
 
@@ -86,7 +90,17 @@ pixi run backup -o ./out --visibility all
 
 # Another user's public bookmarks, newest first, capped at 50
 pixi run backup 12345 --limit 50 --since 2025-01-01
+
+# Fast incremental re-run: skip works already recorded in details.json,
+# not just their already-downloaded files
+pixi run backup --skip-scanned
 ```
+
+`--skip-scanned` is independent of `--skip-existing-files`: one skips
+re-fetching a work from the API, the other skips re-downloading its image
+files. Note that a work recorded by a prior `--metadata-only` run has no
+downloaded images but also no failed ones, so it counts as already scanned; a
+later full run with `--skip-scanned` will skip it and won't download its images.
 
 ### Back up everyone you follow
 

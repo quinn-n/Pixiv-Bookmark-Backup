@@ -20,9 +20,47 @@ from pixiv_bookmark_backup.core import (
     VISIBILITIES,
     decide_exit_code,
     describe_plan,
+    skippable_work_ids,
 )
+from pixiv_bookmark_backup.manifest import ImageEntry, Manifest, WorkEntry
+from pixiv_bookmark_backup.models import ImageStatus
 
 from conftest import ScriptedMonotonic, SpySleep
+
+
+def _image_entry(status: str) -> ImageEntry:
+    return ImageEntry(
+        page=0,
+        source_url="https://example.test/0.png",
+        path="123_p0.png",
+        status=status,
+        bytes_=1024,
+        error=None,
+    )
+
+
+def _work_entry(work_id: int, statuses: list[str]) -> WorkEntry:
+    return WorkEntry(
+        id=work_id,
+        type="illust",
+        title="A work",
+        author={"id": 7, "name": "Artist", "account": "artist"},
+        posted_at="2023-01-02T03:04:05+09:00",
+        nsfw={"x_restrict": 0, "sanity_level": 2, "is_nsfw": False},
+        work_tags=[],
+        bookmark_tags=None,
+        page_count=len(statuses),
+        images=[_image_entry(status) for status in statuses],
+    )
+
+
+def _manifest(*works: WorkEntry) -> Manifest:
+    return Manifest(
+        schema_version=1,
+        generated_at="",
+        source={},
+        works=list(works),
+    )
 
 
 def test_output_dir_is_coerced_to_path() -> None:
@@ -105,6 +143,7 @@ def test_run_summary_defaults_are_zero() -> None:
     assert summary.works_total == 0
     assert summary.works_succeeded == 0
     assert summary.works_failed == 0
+    assert summary.works_skipped == 0
     assert summary.files_downloaded == 0
     assert summary.files_skipped == 0
     assert summary.files_failed == 0
@@ -115,6 +154,10 @@ def test_run_summary_defaults_are_zero() -> None:
     "summary, expected",
     [
         (RunSummary(works_total=0), ExitCode.NO_BOOKMARKS),
+        (
+            RunSummary(works_total=0, works_skipped=3),
+            ExitCode.SUCCESS,
+        ),
         (
             RunSummary(works_total=5, works_succeeded=5, files_downloaded=5),
             ExitCode.SUCCESS,
@@ -138,6 +181,7 @@ def test_following_run_summary_defaults() -> None:
     assert summary.works_total == 0
     assert summary.works_succeeded == 0
     assert summary.works_failed == 0
+    assert summary.works_skipped == 0
     assert summary.files_downloaded == 0
     assert summary.files_skipped == 0
     assert summary.files_failed == 0
@@ -230,6 +274,10 @@ def test_following_config_max_users_zero_is_rejected(tmp_path: Path) -> None:
     [
         (FollowingRunSummary(works_total=0), ExitCode.NO_BOOKMARKS),
         (
+            FollowingRunSummary(works_total=0, works_skipped=4),
+            ExitCode.SUCCESS,
+        ),
+        (
             FollowingRunSummary(works_total=2, works_succeeded=2, files_downloaded=2),
             ExitCode.SUCCESS,
         ),
@@ -247,6 +295,57 @@ def test_decide_exit_code_following_table(
     summary: FollowingRunSummary, expected: ExitCode
 ) -> None:
     assert decide_exit_code(summary) == expected
+
+
+def test_skip_scanned_defaults_to_false(tmp_path: Path) -> None:
+    assert BackupConfig(output_dir=tmp_path).skip_scanned is False
+    assert FollowingConfig(output_dir=tmp_path).skip_scanned is False
+
+
+def test_skip_scanned_rejects_non_bool(tmp_path: Path) -> None:
+    bad: bool = "yes"  # type: ignore[assignment]
+    with pytest.raises(TypeError):
+        BackupConfig(output_dir=tmp_path, skip_scanned=bad)
+    with pytest.raises(TypeError):
+        FollowingConfig(output_dir=tmp_path, skip_scanned=bad)
+
+
+def test_skippable_work_ids_empty_manifest_is_empty_set() -> None:
+    assert skippable_work_ids(_manifest()) == set()
+
+
+def test_skippable_work_ids_includes_work_with_no_failed_images() -> None:
+    manifest = _manifest(_work_entry(100, [ImageStatus.DOWNLOADED.value]))
+    assert skippable_work_ids(manifest) == {100}
+
+
+def test_skippable_work_ids_excludes_work_with_a_failed_image() -> None:
+    manifest = _manifest(
+        _work_entry(
+            200,
+            [ImageStatus.DOWNLOADED.value, ImageStatus.FAILED.value],
+        )
+    )
+    assert skippable_work_ids(manifest) == set()
+
+
+def test_skippable_work_ids_includes_mixed_non_failed_statuses() -> None:
+    manifest = _manifest(
+        _work_entry(
+            300,
+            [ImageStatus.DOWNLOADED.value, ImageStatus.SKIPPED.value],
+        )
+    )
+    assert skippable_work_ids(manifest) == {300}
+
+
+def test_skippable_work_ids_mixed_manifest_keeps_only_clean_works() -> None:
+    manifest = _manifest(
+        _work_entry(1, [ImageStatus.DOWNLOADED.value]),
+        _work_entry(2, [ImageStatus.FAILED.value]),
+        _work_entry(3, [ImageStatus.SKIPPED.value, ImageStatus.DOWNLOADED.value]),
+    )
+    assert skippable_work_ids(manifest) == {1, 3}
 
 
 @pytest.mark.parametrize(

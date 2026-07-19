@@ -301,10 +301,26 @@ def cli() -> None:
     help="Only back up works posted on or after this date (the work's post date).",
 )
 @click.option(
-    "--skip-existing/--no-skip-existing",
+    "--skip-existing-files/--no-skip-existing-files",
+    "skip_existing",
     default=True,
     show_default=True,
-    help="Skip files already present on disk (re-run safe), or re-download them.",
+    help=(
+        "Skip image files already present on disk (re-run safe), or "
+        "re-download them. File-level only; use --skip-scanned to skip "
+        "re-scanning whole works."
+    ),
+)
+@click.option(
+    "--skip-scanned/--no-skip-scanned",
+    default=False,
+    show_default=True,
+    help=(
+        "Skip works already recorded (with no failed images) in the "
+        "existing details.json, without re-fetching or pacing them (much "
+        "faster on re-runs; may miss newly added pages/metadata on those "
+        "works)."
+    ),
 )
 @click.option(
     "--metadata-only",
@@ -351,7 +367,8 @@ def cli() -> None:
         "Client-side rate limit: minimum seconds from one work to the next, "
         "measured start-to-start (a work is one post and its images, not a "
         "single HTTP request). A work that already took longer is not "
-        "delayed. Default 0 disables pacing."
+        "delayed. Also sets the pause between bookmark/following listing "
+        "pages. Default 0 disables pacing (including between listing pages)."
     ),
 )
 @click.option(
@@ -370,6 +387,7 @@ def backup(
     limit: int | None,
     since: datetime.date | None,
     skip_existing: bool,
+    skip_scanned: bool,
     metadata_only: bool,
     json_output: bool,
     quiet: bool,
@@ -448,6 +466,7 @@ def backup(
         limit=limit,
         since=since,
         skip_existing=skip_existing,
+        skip_scanned=skip_scanned,
         metadata_only=metadata_only,
         json_output=json_output,
         verbosity=verbose,
@@ -486,7 +505,9 @@ def backup(
     # Constructed after _warn so the client can surface an unparsable-next_url
     # diagnostic (Pixiv said there's more data but we can't reach it) through
     # the same stderr warning path used elsewhere in this command.
-    client = Pixivpy3Client(warn=_warn)
+    # delay= wires --time-per-request into listing pagination too: the same flag
+    # that paces per-work fetches also sets the pause between listing pages.
+    client = Pixivpy3Client(delay=time_per_request, warn=_warn)
 
     try:
         try:
@@ -539,6 +560,7 @@ def _emit_summary(
             "works_total": summary.works_total,
             "works_succeeded": summary.works_succeeded,
             "works_failed": summary.works_failed,
+            "works_skipped": summary.works_skipped,
             "files_downloaded": summary.files_downloaded,
             "files_skipped": summary.files_skipped,
             "files_failed": summary.files_failed,
@@ -553,8 +575,9 @@ def _emit_summary(
     verb = "Would back up" if config.dry_run else "Backed up"
     click.echo(
         f"{verb} {summary.works_succeeded}/{summary.works_total} works "
-        f"({summary.works_failed} failed), {summary.files_downloaded} files "
-        f"to {config.output_dir}"
+        f"({summary.works_failed} failed), "
+        f"{summary.works_skipped} skipped (already scanned), "
+        f"{summary.files_downloaded} files to {config.output_dir}"
     )
 
 
@@ -634,10 +657,26 @@ def _emit_summary(
     help="Only back up works posted on or after this date (the work's post date).",
 )
 @click.option(
-    "--skip-existing/--no-skip-existing",
+    "--skip-existing-files/--no-skip-existing-files",
+    "skip_existing",
     default=True,
     show_default=True,
-    help="Skip files already present on disk (re-run safe), or re-download them.",
+    help=(
+        "Skip image files already present on disk (re-run safe), or "
+        "re-download them. File-level only; use --skip-scanned to skip "
+        "re-scanning whole works."
+    ),
+)
+@click.option(
+    "--skip-scanned/--no-skip-scanned",
+    default=False,
+    show_default=True,
+    help=(
+        "Skip works already recorded (with no failed images) in the "
+        "existing details.json, without re-fetching or pacing them (much "
+        "faster on re-runs; may miss newly added pages/metadata on those "
+        "works)."
+    ),
 )
 @click.option(
     "--metadata-only",
@@ -684,7 +723,8 @@ def _emit_summary(
         "Client-side rate limit: minimum seconds from one work to the next, "
         "measured start-to-start (a work is one post and its images, not a "
         "single HTTP request). A work that already took longer is not "
-        "delayed. Default 0 disables pacing."
+        "delayed. Also sets the pause between bookmark/following listing "
+        "pages. Default 0 disables pacing (including between listing pages)."
     ),
 )
 @click.option(
@@ -706,6 +746,7 @@ def backup_following(
     exclude: tuple[str, ...],
     since: datetime.date | None,
     skip_existing: bool,
+    skip_scanned: bool,
     metadata_only: bool,
     json_output: bool,
     quiet: bool,
@@ -792,6 +833,7 @@ def backup_following(
         exclude=exclude,
         since=since,
         skip_existing=skip_existing,
+        skip_scanned=skip_scanned,
         metadata_only=metadata_only,
         json_output=json_output,
         verbosity=verbose,
@@ -843,7 +885,9 @@ def backup_following(
     # Constructed after _warn so the client can surface an unparsable-next_url
     # diagnostic (Pixiv said there's more data but we can't reach it) through
     # the same stderr warning path used elsewhere in this command.
-    client = Pixivpy3Client(warn=_warn)
+    # delay= wires --time-per-request into listing pagination too: the same flag
+    # that paces per-work fetches also sets the pause between listing pages.
+    client = Pixivpy3Client(delay=time_per_request, warn=_warn)
 
     try:
         try:
@@ -901,6 +945,7 @@ def _emit_following_summary(
             "works_total": summary.works_total,
             "works_succeeded": summary.works_succeeded,
             "works_failed": summary.works_failed,
+            "works_skipped": summary.works_skipped,
             "files_downloaded": summary.files_downloaded,
             "files_skipped": summary.files_skipped,
             "files_failed": summary.files_failed,
@@ -915,7 +960,8 @@ def _emit_following_summary(
     verb = "Would back up" if config.dry_run else "Backed up"
     click.echo(
         f"{verb} {summary.works_succeeded}/{summary.works_total} works "
-        f"({summary.works_failed} failed) from "
+        f"({summary.works_failed} failed), "
+        f"{summary.works_skipped} skipped (already scanned), from "
         f"{summary.users_with_works}/{summary.users_total} users, "
         f"{summary.files_downloaded} files to {config.output_dir}"
     )

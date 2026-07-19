@@ -161,8 +161,9 @@ class Pixivpy3Client:
     All Pixiv interaction funnels through this class. The underlying ``api``,
     the ``sleep`` function, and the ``rand`` jitter source are injectable so
     tests can run fully offline and deterministically. ``delay`` is the
-    politeness pause (seconds) taken between bookmark pages while paginating;
-    ``rand`` supplies jitter for ``_fetch_page``'s recovery backoff.
+    politeness pause (seconds) taken between listing pages while paginating
+    (bookmarks, following, and user works); ``rand`` supplies jitter for
+    ``_fetch_page``'s recovery backoff.
 
     When no ``api`` is injected, the default :class:`~pixivpy3.AppPixivAPI` is
     constructed with :data:`DEFAULT_TIMEOUT`, which ``pixivpy3`` forwards to

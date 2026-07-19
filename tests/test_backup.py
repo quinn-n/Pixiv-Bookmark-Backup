@@ -1228,3 +1228,245 @@ def test_unavailable_work_still_emits_work_event(
     assert event.files_downloaded == 0
     # No WORK_PLANNED for a non-dry unavailable work.
     assert not any(e.kind == ProgressKind.WORK_PLANNED for e in events)
+
+
+# -- skip-scanned -------------------------------------------------------
+
+
+def _seed_manifest(
+    output_dir: Path, work_ids: list[int], *, failed_ids: frozenset[int] = frozenset()
+) -> None:
+    """Write a valid schema-1 ``details.json`` containing ``work_ids``.
+
+    A work whose id is in ``failed_ids`` gets one ``"failed"`` image (so it is
+    *not* skippable and a resumed run retries it); the rest get one
+    ``"downloaded"`` image (skippable under ``--skip-scanned``).
+    """
+
+    works: list[dict[str, object]] = []
+    for wid in work_ids:
+        status = "failed" if wid in failed_ids else "downloaded"
+        works.append(
+            {
+                "id": wid,
+                "type": "illust",
+                "title": "Old Work",
+                "author": {"id": 7, "name": "Artist", "account": "artist_acct"},
+                "posted_at": "2023-01-01T00:00:00+09:00",
+                "nsfw": {"x_restrict": 0, "sanity_level": 2, "is_nsfw": False},
+                "work_tags": [],
+                "bookmark_tags": None,
+                "page_count": 1,
+                "images": [
+                    {
+                        "page": 0,
+                        "source_url": f"https://i.pximg.net/{wid}_p0.jpg",
+                        "path": f"{wid}_p0.jpg",
+                        "status": status,
+                        "bytes": None if status == "failed" else 99,
+                        "error": "boom" if status == "failed" else None,
+                    }
+                ],
+            }
+        )
+    manifest = {
+        "schema_version": 1,
+        "generated_at": "2026-01-01T00:00:00+00:00",
+        "source": {"user_id": SELF_ID, "visibility": "public"},
+        "works": works,
+        "errors": [],
+    }
+    (output_dir / "details.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def test_skip_scanned_skips_recorded_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One of three works is already recorded; --skip-scanned skips only it.
+
+    The skipped work is not fetched, not paced, and absent from the flushed
+    manifest's freshly backed-up works, while ``works_skipped`` counts it and a
+    WORK_SKIPPED event is emitted.
+    """
+    calls = _patch_downloads(monkeypatch)
+    _seed_manifest(tmp_path, [200])
+    works = {"public": [_make_work(wid, pages=1) for wid in (100, 200, 300)]}
+    client = FakePixivClient(works)
+
+    events: list[ProgressEvent] = []
+    sleep = SpySleep()
+    summary = run(
+        _config(tmp_path, skip_scanned=True, time_per_request=0.5),
+        _auth(),
+        client,
+        progress=events.append,
+        clock=lambda: FIXED_CLOCK,
+        monotonic=ScriptedMonotonic([0.0, 0.2, 0.5]),
+        sleep=sleep,
+    )
+
+    assert summary.works_skipped == 1
+    assert summary.works_total == 2
+    assert decide_exit_code(summary) is ExitCode.SUCCESS
+    # The skipped work is never fetched.
+    assert calls["images"] == [
+        ("https://i.pximg.net/100_p0.jpg", tmp_path / "100_p0.jpg"),
+        ("https://i.pximg.net/300_p0.jpg", tmp_path / "300_p0.jpg"),
+    ]
+    # The pacer ticked only for the two processed works (not the skipped one):
+    # tick1 reads 0.0 (no sleep), tick2 reads 0.2 -> one deficit sleep of 0.3.
+    # A tick for the skipped work would have consumed a third monotonic reading.
+    assert sleep.durations == [pytest.approx(0.3)]
+    # Exactly one WORK_SKIPPED event, naming the skipped work.
+    skipped = [e for e in events if e.kind == ProgressKind.WORK_SKIPPED]
+    assert len(skipped) == 1
+    assert skipped[0].work_id == 200
+    assert "already scanned" in (skipped[0].line or "")
+    # The skipped work is absent from the freshly backed-up works, but the
+    # resume merge preserves its prior entry, so it is still in the manifest.
+    manifest = _read_manifest(tmp_path)
+    fresh_ids = {
+        work["id"]
+        for work in manifest["works"]
+        if work["images"][0]["source_url"].startswith("https://i.pximg.net/")
+        and work["images"][0]["bytes"] == 10
+    }
+    assert fresh_ids == {100, 300}
+    # The prior entry for the skipped work survives via the resume merge.
+    assert {work["id"] for work in manifest["works"]} == {100, 200, 300}
+
+
+def test_skip_scanned_off_never_skips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default (skip_scanned=False) processes every work even if pre-recorded."""
+    calls = _patch_downloads(monkeypatch)
+    _seed_manifest(tmp_path, [100, 200, 300])
+    works = {"public": [_make_work(wid, pages=1) for wid in (100, 200, 300)]}
+    client = FakePixivClient(works)
+
+    summary = _run(_config(tmp_path), client)
+
+    assert summary.works_skipped == 0
+    assert summary.works_total == 3
+    assert len(calls["images"]) == 3
+
+
+def test_skip_scanned_retries_work_with_failed_image(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A recorded work with a failed image is not skippable and is retried."""
+    calls = _patch_downloads(monkeypatch)
+    _seed_manifest(tmp_path, [100, 200], failed_ids=frozenset({200}))
+    works = {"public": [_make_work(wid, pages=1) for wid in (100, 200)]}
+    client = FakePixivClient(works)
+
+    summary = _run(_config(tmp_path, skip_scanned=True), client)
+
+    # 100 skipped (clean prior), 200 retried (had a failed image).
+    assert summary.works_skipped == 1
+    assert summary.works_total == 1
+    assert calls["images"] == [
+        ("https://i.pximg.net/200_p0.jpg", tmp_path / "200_p0.jpg"),
+    ]
+
+
+def test_skip_scanned_does_not_consume_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Skips are keyed off ``works_total``, so they do not eat the --limit budget."""
+    _patch_downloads(monkeypatch)
+    # 100 is already recorded (skippable); --limit 2 must still process 200, 300.
+    _seed_manifest(tmp_path, [100])
+    works = {"public": [_make_work(wid, pages=1) for wid in (100, 200, 300)]}
+    client = FakePixivClient(works)
+
+    summary = _run(_config(tmp_path, skip_scanned=True, limit=2), client)
+
+    assert summary.works_skipped == 1
+    assert summary.works_total == 2
+    manifest = _read_manifest(tmp_path)
+    fresh_ids = {
+        work["id"] for work in manifest["works"] if work["images"][0]["bytes"] == 10
+    }
+    assert fresh_ids == {200, 300}
+
+
+def test_skip_scanned_dry_run_loads_manifest_previews_without_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """dry-run + skip-scanned reads the manifest to preview skips, writes nothing.
+
+    A skippable work yields a WORK_SKIPPED event (not a WORK_PLANNED "would
+    create" line), and no manifest / .bak is written.
+    """
+    _patch_downloads(monkeypatch)
+    _seed_manifest(tmp_path, [200])
+    before = (tmp_path / "details.json").read_text(encoding="utf-8")
+    works = {"public": [_make_work(wid, pages=1) for wid in (100, 200)]}
+    client = FakePixivClient(works)
+
+    events: list[ProgressEvent] = []
+    summary = run(
+        _config(tmp_path, dry_run=True, skip_scanned=True),
+        _auth(),
+        client,
+        progress=events.append,
+        clock=lambda: FIXED_CLOCK,
+    )
+
+    assert summary.works_skipped == 1
+    # The skippable work previews as a skip, not a "would create" plan.
+    skipped_ids = {e.work_id for e in events if e.kind == ProgressKind.WORK_SKIPPED}
+    planned_ids = {e.work_id for e in events if e.kind == ProgressKind.WORK_PLANNED}
+    assert skipped_ids == {200}
+    assert planned_ids == {100}
+    # Nothing written: the on-disk manifest is untouched and no .bak was made.
+    assert (tmp_path / "details.json").read_text(encoding="utf-8") == before
+    assert not (tmp_path / "details.json.bak").exists()
+
+
+def test_dry_run_without_skip_scanned_never_loads_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """dry-run without --skip-scanned must not even read the manifest (spy)."""
+    _patch_downloads(monkeypatch)
+
+    def _boom(_path: Path) -> tuple[Any, bool]:
+        raise AssertionError("manifest must not be loaded in a plain dry-run")
+
+    monkeypatch.setattr(backup, "load_or_init", _boom)
+
+    works = {"public": [_make_work(100, pages=1)]}
+    client = FakePixivClient(works)
+
+    summary = run(
+        _config(tmp_path, dry_run=True),
+        _auth(),
+        client,
+        clock=lambda: FIXED_CLOCK,
+    )
+
+    assert summary.works_total == 1
+
+
+def test_skip_scanned_dry_run_corrupt_manifest_fails_loud(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """dry-run + skip-scanned still fails loud on a corrupt manifest, untouched."""
+    _patch_downloads(monkeypatch)
+    details = tmp_path / "details.json"
+    details.write_text("this is not json {{{", encoding="utf-8")
+    works = {"public": [_make_work(100, pages=1)]}
+    client = FakePixivClient(works)
+
+    with pytest.raises(ManifestLoadError):
+        run(
+            _config(tmp_path, dry_run=True, skip_scanned=True),
+            _auth(),
+            client,
+            clock=lambda: FIXED_CLOCK,
+        )
+
+    assert details.read_text(encoding="utf-8") == "this is not json {{{"
+    assert not (tmp_path / "details.json.bak").exists()

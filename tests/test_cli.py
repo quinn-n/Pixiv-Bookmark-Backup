@@ -268,7 +268,10 @@ def test_success_human_summary_via_scripted_run(
     )
 
     assert result.exit_code == 0, result.output
-    assert "Backed up 3/3 works (0 failed), 5 files" in result.stdout
+    assert (
+        "Backed up 3/3 works (0 failed), 0 skipped (already scanned), 5 files"
+        in result.stdout
+    )
 
 
 # -- exit 2: usage errors ----------------------------------------------
@@ -435,7 +438,7 @@ def test_partial_run_is_exit_6(
     )
 
     assert result.exit_code == 6
-    assert "(1 failed)" in result.stdout
+    assert "(1 failed), 0 skipped (already scanned)" in result.stdout
 
 
 # -- --json -------------------------------------------------------------
@@ -1079,6 +1082,223 @@ def test_time_per_request_absent_from_json_payload(
     # The summary schema is unchanged: the pacing knob is not a JSON field.
     assert payload["schema"] == 1
     assert "time_per_request" not in payload
+
+
+def _capture_client_kwargs(
+    monkeypatch: pytest.MonkeyPatch, captured: dict[str, Any]
+) -> None:
+    """Record the kwargs ``cli`` uses to construct ``Pixivpy3Client``.
+
+    The command builds the client before calling the orchestrator, so pairing
+    this with ``_install_run`` (a no-op orchestrator) lets a test assert on how
+    the client was constructed without any network work.
+    """
+
+    def factory(*_args: Any, **kwargs: Any) -> FakePixivClient:
+        captured["kwargs"] = kwargs
+        # The paired no-op orchestrator never touches this client; the empty
+        # work map only satisfies the constructor.
+        return FakePixivClient({})
+
+    monkeypatch.setattr(cli_module, "Pixivpy3Client", factory)
+
+
+def test_time_per_request_wires_into_client_delay(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, Any] = {}
+    _capture_client_kwargs(monkeypatch, captured)
+    _install_run(monkeypatch, summary=RunSummary(works_total=1, works_succeeded=1))
+
+    result = runner.invoke(
+        cli,
+        [
+            "backup",
+            "--time-per-request",
+            "2.5",
+            "--config",
+            _missing_config(tmp_path),
+        ],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["kwargs"]["delay"] == 2.5
+
+
+def test_time_per_request_default_gives_client_delay_zero(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Confirms the intentional behavior change: the CLI-constructed client's
+    # pagination delay is now 0.0 by default, not the old hardcoded 0.5.
+    captured: dict[str, Any] = {}
+    _capture_client_kwargs(monkeypatch, captured)
+    _install_run(monkeypatch, summary=RunSummary(works_total=1, works_succeeded=1))
+
+    result = runner.invoke(
+        cli,
+        ["backup", "--config", _missing_config(tmp_path)],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["kwargs"]["delay"] == 0.0
+
+
+def test_time_per_request_help_mentions_listing_pages(runner: CliRunner) -> None:
+    result = runner.invoke(cli, ["backup", "--help"])
+    assert result.exit_code == 0
+    assert "listing" in result.output
+
+
+# -- --skip-existing-files rename / --skip-scanned ----------------------
+
+
+@pytest.mark.parametrize(
+    ("flag", "expected"),
+    [("--skip-existing-files", True), ("--no-skip-existing-files", False)],
+)
+def test_skip_existing_files_flag_plumbs_into_config(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    flag: str,
+    expected: bool,
+) -> None:
+    captured: dict[str, Any] = {}
+    _install_run(
+        monkeypatch,
+        summary=RunSummary(works_total=1, works_succeeded=1),
+        captured=captured,
+    )
+
+    result = runner.invoke(
+        cli,
+        ["backup", flag, "--config", _missing_config(tmp_path)],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["config"].skip_existing is expected
+
+
+@pytest.mark.parametrize("flag", ["--skip-existing", "--no-skip-existing"])
+def test_old_skip_existing_spelling_is_removed(
+    runner: CliRunner, tmp_path: Path, flag: str
+) -> None:
+    result = runner.invoke(
+        cli,
+        ["backup", flag, "--config", _missing_config(tmp_path)],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 2
+    assert "No such option" in result.output
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (["--skip-scanned"], True),
+        (["--no-skip-scanned"], False),
+        ([], False),
+    ],
+)
+def test_skip_scanned_flag_plumbs_into_config(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    args: list[str],
+    expected: bool,
+) -> None:
+    captured: dict[str, Any] = {}
+    _install_run(
+        monkeypatch,
+        summary=RunSummary(works_total=1, works_succeeded=1),
+        captured=captured,
+    )
+
+    result = runner.invoke(
+        cli,
+        ["backup", *args, "--config", _missing_config(tmp_path)],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["config"].skip_scanned is expected
+
+
+def test_works_skipped_in_json_payload(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_run(
+        monkeypatch,
+        summary=RunSummary(works_total=2, works_succeeded=2, works_skipped=3),
+    )
+
+    result = runner.invoke(
+        cli,
+        ["backup", "--json", "--config", _missing_config(tmp_path)],
+        env=_token_env(),
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    # Additive-only change: the new counter appears without bumping the schema.
+    assert payload["schema"] == 1
+    assert payload["works_skipped"] == 3
+
+
+def test_works_skipped_in_human_summary(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_run(
+        monkeypatch,
+        summary=RunSummary(
+            works_total=5, works_succeeded=2, works_failed=1, works_skipped=2
+        ),
+    )
+
+    result = runner.invoke(
+        cli,
+        ["backup", "--config", _missing_config(tmp_path)],
+        env=_token_env(),
+    )
+
+    assert "(1 failed), 2 skipped (already scanned)" in result.stdout
+
+
+def test_help_shows_renamed_and_new_flags(runner: CliRunner) -> None:
+    result = runner.invoke(cli, ["backup", "--help"])
+
+    assert result.exit_code == 0
+    assert "--skip-existing-files" in result.output
+    assert "--no-skip-existing-files" in result.output
+    assert "--skip-scanned" in result.output
+    assert "--no-skip-scanned" in result.output
+    # The old bare spelling is gone. Click renders the pair positive-form first
+    # with spaces around the slash, so a restored "--skip-existing" would put
+    # the token "--skip-existing " (trailing space) back on the options line;
+    # the renamed flag renders "--skip-existing-files" (next char "-"), so the
+    # trailing-space token is the discriminating one.
+    assert "--skip-existing " not in result.output
+
+    # Assert against the actual parsed option definitions too, not just the
+    # rendered --help text, so this doesn't depend on click's help-formatting
+    # conventions (e.g. the trailing-space discriminator above).
+    backup_params = {p.name for p in cli.commands["backup"].params}
+    assert "skip_existing" in backup_params
+    assert "skip_scanned" in backup_params
+    all_opts = {
+        opt
+        for p in cli.commands["backup"].params
+        for opt in getattr(p, "opts", []) + getattr(p, "secondary_opts", [])
+    }
+    assert "--skip-existing-files" in all_opts
+    assert "--no-skip-existing-files" in all_opts
+    assert "--skip-scanned" in all_opts
+    assert "--no-skip-scanned" in all_opts
+    assert "--skip-existing" not in all_opts
 
 
 # -- resume manifest: corrupt fails loud, schema mismatch warns ---------

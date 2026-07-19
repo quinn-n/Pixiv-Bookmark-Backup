@@ -47,6 +47,7 @@ from pixiv_bookmark_backup.core import (
     ProgressKind,
     RequestPacer,
     RunSummary,
+    skippable_work_ids,
 )
 from pixiv_bookmark_backup.downloader import download_image
 from pixiv_bookmark_backup.manifest import (
@@ -249,6 +250,34 @@ def _work_planned_event(
     )
 
 
+def _work_skipped_event(
+    work: BookmarkWork,
+    *,
+    line: str,
+    index: int,
+    user_id: str | None = None,
+    users_total: int = 0,
+) -> ProgressEvent:
+    """Build a :attr:`ProgressKind.WORK_SKIPPED` event for an already-scanned work.
+
+    Emitted under ``--skip-scanned`` when a work is already fully recorded in the
+    existing manifest and is skipped without any fetch. Mirrors :func:`_work_event`
+    so the two loops (plain / following) construct it consistently; ``user_id`` /
+    ``users_total`` default to the plain-backup values.
+    """
+
+    return ProgressEvent(
+        kind=ProgressKind.WORK_SKIPPED,
+        index=index,
+        work_id=work.id,
+        title=work.title,
+        page_count=work.page_count,
+        user_id=user_id,
+        users_total=users_total,
+        line=line,
+    )
+
+
 def _tally_status(
     status: ImageStatus | str,
     bytes_: int | None,
@@ -292,6 +321,7 @@ class _Counters:
         self.works_total = 0
         self.works_succeeded = 0
         self.works_failed = 0
+        self.works_skipped = 0
         self.files_downloaded = 0
         self.files_skipped = 0
         self.files_failed = 0
@@ -304,6 +334,7 @@ class _Counters:
             works_total=self.works_total,
             works_succeeded=self.works_succeeded,
             works_failed=self.works_failed,
+            works_skipped=self.works_skipped,
             files_downloaded=self.files_downloaded,
             files_skipped=self.files_skipped,
             files_failed=self.files_failed,
@@ -333,6 +364,7 @@ class _FollowingCounters(_Counters):
             works_total=self.works_total,
             works_succeeded=self.works_succeeded,
             works_failed=self.works_failed,
+            works_skipped=self.works_skipped,
             files_downloaded=self.files_downloaded,
             files_skipped=self.files_skipped,
             files_failed=self.files_failed,
@@ -594,8 +626,17 @@ def run(
     # ``existing is not None`` guards below double as the not-dry-run guard).
     existing: Manifest | None = None
     schema_mismatch = False
-    if not config.dry_run:
+    # Load the manifest read-only when NOT dry-run (to resume/flush) OR when
+    # --skip-scanned needs the prior manifest to compute the skippable set and
+    # preview skips; a dry-run + --skip-scanned reads but never writes.
+    if not config.dry_run or config.skip_scanned:
         existing, schema_mismatch = _preflight_manifest(config.output_dir)
+
+    skippable: frozenset[int] = (
+        frozenset(skippable_work_ids(existing))
+        if config.skip_scanned and existing is not None
+        else frozenset()
+    )
 
     self_id = client.authenticate(auth.refresh_token)
     target = config.user_id if config.user_id is not None else self_id
@@ -613,7 +654,15 @@ def run(
 
     try:
         _iterate_and_process(
-            config, client, target, counters, works, errors, progress, pacer
+            config,
+            client,
+            target,
+            counters,
+            works,
+            errors,
+            progress,
+            pacer,
+            skippable,
         )
     except ApiError as err:
         if counters.works_total == 0:
@@ -626,7 +675,11 @@ def run(
         counters.works_failed += 1
     except KeyboardInterrupt:
         # Flush whatever was gathered before re-raising (CLI -> exit 130).
-        if existing is not None:
+        if not config.dry_run:
+            # A non-dry run always loaded the manifest above, so ``existing`` is
+            # set; the assert both records that invariant and narrows the
+            # Optional for Pyright (which cannot infer it from ``not dry_run``).
+            assert existing is not None
             _flush_manifest(
                 config,
                 str(target),
@@ -639,7 +692,8 @@ def run(
             )
         raise
 
-    if existing is not None:
+    if not config.dry_run:
+        assert existing is not None
         _flush_manifest(
             config, str(target), works, errors, clock, existing, schema_mismatch, warn
         )
@@ -656,6 +710,7 @@ def _iterate_and_process(
     errors: list[dict[str, Any]],
     progress: Callable[[ProgressEvent], None],
     pacer: RequestPacer,
+    skippable: frozenset[int],
 ) -> None:
     """Iterate bookmarks across the visibility passes and process each work.
 
@@ -691,6 +746,17 @@ def _iterate_and_process(
                         "work_id": work.id,
                         "reason": "work unavailable (no downloadable pages)",
                     }
+                )
+                continue
+
+            if config.skip_scanned and work.id in skippable:
+                counters.works_skipped += 1
+                progress(
+                    _work_skipped_event(
+                        work,
+                        line=f"skipped {work.id}: already scanned",
+                        index=index,
+                    )
                 )
                 continue
 
@@ -788,8 +854,17 @@ def run_following(
     # as not-dry-run.
     existing: Manifest | None = None
     schema_mismatch = False
-    if not config.dry_run:
+    # Load the manifest read-only when NOT dry-run (to resume/flush) OR when
+    # --skip-scanned needs the prior manifest to compute the skippable set and
+    # preview skips; a dry-run + --skip-scanned reads but never writes.
+    if not config.dry_run or config.skip_scanned:
         existing, schema_mismatch = _preflight_manifest(config.output_dir)
+
+    skippable: frozenset[int] = (
+        frozenset(skippable_work_ids(existing))
+        if config.skip_scanned and existing is not None
+        else frozenset()
+    )
 
     self_id = client.authenticate(auth.refresh_token)
 
@@ -823,6 +898,7 @@ def run_following(
             errors,
             progress,
             pacer,
+            skippable,
         )
     except ApiError as err:
         if counters.works_total == 0:
@@ -834,13 +910,18 @@ def run_following(
         counters.works_failed += 1
         truncated = True
     except KeyboardInterrupt:
-        if existing is not None:
+        if not config.dry_run:
+            # A non-dry run always loaded the manifest above, so ``existing`` is
+            # set; the assert both records that invariant and narrows the
+            # Optional for Pyright (which cannot infer it from ``not dry_run``).
+            assert existing is not None
             _flush_following_manifest(
                 config, self_id, works, errors, clock, existing, schema_mismatch, warn
             )
         raise
 
-    if existing is not None:
+    if not config.dry_run:
+        assert existing is not None
         _flush_following_manifest(
             config, self_id, works, errors, clock, existing, schema_mismatch, warn
         )
@@ -864,6 +945,7 @@ def _iterate_following(
     errors: list[dict[str, Any]],
     progress: Callable[[ProgressEvent], None],
     pacer: RequestPacer,
+    skippable: frozenset[int],
 ) -> bool:
     """Iterate followed users across the follow passes and process each.
 
@@ -920,7 +1002,7 @@ def _iterate_following(
             )
 
             if _process_following_user(
-                config, client, uid, counters, works, errors, progress, pacer
+                config, client, uid, counters, works, errors, progress, pacer, skippable
             ):
                 return True
 
@@ -971,6 +1053,7 @@ def _process_following_user(
     errors: list[dict[str, Any]],
     progress: Callable[[ProgressEvent], None],
     pacer: RequestPacer,
+    skippable: frozenset[int],
 ) -> bool:
     """Back up one followed user's works; return whether to stop the whole run.
 
@@ -1022,6 +1105,22 @@ def _process_following_user(
                         "work_id": work.id,
                         "reason": "work unavailable (no downloadable pages)",
                     }
+                )
+                continue
+
+            if config.skip_scanned and work.id in skippable:
+                # A skipped work consumes neither the per-user budget nor marks
+                # the user as contributing (both handled after this block), so an
+                # all-skipped user is correctly recorded as contributing nothing.
+                counters.works_skipped += 1
+                progress(
+                    _work_skipped_event(
+                        work,
+                        line=f"skipped {work.id}: already scanned",
+                        index=index,
+                        user_id=uid,
+                        users_total=counters.users_total,
+                    )
                 )
                 continue
 

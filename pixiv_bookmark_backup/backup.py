@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import os
 import time
+
+import attrs
 import unicodedata
 from collections.abc import Callable
 from datetime import date, datetime, timezone
@@ -640,6 +642,7 @@ def run(
 
     self_id = client.authenticate(auth.refresh_token)
     target = config.user_id if config.user_id is not None else self_id
+    own_bookmarks = str(target) == str(self_id)
 
     if config.visibility in ("private", "all") and str(target) != str(self_id):
         raise BackupUsageError(
@@ -663,6 +666,7 @@ def run(
             progress,
             pacer,
             skippable,
+            own_bookmarks,
         )
     except ApiError as err:
         if counters.works_total == 0:
@@ -711,13 +715,17 @@ def _iterate_and_process(
     progress: Callable[[ProgressEvent], None],
     pacer: RequestPacer,
     skippable: frozenset[int],
+    own_bookmarks: bool,
 ) -> None:
     """Iterate bookmarks across the visibility passes and process each work.
 
     Maintains a running index across passes, applies ``--limit`` (stop once
     ``works_total`` reaches it) and ``--since``, and appends recorded works /
-    errors plus per-file tallies into the shared accumulators. ``ApiError`` and
-    ``KeyboardInterrupt`` propagate to :func:`run`, which owns recovery.
+    errors plus per-file tallies into the shared accumulators. When
+    ``own_bookmarks`` is true, each processed (non-skipped, non-dry-run) work's
+    personal bookmark tags are fetched here, in the same paced step as its image
+    entries. ``ApiError`` and ``KeyboardInterrupt`` propagate to :func:`run`,
+    which owns recovery.
     """
 
     index = 0
@@ -777,6 +785,17 @@ def _iterate_and_process(
                     )
                 )
                 continue
+
+            if own_bookmarks:
+                # Fold the personal-bookmark-tag fetch into this same paced,
+                # post-skip-check step rather than eager-fetching it during
+                # listing: it must come AFTER the --skip-scanned check so skipped
+                # works incur no request, and it shares this work's single
+                # pacer.tick() (--time-per-request paces work-to-work, not
+                # per-HTTP-request), so no extra tick is taken here.
+                work = attrs.evolve(
+                    work, bookmark_tags=client.fetch_bookmark_tags(work.id)
+                )
 
             entries = _image_entries_for_work(config, client, work, counters)
             counters.works_total += 1

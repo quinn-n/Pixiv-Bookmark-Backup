@@ -129,6 +129,11 @@ class FakeFollowingClient:
         dest_path.write_bytes(data)
         return len(data)
 
+    def fetch_bookmark_tags(  # pragma: no cover
+        self, illust_id: int
+    ) -> list[str] | None:
+        raise NotImplementedError
+
 
 # Static guarantee the fake satisfies the public Protocol.
 _: type[PixivClient] = FakeFollowingClient

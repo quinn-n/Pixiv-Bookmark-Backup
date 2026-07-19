@@ -180,6 +180,9 @@ def test_skip_scanned_carries_forward_prior_entry_without_refetch(
 
     # The per-work fetch ran for C and never for A: the no-refetch contract.
     assert fetched_ids == [200]
+    # The personal bookmark-tag fetch is likewise skipped for A (own-account
+    # run): it only fires for the non-skipped work C, sharing C's paced step.
+    assert client.tag_fetch_calls == [200]
 
     after = _load(tmp_path)
     # (1) A's entry is identical to its pre-existing record (frozen ==).
@@ -362,6 +365,9 @@ class _CliFakePixivClient:
         data = b"fake-image-bytes"
         dest_path.write_bytes(data)
         return len(data)
+
+    def fetch_bookmark_tags(self, illust_id: int) -> list[str] | None:
+        return None
 
 
 # Static guarantee the CLI fake satisfies the public Protocol.

@@ -143,6 +143,9 @@ class FakePixivClient:
         dest_path.write_bytes(data)
         return len(data)
 
+    def fetch_bookmark_tags(self, illust_id: int) -> list[str] | None:
+        return None
+
 
 # Static guarantee the fake satisfies the public Protocol.
 _: type[PixivClient] = FakePixivClient

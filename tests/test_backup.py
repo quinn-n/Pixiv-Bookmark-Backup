@@ -109,13 +109,16 @@ class FakePixivClient:
         self_id: str = SELF_ID,
         raise_after: int | None = None,
         raise_exc: type[BaseException] | BaseException | None = None,
+        bookmark_tags_by_id: dict[int, list[str] | None] | None = None,
     ) -> None:
         self._works_by_restrict = works_by_restrict
         self._self_id = self_id
         self._raise_after = raise_after
         self._raise_exc = raise_exc
+        self._bookmark_tags_by_id = bookmark_tags_by_id or {}
         self.auth_calls: list[str] = []
         self.iter_calls: list[tuple[str, str]] = []
+        self.tag_fetch_calls: list[int] = []
 
     def authenticate(self, refresh_token: str) -> str:
         self.auth_calls.append(refresh_token)
@@ -157,6 +160,10 @@ class FakePixivClient:
         self, url: str, dest_path: Path, referer: str = "https://www.pixiv.net/"
     ) -> int:
         raise NotImplementedError
+
+    def fetch_bookmark_tags(self, illust_id: int) -> list[str] | None:
+        self.tag_fetch_calls.append(illust_id)
+        return self._bookmark_tags_by_id.get(illust_id)
 
 
 # Static guarantee the fake satisfies the public Protocol.
@@ -374,6 +381,122 @@ def test_pacing_only_fires_for_processed_works(
     # Exactly (processed - 1) sleeps: the filtered/unavailable/over-limit works
     # never called tick().
     assert sleep.durations == [pytest.approx(0.5), pytest.approx(0.5)]
+
+
+# -- personal bookmark tags: fetched per-work, paced, not during listing --
+
+
+def test_bookmark_tags_fetched_per_work_and_land_in_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Own-account run fetches each processed work's tags into the manifest.
+
+    ``fetch_bookmark_tags`` is called exactly once per processed work (own
+    account) and the returned tags appear on the flushed ``WorkEntry``. This is
+    the moved-fetch's success path: tags now populate in the per-work loop, not
+    during listing.
+    """
+    _patch_downloads(monkeypatch)
+    works = {"public": [_make_work(100, pages=1), _make_work(200, pages=1)]}
+    client = FakePixivClient(
+        works, bookmark_tags_by_id={100: ["favorite", "art"], 200: None}
+    )
+
+    summary = _run(_config(tmp_path), client)
+
+    assert summary.works_total == 2
+    assert client.tag_fetch_calls == [100, 200]
+    manifest = _read_manifest(tmp_path)
+    tags_by_id = {work["id"]: work["bookmark_tags"] for work in manifest["works"]}
+    assert tags_by_id == {100: ["favorite", "art"], 200: None}
+
+
+def test_bookmark_tag_fetch_shares_the_per_work_tick_no_extra_sleep(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tag fetch is folded into the existing per-work tick, adding no sleep.
+
+    Reuses the exact scripted-monotonic scenario from
+    ``test_pacing_sleeps_start_to_start_once_per_processed_work`` (three works,
+    period 0.5, one deficit sleep of ~0.3). Adding the per-work tag fetch must
+    NOT introduce a second tick/sleep: the sleep count and monotonic-read count
+    are identical to the tag-free pacing test.
+    """
+    _patch_downloads(monkeypatch)
+    works = {"public": [_make_work(wid, pages=1) for wid in (100, 200, 300)]}
+    client = FakePixivClient(
+        works, bookmark_tags_by_id={100: ["a"], 200: ["b"], 300: ["c"]}
+    )
+    monotonic = ScriptedMonotonic([0.0, 0.2, 0.5, 1.1])
+    sleep = SpySleep()
+
+    summary = _run_paced(
+        _config(tmp_path, time_per_request=0.5),
+        client,
+        monotonic=monotonic,
+        sleep=sleep,
+    )
+
+    assert summary.works_total == 3
+    assert client.tag_fetch_calls == [100, 200, 300]
+    # Identical to the tag-free pacing test: no second tick was introduced.
+    assert sleep.durations == [pytest.approx(0.3)]
+    assert monotonic.calls == 4
+
+
+def test_bookmark_tag_fetch_failure_degrades_to_none_and_continues(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A work whose tag fetch fails (returns None) is still recorded, run goes on.
+
+    ``fetch_bookmark_tags`` swallows both failure modes internally and returns
+    ``None`` for the offending work; the call site accepts that via
+    ``attrs.evolve`` and never aborts. The other work keeps its real tags.
+    """
+    _patch_downloads(monkeypatch)
+    works = {"public": [_make_work(100, pages=1), _make_work(200, pages=1)]}
+    client = FakePixivClient(works, bookmark_tags_by_id={100: None, 200: ["kept"]})
+
+    summary = _run(_config(tmp_path), client)
+
+    assert summary.works_total == 2
+    assert summary.works_failed == 0
+    manifest = _read_manifest(tmp_path)
+    tags_by_id = {work["id"]: work["bookmark_tags"] for work in manifest["works"]}
+    assert tags_by_id == {100: None, 200: ["kept"]}
+
+
+def test_bookmark_tags_not_fetched_for_other_users_bookmarks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Backing up another user's public bookmarks never fetches personal tags."""
+    _patch_downloads(monkeypatch)
+    works = {"public": [_make_work(100, pages=1)]}
+    client = FakePixivClient(works, bookmark_tags_by_id={100: ["nope"]})
+
+    _run(_config(tmp_path, user_id="99999", visibility="public"), client)
+
+    assert client.tag_fetch_calls == []
+    manifest = _read_manifest(tmp_path)
+    assert manifest["works"][0]["bookmark_tags"] is None
+
+
+def test_dry_run_does_not_fetch_bookmark_tags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plain --dry-run makes no real per-work tag request (preview contract).
+
+    The tag fetch now lives in the same branch as the image-entry fetch, which
+    dry-run already skips, so a dry-run correctly issues zero tag requests even
+    without --skip-scanned.
+    """
+    _patch_downloads(monkeypatch)
+    works = {"public": [_make_work(100, pages=1), _make_work(200, pages=1)]}
+    client = FakePixivClient(works, bookmark_tags_by_id={100: ["x"], 200: ["y"]})
+
+    _run(_config(tmp_path, dry_run=True), client)
+
+    assert client.tag_fetch_calls == []
 
 
 # -- pacing: dry-run still paces ----------------------------------------

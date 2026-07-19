@@ -143,6 +143,9 @@ class FakeFollowingClient:
         self.auth_calls: list[str] = []
         self.following_calls: list[tuple[str, str]] = []
         self.works_calls: list[str] = []
+        # Records any (unexpected) personal-bookmark-tag fetch: following runs
+        # must never request own-account tags for another user's works.
+        self.tag_fetch_calls: list[int] = []
 
     def authenticate(self, refresh_token: str) -> str:
         self.auth_calls.append(refresh_token)
@@ -196,6 +199,12 @@ class FakeFollowingClient:
         self, url: str, dest_path: Path, referer: str = "https://www.pixiv.net/"
     ) -> int:
         raise NotImplementedError
+
+    def fetch_bookmark_tags(self, illust_id: int) -> list[str] | None:
+        # Should never be reached in a following run; recorded so a test can
+        # assert on it rather than only via an exception.
+        self.tag_fetch_calls.append(illust_id)
+        return None
 
 
 # Static guarantee the fake satisfies the public Protocol.
@@ -535,6 +544,28 @@ def test_keyboard_interrupt_during_sleep_flushes_partial_and_reraises(
 
 
 # -- success / layout ---------------------------------------------------
+
+
+def test_following_run_never_fetches_personal_bookmark_tags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A following run backs up others' works, so it never requests own-tags.
+
+    Personal bookmark tags only make sense for the authenticated user's own
+    bookmark list; the following path must never call ``fetch_bookmark_tags``.
+    """
+    _patch_downloads(monkeypatch)
+    following = {"public": [_make_user(10), _make_user(20)]}
+    works = {
+        "10": [_make_work(101, author_id=10)],
+        "20": [_make_work(201, author_id=20)],
+    }
+    client = FakeFollowingClient(following, works)
+
+    summary = _run(_config(tmp_path), client)
+
+    assert summary.works_total == 2
+    assert client.tag_fetch_calls == []
 
 
 def test_two_users_per_author_subdirs_and_root_manifest(

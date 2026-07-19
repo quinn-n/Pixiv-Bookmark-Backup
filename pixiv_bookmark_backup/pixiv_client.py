@@ -155,6 +155,10 @@ class PixivClient(Protocol):
         """Download ``url`` to ``dest_path`` in one attempt, returning bytes written."""
         ...
 
+    def fetch_bookmark_tags(self, illust_id: int) -> list[str] | None:
+        """Return the authenticated user's registered bookmark tags for a work."""
+        ...
+
 
 class _AppApi(Protocol):
     """Internal structural view of the ``pixivpy3`` methods we call.
@@ -402,13 +406,14 @@ class Pixivpy3Client:
 
         Pages are fetched lazily; the injected ``sleep`` is invoked for
         ``delay`` seconds between successive pages. Personal bookmark tags are
-        fetched only when backing up the authenticated user's own bookmarks.
+        *not* fetched here -- the caller fetches them per work via
+        :meth:`fetch_bookmark_tags`, so that pacing/skip decisions can be applied
+        before each per-work tag request.
 
         Raises:
             ApiError: If listing bookmarks fails.
         """
 
-        fetch_bookmark_tags = str(user_id) == str(self._api.user_id)
         pages_so_far = 0
         items_so_far = 0
         try:
@@ -420,7 +425,7 @@ class Pixivpy3Client:
                 page_item_count = len(page_items)
                 pages_so_far += 1
                 for illust in page_items:
-                    yield self._to_work(illust, fetch_bookmark_tags)
+                    yield self._to_work(illust)
                 items_so_far += page_item_count
                 next_url = result.next_url
                 if not next_url:
@@ -508,7 +513,7 @@ class Pixivpy3Client:
                 page_item_count = len(page_items)
                 pages_so_far += 1
                 for illust in page_items:
-                    yield self._to_work(illust, fetch_bookmark_tags=False)
+                    yield self._to_work(illust)
                 items_so_far += page_item_count
                 next_url = result.next_url
                 if not next_url:
@@ -567,8 +572,15 @@ class Pixivpy3Client:
 
     # -- private helpers: all JsonDict/Any access lives here ------------
 
-    def _to_work(self, illust: Any, fetch_bookmark_tags: bool) -> BookmarkWork:
-        """Map a Pixiv illust ``JsonDict`` to a typed :class:`BookmarkWork`."""
+    def _to_work(self, illust: Any) -> BookmarkWork:
+        """Map a Pixiv illust ``JsonDict`` to a typed :class:`BookmarkWork`.
+
+        Personal bookmark tags are intentionally left ``None`` here: the listing
+        step no longer knows or cares about them. For an own-bookmarks backup the
+        caller fetches them per work via :meth:`fetch_bookmark_tags`, after
+        pacing/skip decisions; other paths (e.g. a following backup) leave them
+        ``None``.
+        """
 
         author = Author(
             id=illust.user.id,
@@ -579,9 +591,6 @@ class Pixivpy3Client:
             WorkTag(name=tag.name, translated_name=tag.translated_name)
             for tag in illust.tags
         ]
-        bookmark_tags = (
-            self._fetch_bookmark_tags(illust.id) if fetch_bookmark_tags else None
-        )
         return BookmarkWork(
             id=illust.id,
             type=illust.type,
@@ -591,7 +600,7 @@ class Pixivpy3Client:
             x_restrict=illust.x_restrict,
             sanity_level=illust.sanity_level,
             work_tags=work_tags,
-            bookmark_tags=bookmark_tags,
+            bookmark_tags=None,
             page_count=illust.page_count,
             images=self._extract_images(illust),
         )
@@ -614,7 +623,7 @@ class Pixivpy3Client:
             return []
         return [WorkImage(page=0, source_url=single)]
 
-    def _fetch_bookmark_tags(self, illust_id: int) -> list[str] | None:
+    def fetch_bookmark_tags(self, illust_id: int) -> list[str] | None:
         """Return the authenticated user's registered bookmark tags for a work.
 
         Routed through :meth:`_fetch_page` so a mid-run token expiry recovers via

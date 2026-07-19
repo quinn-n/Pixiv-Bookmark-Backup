@@ -138,6 +138,11 @@ class FakeClient:
     ) -> Iterator[BookmarkWork]:  # pragma: no cover
         raise NotImplementedError
 
+    def fetch_bookmark_tags(
+        self, illust_id: int
+    ) -> list[str] | None:  # pragma: no cover
+        raise NotImplementedError
+
 
 # Static guarantee that the fake satisfies the public Protocol.
 _: type[PixivClient] = FakeClient

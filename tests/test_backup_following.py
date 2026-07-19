@@ -1623,6 +1623,122 @@ def test_skip_scanned_all_skipped_user_not_marked_contributing(
     assert summary.users_with_works == 1
 
 
+def test_skip_scanned_events_carry_running_skip_count_following(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every emitted event's ``works_skipped`` tracks the running skip total.
+
+    The skips bracket a processed work across the user boundary: user 10's
+    recorded work 101 is skipped (running total 1), user 10's new work 102 is
+    processed after that skip and its WORK event must carry the accumulated 1
+    (not a stale 0), and user 20's recorded work 201 is skipped last (total 2).
+    """
+    _patch_downloads(monkeypatch)
+    following = {"public": [_make_user(10), _make_user(20)]}
+    _run(
+        _config(tmp_path),
+        FakeFollowingClient(
+            following,
+            {
+                "10": [_make_work(101, author_id=10)],
+                "20": [_make_work(201, author_id=20)],
+            },
+        ),
+    )
+
+    second_works = {
+        "10": [_make_work(101, author_id=10), _make_work(102, author_id=10)],
+        "20": [_make_work(201, author_id=20)],
+    }
+    client = FakeFollowingClient(following, second_works)
+    events = _run_events(_config(tmp_path, skip_scanned=True), client)
+
+    skipped = {e.work_id: e for e in events if e.kind == ProgressKind.WORK_SKIPPED}
+    work = {e.work_id: e for e in events if e.kind == ProgressKind.WORK}
+    # The skip total climbs by one per skip, in emission order across users.
+    assert skipped[101].works_skipped == 1
+    # The processed work after the first skip carries the accumulated total.
+    assert work[102].works_skipped == 1
+    assert skipped[201].works_skipped == 2
+
+
+def test_skip_scanned_event_snapshots_all_live_counters_following(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A following WORK_SKIPPED event carries the live totals, not zeros.
+
+    Regression for the same bug as the plain loop: ``_work_skipped_event`` was
+    built without the live ``counters``, so WORK_SKIPPED events hardcoded
+    ``works_total`` / ``files_downloaded`` / ``bytes_downloaded`` to ``0`` mid-run.
+
+    User 10's new work 100 is fetched and tallied *before* the recorded work 101
+    is skipped, so the WORK_SKIPPED event's totals must equal the prior WORK
+    event's totals rather than resetting to zero.
+    """
+    _patch_downloads(monkeypatch)
+    following = {"public": [_make_user(10)]}
+    _run(
+        _config(tmp_path),
+        FakeFollowingClient(following, {"10": [_make_work(101, author_id=10)]}),
+    )
+
+    second_works = {
+        "10": [_make_work(100, author_id=10), _make_work(101, author_id=10)],
+    }
+    client = FakeFollowingClient(following, second_works)
+    events = _run_events(_config(tmp_path, skip_scanned=True), client)
+
+    work_100 = next(
+        e for e in events if e.kind == ProgressKind.WORK and e.work_id == 100
+    )
+    skipped_101 = next(
+        e for e in events if e.kind == ProgressKind.WORK_SKIPPED and e.work_id == 101
+    )
+    # The prior real work established non-zero running totals.
+    assert work_100.works_total == 1
+    assert work_100.files_downloaded == 1
+    # The skip event must snapshot those same live totals, not reset them to 0.
+    assert skipped_101.works_total == work_100.works_total
+    assert skipped_101.files_downloaded == work_100.files_downloaded
+    assert skipped_101.files_skipped == work_100.files_skipped
+    assert skipped_101.files_failed == work_100.files_failed
+    assert skipped_101.bytes_downloaded == work_100.bytes_downloaded
+    # It still carries the post-increment skip total and the live user count.
+    assert skipped_101.works_skipped == 1
+    assert skipped_101.users_total == work_100.users_total
+
+
+def test_skip_scanned_dry_run_events_carry_running_skip_count_following(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WORK_PLANNED events also snapshot the running skip total in following runs.
+
+    User 10's recorded work 101 is skipped, then its new work 102 is previewed,
+    so 102's WORK and WORK_PLANNED events must carry the post-skip total of 1.
+    """
+    _patch_downloads(monkeypatch)
+    following = {"public": [_make_user(10)]}
+    _run(
+        _config(tmp_path),
+        FakeFollowingClient(following, {"10": [_make_work(101, author_id=10)]}),
+    )
+
+    second_works = {
+        "10": [_make_work(101, author_id=10), _make_work(102, author_id=10)]
+    }
+    client = FakeFollowingClient(following, second_works)
+    events = _run_events(_config(tmp_path, dry_run=True, skip_scanned=True), client)
+
+    skipped = [e for e in events if e.kind == ProgressKind.WORK_SKIPPED]
+    planned = [e for e in events if e.kind == ProgressKind.WORK_PLANNED]
+    work = [e for e in events if e.kind == ProgressKind.WORK]
+    assert [e.works_skipped for e in skipped] == [1]
+    # The previewed work after the skip carries the accumulated total on both
+    # its WORK and WORK_PLANNED events.
+    assert [e.works_skipped for e in planned] == [1]
+    assert [e.works_skipped for e in work] == [1]
+
+
 def test_skip_scanned_dry_run_following_previews_without_writing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

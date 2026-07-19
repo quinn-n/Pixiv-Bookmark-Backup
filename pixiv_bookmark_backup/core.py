@@ -196,6 +196,7 @@ class ProgressEvent:
 
     kind: ProgressKind
     works_total: int = 0
+    works_skipped: int = 0
     files_downloaded: int = 0
     files_skipped: int = 0
     files_failed: int = 0

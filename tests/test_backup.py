@@ -1549,6 +1549,113 @@ def test_skip_scanned_dry_run_loads_manifest_previews_without_writing(
     assert not (tmp_path / "details.json.bak").exists()
 
 
+def test_skip_scanned_events_carry_running_skip_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every emitted event's ``works_skipped`` tracks the running skip total.
+
+    With 100 and 300 already recorded and processed order 100, 200, 300, the two
+    skips bracket the processed work: the WORK_SKIPPED for 100 carries 1, the
+    WORK event for 200 (processed after that skip) must carry the accumulated 1
+    (not a stale 0), and the WORK_SKIPPED for 300 carries 2.
+    """
+    _patch_downloads(monkeypatch)
+    _seed_manifest(tmp_path, [100, 300])
+    works = {"public": [_make_work(wid, pages=1) for wid in (100, 200, 300)]}
+    client = FakePixivClient(works)
+
+    events = _run_events(_config(tmp_path, skip_scanned=True), client)
+
+    skipped = {e.work_id: e for e in events if e.kind == ProgressKind.WORK_SKIPPED}
+    work = {e.work_id: e for e in events if e.kind == ProgressKind.WORK}
+    # The skip total climbs by one per skip, in emission order.
+    assert skipped[100].works_skipped == 1
+    # The processed work after the first skip carries the accumulated total.
+    assert work[200].works_skipped == 1
+    assert skipped[300].works_skipped == 2
+
+
+def test_skip_scanned_event_snapshots_all_live_counters_not_just_skip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A WORK_SKIPPED event carries the live totals, not zeros.
+
+    Regression for a bug where ``_work_skipped_event`` was built without the live
+    ``counters``, so every WORK_SKIPPED event hardcoded ``works_total`` /
+    ``files_downloaded`` / ``bytes_downloaded`` to ``0`` -- even mid-run after real
+    works had accumulated counts. That made a skip-triggered live progress redraw
+    visibly drop the bar's counters to zero before the next real work bumped them
+    back up.
+
+    Seeding only 200 with order 100, 200, 300 means a real WORK (100) is processed
+    and tallied *before* the skip of 200, so the WORK_SKIPPED event's totals must
+    equal the prior WORK event's totals (non-decreasing), not fall back to zero.
+    """
+    _patch_downloads(monkeypatch)
+    _seed_manifest(tmp_path, [200])
+    works = {"public": [_make_work(wid, pages=1) for wid in (100, 200, 300)]}
+    client = FakePixivClient(works)
+
+    events = _run_events(_config(tmp_path, skip_scanned=True), client)
+
+    work_100 = next(
+        e for e in events if e.kind == ProgressKind.WORK and e.work_id == 100
+    )
+    skipped_200 = next(
+        e for e in events if e.kind == ProgressKind.WORK_SKIPPED and e.work_id == 200
+    )
+    # The prior real work established non-zero running totals.
+    assert work_100.works_total == 1
+    assert work_100.files_downloaded == 1
+    # The skip event must snapshot those same live totals, not reset them to 0.
+    assert skipped_200.works_total == work_100.works_total
+    assert skipped_200.files_downloaded == work_100.files_downloaded
+    assert skipped_200.files_skipped == work_100.files_skipped
+    assert skipped_200.files_failed == work_100.files_failed
+    assert skipped_200.bytes_downloaded == work_100.bytes_downloaded
+    # And it still carries the post-increment running skip total.
+    assert skipped_200.works_skipped == 1
+
+
+def test_skip_scanned_dry_run_events_carry_running_skip_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WORK_PLANNED events also snapshot the running skip total.
+
+    A skip (100) precedes a previewed work (200), so 200's WORK and WORK_PLANNED
+    events must carry the post-skip total of 1.
+    """
+    _patch_downloads(monkeypatch)
+    _seed_manifest(tmp_path, [100])
+    works = {"public": [_make_work(wid, pages=1) for wid in (100, 200)]}
+    client = FakePixivClient(works)
+
+    events = _run_events(_config(tmp_path, dry_run=True, skip_scanned=True), client)
+
+    skipped = [e for e in events if e.kind == ProgressKind.WORK_SKIPPED]
+    planned = [e for e in events if e.kind == ProgressKind.WORK_PLANNED]
+    work = [e for e in events if e.kind == ProgressKind.WORK]
+    assert [e.works_skipped for e in skipped] == [1]
+    # The previewed work after the skip carries the accumulated total on both
+    # its WORK and WORK_PLANNED events.
+    assert [e.works_skipped for e in planned] == [1]
+    assert [e.works_skipped for e in work] == [1]
+
+
+def test_no_skips_leaves_works_skipped_zero_on_every_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression guard: a run with nothing skippable emits ``works_skipped == 0``."""
+    _patch_downloads(monkeypatch)
+    works = {"public": [_make_work(wid, pages=1) for wid in (100, 200)]}
+    client = FakePixivClient(works)
+
+    events = _run_events(_config(tmp_path, skip_scanned=True), client)
+
+    assert events
+    assert all(e.works_skipped == 0 for e in events)
+
+
 def test_dry_run_without_skip_scanned_never_loads_manifest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

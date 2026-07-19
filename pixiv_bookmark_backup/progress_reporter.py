@@ -128,11 +128,22 @@ class ProgressReporter:
     _event_count: int = field(init=False, default=0)
     _last_line_len: int = field(init=False, default=0)
     _last_milestone: float | None = field(init=False, default=None)
+    #: Current spinner glyph, kept in sync by ``_spinner_frame``. Reused (not
+    #: advanced) by skip-triggered redraws so a run of skips never spins the bar.
+    _last_frame: str = field(init=False, default="")
+    #: Throttle timestamp for skip-triggered BAR redraws, isolated from
+    #: ``_last_draw`` so a skip never consumes/resets real progress' budget.
+    _last_skip_draw: float | None = field(init=False, default=None)
+    #: Cadence timestamp for skip-triggered MILESTONE lines, isolated from
+    #: ``_last_milestone`` so a skip never ticks the real milestone cadence.
+    _last_skip_milestone: float | None = field(init=False, default=None)
 
     def __attrs_post_init__(self) -> None:
         # Capture a construction timestamp so the first-draw delay works even
         # when no RUN_START event is ever handled.
         self._created = self.clock()
+        frames = ASCII_FRAMES if self.ascii_only else BRAILLE_FRAMES
+        self._last_frame = frames[0]
 
     # -- public API --------------------------------------------------------
 
@@ -180,11 +191,10 @@ class ProgressReporter:
             if self._started is None:
                 self._started = self.clock()
             return
+        if event.kind is ProgressKind.WORK_SKIPPED:
+            self._handle_bar_skip(event)
+            return
         # WORK_PLANNED is a VERBOSE-only concept; ignore it (and anything else).
-        # WORK_SKIPPED is excluded on purpose: a skipped work does no download
-        # work, so it must not advance the spinner or count toward the redraw
-        # throttle (else a long run of skips would spin the bar and starve real
-        # progress of its throttle budget).
         if event.kind not in (ProgressKind.WORK, ProgressKind.USER):
             return
 
@@ -206,9 +216,35 @@ class ProgressReporter:
 
         self._draw_bar(event, now)
 
+    def _handle_bar_skip(self, event: ProgressEvent) -> None:
+        # A skipped work does no download work, so it must never advance the
+        # spinner, tick ``_event_count``, or touch the real-progress throttle
+        # (``_last_draw``). It gets its own throttle timestamp and reuses the
+        # current spinner glyph, but still redraws so a running skip count and
+        # live feedback show during long / all-skip stretches.
+        now = self.clock()
+
+        if not self._emitted_anything:
+            # Only the time branch can gate a pure-skip first draw: skips never
+            # tick ``_event_count``, so the event-count branch is inert here.
+            base = self._started if self._started is not None else self._created
+            if (now - base) < FIRST_DRAW_DELAY:
+                return
+        else:
+            if (
+                self._last_skip_draw is not None
+                and (now - self._last_skip_draw) < THROTTLE_INTERVAL
+            ):
+                return
+
+        self._draw_bar(event, now, advance_frame=False)
+        self._last_skip_draw = now
+
     def _handle_milestone(self, event: ProgressEvent) -> None:
-        # WORK_SKIPPED is excluded on purpose: a skipped work is not real
-        # progress, so it must not tick the milestone count/time cadence.
+        if event.kind is ProgressKind.WORK_SKIPPED:
+            self._handle_milestone_skip(event)
+            return
+        # Anything that isn't real progress (WORK_PLANNED, RUN_START) is ignored.
         if event.kind not in (ProgressKind.WORK, ProgressKind.USER):
             return
 
@@ -222,18 +258,40 @@ class ProgressReporter:
         if not (due_by_count or due_by_time):
             return
 
+        self._write(self._milestone_line(event), nl=True)
+        self._last_milestone = now
+
+    def _handle_milestone_skip(self, event: ProgressEvent) -> None:
+        # A skip must never tick ``_event_count`` or the real milestone cadence
+        # (``_last_milestone``); it gets its own time-only cadence. There is no
+        # count-based gate for skips because ``_event_count`` stays untouched.
+        now = self.clock()
+        due = self._last_skip_milestone is None or (
+            (now - self._last_skip_milestone) >= MILESTONE_INTERVAL
+        )
+        if not due:
+            return
+
+        self._write(self._milestone_line(event), nl=True)
+        self._last_skip_milestone = now
+
+    def _milestone_line(self, event: ProgressEvent) -> str:
         head = self._headline_count(event)
-        line = (
-            f"... {head}, {_pluralize(event.files_downloaded, 'file')}, "
+        skip = f"{event.works_skipped} skipped, " if event.works_skipped > 0 else ""
+        return (
+            f"... {head}, {skip}{_pluralize(event.files_downloaded, 'file')}, "
             f"{self._format_bytes(event.bytes_downloaded)}"
         )
-        self._write(line, nl=True)
-        self._last_milestone = now
 
     # -- drawing helpers ---------------------------------------------------
 
-    def _draw_bar(self, event: ProgressEvent, now: float) -> None:
-        frame = self._spinner_frame()
+    def _draw_bar(
+        self, event: ProgressEvent, now: float, *, advance_frame: bool = True
+    ) -> None:
+        # Real WORK/USER draws advance the spinner; skip-triggered redraws pass
+        # ``advance_frame=False`` to reuse the current glyph (never spinning the
+        # bar) and must not clobber the real-progress throttle (``_last_draw``).
+        frame = self._spinner_frame() if advance_frame else self._last_frame
         if self.unit == "users":
             numerator = event.users_total
         else:
@@ -250,15 +308,18 @@ class ProgressReporter:
         # The ASCII fallback reuses the milestone line's ", " (not " - ") so a
         # frozen "-" spinner frame cannot blur into the separator.
         sep = ", " if self.ascii_only else " · "
+        skip = f"{event.works_skipped} skipped{sep}" if event.works_skipped > 0 else ""
         line = (
-            f"{frame} {head}{sep}{_pluralize(event.files_downloaded, 'file')}{sep}"
+            f"{frame} {head}{sep}{skip}"
+            f"{_pluralize(event.files_downloaded, 'file')}{sep}"
             f"{self._format_bytes(event.bytes_downloaded)}"
         )
         pad = max(0, self._last_line_len - len(line))
         self._write("\r" + line + " " * pad, nl=False)
 
         self._last_line_len = len(line)
-        self._last_draw = now
+        if advance_frame:
+            self._last_draw = now
         self._emitted_anything = True
 
     def _headline_count(self, event: ProgressEvent) -> str:
@@ -270,6 +331,9 @@ class ProgressReporter:
         frames = ASCII_FRAMES if self.ascii_only else BRAILLE_FRAMES
         frame = frames[self._spin_idx % len(frames)]
         self._spin_idx += 1
+        # Remember the glyph so skip-triggered redraws can reuse it without
+        # advancing the spinner.
+        self._last_frame = frame
         return frame
 
     def _format_bytes(self, n: int) -> str:

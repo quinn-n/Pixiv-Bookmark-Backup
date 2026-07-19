@@ -210,6 +210,7 @@ def _work_event(
     return ProgressEvent(
         kind=ProgressKind.WORK,
         works_total=counters.works_total,
+        works_skipped=counters.works_skipped,
         files_downloaded=counters.files_downloaded,
         files_skipped=counters.files_skipped,
         files_failed=counters.files_failed,
@@ -232,13 +233,15 @@ def _work_planned_event(
     index: int,
     user_id: str | None = None,
     users_total: int = 0,
+    works_skipped: int = 0,
 ) -> ProgressEvent:
     """Build a :attr:`ProgressKind.WORK_PLANNED` event for a dry-run work.
 
     Carries the dry-run "would create" ``line`` and the ``planned`` filenames as
     a tuple so a renderer need not re-parse the line. ``users_total`` is threaded
     through for a following run's ``unit="users"`` bar (see :func:`_work_event`);
-    it defaults to ``0`` for the plain bookmark backup.
+    it defaults to ``0`` for the plain bookmark backup. ``works_skipped`` snapshots
+    the running skip total so live progress matches the WORK events.
     """
 
     return ProgressEvent(
@@ -248,11 +251,13 @@ def _work_planned_event(
         planned=tuple(planned),
         user_id=user_id,
         users_total=users_total,
+        works_skipped=works_skipped,
         line=line,
     )
 
 
 def _work_skipped_event(
+    counters: _Counters,
     work: BookmarkWork,
     *,
     line: str,
@@ -264,18 +269,27 @@ def _work_skipped_event(
 
     Emitted under ``--skip-scanned`` when a work is already fully recorded in the
     existing manifest and is skipped without any fetch. Mirrors :func:`_work_event`
-    so the two loops (plain / following) construct it consistently; ``user_id`` /
-    ``users_total`` default to the plain-backup values.
+    exactly -- all numeric fields snapshot ``counters`` *at the call site* (with the
+    ``works_skipped`` increment applied just before), so a skip-triggered live
+    redraw carries the same running totals as the surrounding WORK events rather
+    than dropping them to ``0``. ``users_total`` is threaded through explicitly
+    (see :func:`_work_event`) and defaults to the plain-backup value.
     """
 
     return ProgressEvent(
         kind=ProgressKind.WORK_SKIPPED,
+        works_total=counters.works_total,
+        works_skipped=counters.works_skipped,
+        files_downloaded=counters.files_downloaded,
+        files_skipped=counters.files_skipped,
+        files_failed=counters.files_failed,
+        bytes_downloaded=counters.bytes_downloaded,
+        users_total=users_total,
         index=index,
         work_id=work.id,
         title=work.title,
         page_count=work.page_count,
         user_id=user_id,
-        users_total=users_total,
         line=line,
     )
 
@@ -761,6 +775,7 @@ def _iterate_and_process(
                 counters.works_skipped += 1
                 progress(
                     _work_skipped_event(
+                        counters,
                         work,
                         line=f"skipped {work.id}: already scanned",
                         index=index,
@@ -782,6 +797,7 @@ def _iterate_and_process(
                         planned,
                         line=f"    would create: {', '.join(planned)}",
                         index=index,
+                        works_skipped=counters.works_skipped,
                     )
                 )
                 continue
@@ -1134,6 +1150,7 @@ def _process_following_user(
                 counters.works_skipped += 1
                 progress(
                     _work_skipped_event(
+                        counters,
                         work,
                         line=f"skipped {work.id}: already scanned",
                         index=index,
@@ -1168,6 +1185,7 @@ def _process_following_user(
                         index=index,
                         user_id=uid,
                         users_total=counters.users_total,
+                        works_skipped=counters.works_skipped,
                     )
                 )
             else:

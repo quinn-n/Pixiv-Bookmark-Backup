@@ -69,6 +69,9 @@ class FakeClient:
         dest_path.write_bytes(self.payload)
         return len(self.payload)
 
+    def fetch_bookmark_tags(self, illust_id: int) -> list[str] | None:
+        raise NotImplementedError
+
 
 def _recording_sleep(naps: list[float]) -> Callable[[float], None]:
     """Return a sleep stub that appends each requested duration to ``naps``."""

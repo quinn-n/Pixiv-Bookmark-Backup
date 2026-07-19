@@ -293,6 +293,21 @@ def test_verbose_prints_work_and_user_lines() -> None:
     assert "user alice\n" in out
 
 
+def test_verbose_prints_skipped_line() -> None:
+    stream = io.StringIO()
+    clock = FakeClock()
+    reporter = make_reporter(stream, ReporterMode.VERBOSE, clock, show_planned=False)
+
+    # A skip line is normal informational verbose output -- printed verbatim and
+    # NOT gated by show_planned (which only governs dry-run WORK_PLANNED previews).
+    reporter.handle(
+        ProgressEvent(
+            kind=ProgressKind.WORK_SKIPPED, line="skipped 123: already scanned"
+        )
+    )
+    assert "skipped 123: already scanned\n" in stream.getvalue()
+
+
 def test_verbose_planned_hidden_by_default() -> None:
     stream = io.StringIO()
     clock = FakeClock()
@@ -492,3 +507,38 @@ def test_milestone_ignores_non_progress_kinds() -> None:
     reporter.handle(ProgressEvent(kind=ProgressKind.RUN_START))
     reporter.handle(ProgressEvent(kind=ProgressKind.WORK_PLANNED, line="will fetch: a"))
     assert stream.getvalue() == ""
+
+
+# -- WORK_SKIPPED exclusion from BAR / MILESTONE ---------------------------
+
+
+def test_bar_ignores_work_skipped() -> None:
+    # A skipped work must not draw or advance the spinner even once the
+    # first-draw delay has elapsed.
+    stream = io.StringIO()
+    clock = FakeClock()
+    reporter = make_reporter(stream, ReporterMode.BAR, clock)
+
+    clock.advance(FIRST_DRAW_DELAY)
+    reporter.handle(
+        ProgressEvent(
+            kind=ProgressKind.WORK_SKIPPED, line="skipped 123: already scanned"
+        )
+    )
+    assert stream.getvalue() == ""
+    assert reporter._event_count == 0  # skip did not tick the throttle counter
+
+
+def test_milestone_ignores_work_skipped() -> None:
+    # A skipped work must not tick the milestone cadence.
+    stream = io.StringIO()
+    clock = FakeClock()
+    reporter = make_reporter(stream, ReporterMode.MILESTONE, clock)
+
+    reporter.handle(
+        ProgressEvent(
+            kind=ProgressKind.WORK_SKIPPED, line="skipped 123: already scanned"
+        )
+    )
+    assert stream.getvalue() == ""
+    assert reporter._event_count == 0

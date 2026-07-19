@@ -143,6 +143,9 @@ class FakeFollowingClient:
         self.auth_calls: list[str] = []
         self.following_calls: list[tuple[str, str]] = []
         self.works_calls: list[str] = []
+        # Records any (unexpected) personal-bookmark-tag fetch: following runs
+        # must never request own-account tags for another user's works.
+        self.tag_fetch_calls: list[int] = []
 
     def authenticate(self, refresh_token: str) -> str:
         self.auth_calls.append(refresh_token)
@@ -196,6 +199,12 @@ class FakeFollowingClient:
         self, url: str, dest_path: Path, referer: str = "https://www.pixiv.net/"
     ) -> int:
         raise NotImplementedError
+
+    def fetch_bookmark_tags(self, illust_id: int) -> list[str] | None:
+        # Should never be reached in a following run; recorded so a test can
+        # assert on it rather than only via an exception.
+        self.tag_fetch_calls.append(illust_id)
+        return None
 
 
 # Static guarantee the fake satisfies the public Protocol.
@@ -535,6 +544,28 @@ def test_keyboard_interrupt_during_sleep_flushes_partial_and_reraises(
 
 
 # -- success / layout ---------------------------------------------------
+
+
+def test_following_run_never_fetches_personal_bookmark_tags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A following run backs up others' works, so it never requests own-tags.
+
+    Personal bookmark tags only make sense for the authenticated user's own
+    bookmark list; the following path must never call ``fetch_bookmark_tags``.
+    """
+    _patch_downloads(monkeypatch)
+    following = {"public": [_make_user(10), _make_user(20)]}
+    works = {
+        "10": [_make_work(101, author_id=10)],
+        "20": [_make_work(201, author_id=20)],
+    }
+    client = FakeFollowingClient(following, works)
+
+    summary = _run(_config(tmp_path), client)
+
+    assert summary.works_total == 2
+    assert client.tag_fetch_calls == []
 
 
 def test_two_users_per_author_subdirs_and_root_manifest(
@@ -1454,3 +1485,227 @@ def test_sanitize_display_text_is_identity_without_control_chars(text: str) -> N
     # unchanged -- the sanitizer should not mangle ordinary (including
     # non-ASCII) names.
     assert backup._sanitize_display_text(text) == text
+
+
+# -- skip-scanned -------------------------------------------------------
+
+
+def test_skip_scanned_skips_recorded_following_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A first run records user 10's works; a --skip-scanned re-run skips them.
+
+    On the second run one of user 10's two works is new (100 vs the prior 101,
+    102): only the new work is fetched, the two prior ones are skipped and
+    counted in ``works_skipped`` with WORK_SKIPPED events.
+    """
+    calls = _patch_downloads(monkeypatch)
+    following = {"public": [_make_user(10)]}
+    first = FakeFollowingClient(
+        following,
+        {"10": [_make_work(101, author_id=10), _make_work(102, author_id=10)]},
+    )
+    _run(_config(tmp_path), first)
+    calls["images"].clear()
+
+    second_works = {
+        "10": [
+            _make_work(101, author_id=10),
+            _make_work(102, author_id=10),
+            _make_work(103, author_id=10),
+        ]
+    }
+    client = FakeFollowingClient(following, second_works)
+    events: list[ProgressEvent] = []
+    summary = run_following(
+        _config(tmp_path, skip_scanned=True),
+        _auth(),
+        client,
+        progress=events.append,
+        clock=lambda: FIXED_CLOCK,
+    )
+
+    assert summary.works_skipped == 2
+    assert summary.works_total == 1
+    # Only the new work is fetched, into user 10's subdirectory.
+    assert calls["images"] == [
+        ("https://i.pximg.net/103_p0.jpg", tmp_path / "10" / "103_p0.jpg"),
+    ]
+    skipped_ids = {e.work_id for e in events if e.kind == ProgressKind.WORK_SKIPPED}
+    assert skipped_ids == {101, 102}
+
+
+def test_skip_scanned_off_never_skips_following(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default (skip_scanned=False) re-fetches even pre-recorded following works."""
+    calls = _patch_downloads(monkeypatch)
+    following = {"public": [_make_user(10)]}
+    works = {"10": [_make_work(101, author_id=10)]}
+    _run(_config(tmp_path), FakeFollowingClient(following, works))
+    calls["images"].clear()
+
+    summary = _run(_config(tmp_path), FakeFollowingClient(following, works))
+
+    assert summary.works_skipped == 0
+    assert summary.works_total == 1
+    assert len(calls["images"]) == 1
+
+
+def test_skip_scanned_does_not_consume_per_user_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A skipped work must not eat the --per-user-limit budget.
+
+    User 10's work 101 is already recorded. With ``per_user_limit=1`` a naive
+    skip that consumed the budget would leave the new work 102 unprocessed; the
+    skip must instead let 102 through (skips are counted before the budget).
+    """
+    calls = _patch_downloads(monkeypatch)
+    following = {"public": [_make_user(10)]}
+    _run(
+        _config(tmp_path),
+        FakeFollowingClient(following, {"10": [_make_work(101, author_id=10)]}),
+    )
+    calls["images"].clear()
+
+    second_works = {
+        "10": [_make_work(101, author_id=10), _make_work(102, author_id=10)]
+    }
+    client = FakeFollowingClient(following, second_works)
+    summary = run_following(
+        _config(tmp_path, skip_scanned=True, per_user_limit=1),
+        _auth(),
+        client,
+        clock=lambda: FIXED_CLOCK,
+    )
+
+    assert summary.works_skipped == 1
+    assert summary.works_total == 1
+    assert calls["images"] == [
+        ("https://i.pximg.net/102_p0.jpg", tmp_path / "10" / "102_p0.jpg"),
+    ]
+
+
+def test_skip_scanned_all_skipped_user_not_marked_contributing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A user whose every work is skipped contributes nothing (users_with_works).
+
+    User 10 has one work, already recorded; user 20 has one new work. On the
+    --skip-scanned re-run only user 20 contributes, so ``users_with_works`` is 1
+    (not 2), while both users are still enumerated (``users_total`` is 2).
+    """
+    calls = _patch_downloads(monkeypatch)
+    following = {"public": [_make_user(10)]}
+    _run(
+        _config(tmp_path),
+        FakeFollowingClient(following, {"10": [_make_work(101, author_id=10)]}),
+    )
+    calls["images"].clear()
+
+    following2 = {"public": [_make_user(10), _make_user(20)]}
+    works2 = {
+        "10": [_make_work(101, author_id=10)],
+        "20": [_make_work(201, author_id=20)],
+    }
+    client = FakeFollowingClient(following2, works2)
+    summary = run_following(
+        _config(tmp_path, skip_scanned=True),
+        _auth(),
+        client,
+        clock=lambda: FIXED_CLOCK,
+    )
+
+    assert summary.works_skipped == 1
+    assert summary.works_total == 1
+    assert summary.users_total == 2
+    assert summary.users_with_works == 1
+
+
+def test_skip_scanned_dry_run_following_previews_without_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """dry-run + skip-scanned reads the manifest to preview skips, writes nothing."""
+    _patch_downloads(monkeypatch)
+    following = {"public": [_make_user(10)]}
+    _run(
+        _config(tmp_path),
+        FakeFollowingClient(following, {"10": [_make_work(101, author_id=10)]}),
+    )
+    before = (tmp_path / "details.json").read_text(encoding="utf-8")
+
+    def _boom(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("dry-run must never write the manifest")
+
+    monkeypatch.setattr(backup, "write_atomic", _boom)
+
+    second_works = {
+        "10": [_make_work(101, author_id=10), _make_work(102, author_id=10)]
+    }
+    client = FakeFollowingClient(following, second_works)
+    events: list[ProgressEvent] = []
+    summary = run_following(
+        _config(tmp_path, dry_run=True, skip_scanned=True),
+        _auth(),
+        client,
+        progress=events.append,
+        clock=lambda: FIXED_CLOCK,
+    )
+
+    assert summary.works_skipped == 1
+    skipped_ids = {e.work_id for e in events if e.kind == ProgressKind.WORK_SKIPPED}
+    planned_ids = {e.work_id for e in events if e.kind == ProgressKind.WORK_PLANNED}
+    assert skipped_ids == {101}
+    assert planned_ids == {102}
+    # Nothing written: the on-disk manifest is untouched and no .bak was made.
+    assert (tmp_path / "details.json").read_text(encoding="utf-8") == before
+    assert not (tmp_path / "details.json.bak").exists()
+
+
+def test_dry_run_without_skip_scanned_never_loads_manifest_following(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """dry-run without --skip-scanned must not even read the manifest (spy)."""
+    _patch_downloads(monkeypatch)
+
+    def _boom(_path: Path) -> tuple[Any, bool]:
+        raise AssertionError("manifest must not be loaded in a plain dry-run")
+
+    monkeypatch.setattr(backup, "load_or_init", _boom)
+
+    following = {"public": [_make_user(10)]}
+    works = {"10": [_make_work(101, author_id=10)]}
+    client = FakeFollowingClient(following, works)
+
+    summary = run_following(
+        _config(tmp_path, dry_run=True),
+        _auth(),
+        client,
+        clock=lambda: FIXED_CLOCK,
+    )
+
+    assert summary.works_total == 1
+
+
+def test_skip_scanned_dry_run_corrupt_manifest_fails_loud_following(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """dry-run + skip-scanned still fails loud on a corrupt manifest, untouched."""
+    _patch_downloads(monkeypatch)
+    details = tmp_path / "details.json"
+    details.write_text("this is not json {{{", encoding="utf-8")
+    following = {"public": [_make_user(10)]}
+    works = {"10": [_make_work(101, author_id=10)]}
+    client = FakeFollowingClient(following, works)
+
+    with pytest.raises(ManifestLoadError):
+        run_following(
+            _config(tmp_path, dry_run=True, skip_scanned=True),
+            _auth(),
+            client,
+            clock=lambda: FIXED_CLOCK,
+        )
+
+    assert details.read_text(encoding="utf-8") == "this is not json {{{"
+    assert not (tmp_path / "details.json.bak").exists()

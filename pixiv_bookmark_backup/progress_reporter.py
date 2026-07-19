@@ -163,7 +163,11 @@ class ProgressReporter:
     # -- per-mode handlers -------------------------------------------------
 
     def _handle_verbose(self, event: ProgressEvent) -> None:
-        if event.kind in (ProgressKind.WORK, ProgressKind.USER):
+        if event.kind in (
+            ProgressKind.WORK,
+            ProgressKind.USER,
+            ProgressKind.WORK_SKIPPED,
+        ):
             if event.line is not None:
                 self._write(event.line, nl=True)
         elif event.kind is ProgressKind.WORK_PLANNED:
@@ -177,6 +181,10 @@ class ProgressReporter:
                 self._started = self.clock()
             return
         # WORK_PLANNED is a VERBOSE-only concept; ignore it (and anything else).
+        # WORK_SKIPPED is excluded on purpose: a skipped work does no download
+        # work, so it must not advance the spinner or count toward the redraw
+        # throttle (else a long run of skips would spin the bar and starve real
+        # progress of its throttle budget).
         if event.kind not in (ProgressKind.WORK, ProgressKind.USER):
             return
 
@@ -199,6 +207,8 @@ class ProgressReporter:
         self._draw_bar(event, now)
 
     def _handle_milestone(self, event: ProgressEvent) -> None:
+        # WORK_SKIPPED is excluded on purpose: a skipped work is not real
+        # progress, so it must not tick the milestone count/time cadence.
         if event.kind not in (ProgressKind.WORK, ProgressKind.USER):
             return
 

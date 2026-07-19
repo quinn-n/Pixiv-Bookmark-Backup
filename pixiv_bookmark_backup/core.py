@@ -16,7 +16,8 @@ from typing import NamedTuple, Protocol
 from attrs import define, field, frozen
 from attrs.validators import ge, in_, instance_of, le, optional
 
-from pixiv_bookmark_backup.manifest import WorkEntry
+from pixiv_bookmark_backup.manifest import Manifest, WorkEntry
+from pixiv_bookmark_backup.models import ImageStatus
 from pixiv_bookmark_backup.naming import strip_control
 
 #: Bookmark visibilities the tool understands.
@@ -74,6 +75,7 @@ class BackupConfig:
     )
     since: date | None = field(default=None, validator=optional(instance_of(date)))
     skip_existing: bool = field(default=True, validator=instance_of(bool))
+    skip_scanned: bool = field(default=False, validator=instance_of(bool))
     metadata_only: bool = field(default=False, validator=instance_of(bool))
     json_output: bool = field(default=False, validator=instance_of(bool))
     verbosity: int = field(default=0, validator=instance_of(int))
@@ -94,6 +96,7 @@ class RunSummary:
     works_total: int = 0
     works_succeeded: int = 0
     works_failed: int = 0
+    works_skipped: int = 0
     files_downloaded: int = 0
     files_skipped: int = 0
     files_failed: int = 0
@@ -122,6 +125,7 @@ class FollowingConfig:
     )
     since: date | None = field(default=None, validator=optional(instance_of(date)))
     skip_existing: bool = field(default=True, validator=instance_of(bool))
+    skip_scanned: bool = field(default=False, validator=instance_of(bool))
     metadata_only: bool = field(default=False, validator=instance_of(bool))
     json_output: bool = field(default=False, validator=instance_of(bool))
     verbosity: int = field(default=0, validator=instance_of(int))
@@ -154,6 +158,7 @@ class FollowingRunSummary:
     works_total: int = 0
     works_succeeded: int = 0
     works_failed: int = 0
+    works_skipped: int = 0
     files_downloaded: int = 0
     files_skipped: int = 0
     files_failed: int = 0
@@ -174,6 +179,7 @@ class ProgressKind(Enum):
     USER = "user"
     WORK = "work"
     WORK_PLANNED = "work_planned"
+    WORK_SKIPPED = "work_skipped"
 
 
 @frozen
@@ -256,6 +262,9 @@ class _ExitDecidable(Protocol):
     def works_failed(self) -> int: ...
 
     @property
+    def works_skipped(self) -> int: ...
+
+    @property
     def files_failed(self) -> int: ...
 
 
@@ -304,9 +313,14 @@ def decide_exit_code(summary: _ExitDecidable) -> ExitCode:
 
     This is a pure, count-based decision for runs that reached completion:
 
-    * no works at all -> :attr:`ExitCode.NO_BOOKMARKS`
+    * no works processed *and* none skipped -> :attr:`ExitCode.NO_BOOKMARKS`
     * works processed with no failures -> :attr:`ExitCode.SUCCESS`
     * works processed with any failure -> :attr:`ExitCode.PARTIAL`
+
+    An *all-skipped* run (``works_total == 0`` but ``works_skipped > 0``) is a
+    success, not "no bookmarks found": under ``--skip-scanned`` a fully
+    backed-up account re-run processes zero *new* works, and reporting that as
+    :attr:`ExitCode.NO_BOOKMARKS` would falsely signal an empty account.
 
     The :attr:`ExitCode.AUTH`, :attr:`ExitCode.NETWORK`, and
     :attr:`ExitCode.INTERRUPTED` outcomes are *not* decided here. They are
@@ -314,11 +328,26 @@ def decide_exit_code(summary: _ExitDecidable) -> ExitCode:
     signal handling), because no completed summary exists in those cases.
     """
 
-    if summary.works_total == 0:
+    if summary.works_total == 0 and summary.works_skipped == 0:
         return ExitCode.NO_BOOKMARKS
     if summary.works_failed == 0 and summary.files_failed == 0:
         return ExitCode.SUCCESS
     return ExitCode.PARTIAL
+
+
+def skippable_work_ids(existing: Manifest) -> set[int]:
+    """Return the ids of works in ``existing`` safe to skip on a resumed run.
+
+    A work is skippable iff it is already recorded in the manifest and none of
+    its images has a ``"failed"`` status -- a work with any failed image is
+    *not* skipped so the resumed run can retry it.
+    """
+
+    return {
+        w.id
+        for w in existing.works
+        if not any(img.status == ImageStatus.FAILED.value for img in w.images)
+    }
 
 
 def describe_plan(config: BackupConfig) -> str:

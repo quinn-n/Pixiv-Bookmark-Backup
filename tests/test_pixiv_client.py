@@ -1155,34 +1155,32 @@ def test_work_tags_are_mapped_with_translations() -> None:
 # -- bookmark (personal) tags ------------------------------------------
 
 
-def test_bookmark_tags_populated_for_self_with_only_registered() -> None:
+def test_fetch_bookmark_tags_returns_only_registered() -> None:
     api = FakeApi(user_id=SELF_ID)
     api.bookmark_detail_tags = [("favorite", True), ("noise", False), ("art", True)]
-    api.pages = [([_make_illust(40, single_url="https://x/p0.png")], None)]
     client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0)
-    work = next(iter(client.iter_bookmarks(SELF_ID, "public")))
-    assert work.bookmark_tags == ["favorite", "art"]
+    assert client.fetch_bookmark_tags(40) == ["favorite", "art"]
     assert api.bookmark_detail_calls == [40]
 
 
-def test_bookmark_tags_none_for_other_user() -> None:
+def test_iter_bookmarks_does_not_fetch_bookmark_tags_for_self() -> None:
+    # Listing no longer consults the detail endpoint at all -- personal bookmark
+    # tags are fetched per-work by the caller, after pacing/skip decisions -- so
+    # every listed work carries ``bookmark_tags is None`` regardless of target.
     api = FakeApi(user_id=SELF_ID)
     api.bookmark_detail_tags = [("favorite", True)]
     api.pages = [([_make_illust(50, single_url="https://x/p0.png")], None)]
     client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0)
-    work = next(iter(client.iter_bookmarks(OTHER_ID, "public")))
+    work = next(iter(client.iter_bookmarks(SELF_ID, "public")))
     assert work.bookmark_tags is None
-    # Detail endpoint is not consulted for a non-self target.
     assert api.bookmark_detail_calls == []
 
 
-def test_bookmark_tags_none_when_detail_raises() -> None:
+def test_fetch_bookmark_tags_none_when_detail_raises() -> None:
     api = FakeApi(user_id=SELF_ID)
     api.bookmark_detail_should_raise = True
-    api.pages = [([_make_illust(60, single_url="https://x/p0.png")], None)]
     client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0)
-    work = next(iter(client.iter_bookmarks(SELF_ID, "public")))
-    assert work.bookmark_tags is None
+    assert client.fetch_bookmark_tags(60) is None
 
 
 class _ExpiringDetailApi(FakeApi):
@@ -1220,7 +1218,7 @@ class _ExpiringDetailApi(FakeApi):
         return SimpleNamespace(bookmark_detail=SimpleNamespace(tags=tags))
 
 
-def test_bookmark_tags_reauth_and_recovers_on_expired_token() -> None:
+def test_fetch_bookmark_tags_reauth_and_recovers_on_expired_token() -> None:
     # Regression: an expired-token error while fetching a work's personal bookmark
     # tags previously slipped past recovery -- illust_bookmark_detail was called
     # DIRECTLY (not via _fetch_page), so the error-shaped response's missing
@@ -1229,35 +1227,29 @@ def test_bookmark_tags_reauth_and_recovers_on_expired_token() -> None:
     # the real tags.
     api = _ExpiringDetailApi(user_id=SELF_ID)
     api.bookmark_detail_tags = [("favorite", True), ("noise", False), ("art", True)]
-    api.pages = [([_make_illust(80, single_url="https://x/p0.png")], None)]
     client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0)
     # Cache the refresh token via the normal initial auth.
     client.authenticate("refresh-secret")
-    work = next(iter(client.iter_bookmarks(SELF_ID, "public")))
     # Real tags recovered, not a silent empty/None truncation.
-    assert work.bookmark_tags == ["favorite", "art"]
+    assert client.fetch_bookmark_tags(80) == ["favorite", "art"]
     # Re-auth happened (initial + one recovery), bounded (not an infinite loop).
     assert api.auth_calls == ["refresh-secret", "refresh-secret"]
 
 
-def test_bookmark_tags_degrade_to_none_and_warn_when_error_persists() -> None:
+def test_fetch_bookmark_tags_degrade_to_none_and_warn_when_error_persists() -> None:
     # A single work whose bookmark-detail keeps erroring even after re-auth (e.g. a
     # deleted/restricted bookmark -- common on a large, long-lived account) must
-    # NOT abort the whole run. _fetch_bookmark_tags catches _fetch_page's
+    # NOT abort the whole run. fetch_bookmark_tags catches _fetch_page's
     # exhausted-budget ApiError and degrades to None for just this work -- but only
     # AFTER the bounded re-auth/retry ran, and the skip is surfaced via warn (never
-    # silent). A systemic token failure is still backstopped by the next listing
-    # page's own _fetch_page; here the listing itself is healthy.
+    # silent). The caller (backup.run) treats the None as "no tags" and keeps going.
     warnings: list[str] = []
     api = _ExpiringDetailApi(user_id=SELF_ID, recover=False)
     api.bookmark_detail_tags = [("favorite", True)]
-    api.pages = [([_make_illust(90, single_url="https://x/p0.png")], None)]
     client = Pixivpy3Client(api=api, sleep=_no_sleep, delay=0, warn=warnings.append)
     client.authenticate("refresh-secret")
-    # The run completes: the work is still yielded, just without its tags.
-    works = list(client.iter_bookmarks(SELF_ID, "public"))
-    assert [w.id for w in works] == [90]
-    assert works[0].bookmark_tags is None
+    # The call returns None rather than raising -- graceful degradation.
+    assert client.fetch_bookmark_tags(90) is None
     # Bounded recovery was still attempted -- initial auth + FETCH_PAGE_MAX_RETRIES
     # recovery re-auths -- proving "tried then gracefully gave up", NOT a reversion
     # to the original silent bug where recovery was never attempted at all.

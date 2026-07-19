@@ -990,8 +990,8 @@ def test_time_per_request_help_lists_option_and_default(runner: CliRunner) -> No
     out = result.output
     assert "--time-per-request" in out
     assert "SECONDS" in out
-    # click renders "[default: 0.0; x>=0]"; match the safe substring.
-    assert "default: 0.0" in out
+    # click renders "[default: 1.5; x>=0]"; match the safe substring.
+    assert "default: 1.5" in out
 
 
 def test_time_per_request_negative_is_exit_2(runner: CliRunner, tmp_path: Path) -> None:
@@ -1039,7 +1039,7 @@ def test_time_per_request_fractional_reaches_config(
     assert captured["config"].time_per_request == 0.5
 
 
-def test_time_per_request_defaults_to_zero_in_config(
+def test_time_per_request_defaults_to_one_point_five_in_config(
     runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     captured: dict[str, Any] = {}
@@ -1056,7 +1056,7 @@ def test_time_per_request_defaults_to_zero_in_config(
     )
 
     assert result.exit_code == 0, result.output
-    assert captured["config"].time_per_request == 0.0
+    assert captured["config"].time_per_request == 1.5
 
 
 def test_time_per_request_absent_from_json_payload(
@@ -1129,11 +1129,11 @@ def test_time_per_request_wires_into_client_delay(
     assert captured["kwargs"]["delay"] == 2.5
 
 
-def test_time_per_request_default_gives_client_delay_zero(
+def test_time_per_request_default_gives_client_delay_one_point_five(
     runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Confirms the intentional behavior change: the CLI-constructed client's
-    # pagination delay is now 0.0 by default, not the old hardcoded 0.5.
+    # Confirms the CLI-constructed client's pagination delay picks up the
+    # default --time-per-request value.
     captured: dict[str, Any] = {}
     _capture_client_kwargs(monkeypatch, captured)
     _install_run(monkeypatch, summary=RunSummary(works_total=1, works_succeeded=1))
@@ -1145,7 +1145,7 @@ def test_time_per_request_default_gives_client_delay_zero(
     )
 
     assert result.exit_code == 0, result.output
-    assert captured["kwargs"]["delay"] == 0.0
+    assert captured["kwargs"]["delay"] == 1.5
 
 
 def test_time_per_request_help_mentions_listing_pages(runner: CliRunner) -> None:

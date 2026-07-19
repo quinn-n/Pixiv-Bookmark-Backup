@@ -360,7 +360,7 @@ def cli() -> None:
 @click.option(
     "--time-per-request",
     type=click.FloatRange(min=0),
-    default=0.0,
+    default=1.5,
     show_default=True,
     metavar="SECONDS",
     help=(
@@ -368,7 +368,7 @@ def cli() -> None:
         "measured start-to-start (a work is one post and its images, not a "
         "single HTTP request). A work that already took longer is not "
         "delayed. Also sets the pause between bookmark/following listing "
-        "pages. Default 0 disables pacing (including between listing pages)."
+        "pages. Set to 0 to disable pacing (including between listing pages)."
     ),
 )
 @click.option(
@@ -716,7 +716,7 @@ def _emit_summary(
 @click.option(
     "--time-per-request",
     type=click.FloatRange(min=0),
-    default=0.0,
+    default=1.5,
     show_default=True,
     metavar="SECONDS",
     help=(
@@ -724,7 +724,7 @@ def _emit_summary(
         "measured start-to-start (a work is one post and its images, not a "
         "single HTTP request). A work that already took longer is not "
         "delayed. Also sets the pause between bookmark/following listing "
-        "pages. Default 0 disables pacing (including between listing pages)."
+        "pages. Set to 0 to disable pacing (including between listing pages)."
     ),
 )
 @click.option(

@@ -54,6 +54,43 @@ FETCH_PAGE_MAX_RETRIES = 3
 FETCH_PAGE_BASE_DELAY = 1.0
 
 
+#: Cap on how much of a Pixiv error body's repr is embedded in a failure
+#: message, so a pathologically large response body can't bloat the message
+#: (and, downstream, CLI stderr output and the JSON manifest's ``errors`` list).
+RESPONSE_ERROR_DETAIL_MAX_LEN = 500
+
+
+def _response_error_detail(error: Any) -> str | None:
+    """Bounded, defensive ``repr()`` of a Pixiv ``result.error`` body.
+
+    Returns ``None`` if there is nothing to show. Pixiv's error bodies
+    (``{"error": {"user_message": ..., "message": ...}}``) never echo request
+    credentials -- unlike a raised ``PixivError``, which can embed the request
+    URL/headers and is therefore never surfaced (see ``_fetch_page``). Building
+    the description must never itself crash a run, so it's guarded like
+    ``_warn_unparsable_next_url``'s shape sketch.
+    """
+
+    if error is None:
+        return None
+    try:
+        text = repr(error)
+    except Exception:  # pragma: no cover - defensive: never crash a run
+        return None
+    if len(text) > RESPONSE_ERROR_DETAIL_MAX_LEN:
+        text = f"{text[:RESPONSE_ERROR_DETAIL_MAX_LEN]}...(truncated)"
+    return text
+
+
+def _describe_response_error(result: Any) -> str:
+    """Render ``result.error`` for a "last failure" style failure message."""
+
+    detail = _response_error_detail(getattr(result, "error", None))
+    if detail is None:
+        return "an error response"
+    return f"an error response ({detail})"
+
+
 @frozen
 class FollowedUser:
     """A Pixiv user followed by the authenticated account.
@@ -260,10 +297,12 @@ class Pixivpy3Client:
 
         Once the budget is exhausted, an :class:`ApiError` is raised (the CLI's
         partial-run exit-code contract is unchanged). Its message states how many
-        attempts were made and *what kind* of failure last occurred (an error
-        response, or a network error) but deliberately never embeds the raw
-        underlying ``PixivError`` text -- mirroring :meth:`authenticate`'s static
-        message, so an auth endpoint's HTTP response body is never surfaced.
+        attempts were made and describes the last concrete failure: for an
+        error-shaped response, Pixiv's own ``error`` body (via
+        :func:`_describe_response_error`) -- these bodies never echo request
+        credentials, unlike a raised ``PixivError``, whose text can embed the
+        request URL/headers and is therefore deliberately never surfaced (a
+        network-error give-up mirrors :meth:`authenticate`'s static message).
 
         Raises:
             ApiError: If no refresh token was cached, or the failure persists
@@ -274,16 +313,18 @@ class Pixivpy3Client:
         if getattr(result, "error", None) is None:
             return result
         if self._refresh_token is None:
+            detail = _response_error_detail(getattr(result, "error", None))
+            suffix = f" ({detail})" if detail is not None else ""
             raise ApiError(
                 "Pixiv returned an error response and no refresh token is "
-                "available to re-authenticate."
+                f"available to re-authenticate{suffix}."
             )
 
         total_tries = FETCH_PAGE_MAX_RETRIES + 1
         # Tracks how the most recent recovery attempt failed, so the final
         # give-up message reflects the last concrete failure without embedding
         # any raw PixivError text. Reset each attempt.
-        last_failure = "an error response"
+        last_failure = _describe_response_error(result)
         for attempt in range(FETCH_PAGE_MAX_RETRIES):
             # Back off before each recovery: exponential + jitter, matching
             # download_image. This also supplies the politeness pause the
@@ -303,7 +344,7 @@ class Pixivpy3Client:
             result = fetch()
             if getattr(result, "error", None) is None:
                 return result
-            last_failure = "an error response"
+            last_failure = _describe_response_error(result)
 
         raise ApiError(
             f"Pixiv request recovery failed after {total_tries} attempts "

@@ -5,7 +5,7 @@ argument-hint: <path/to/features.md>
 
 Build **every feature listed in the Markdown file at `$ARGUMENTS`**, each isolated in its **own git worktree**, running the same pipeline `/feature` runs — design → plan → fact-check → parallel implement↔review loops → real-CLI test → feature review (security/CLI-UX) → fix — **concurrently across features**, then open **one pull request per feature**.
 
-The worktrees give true isolation: parallel features can't collide on files, the `pixi` manifest, the `cli.py` click group, the lockfile, or the `pixi run check` gate — stronger than in-tree `Owns` sets. Correctness still beats concurrency: create worktrees serially, and never mutate the base checkout mid-run.
+The worktrees give true isolation: parallel features can't collide on files, the `pixi` manifest, the `cli.py` click group, the lockfile, or the `pixi run check` gate — stronger than in-tree `Owns` sets. Correctness still beats concurrency: create worktrees serially, and never mutate the base checkout mid-run — the sole exception is checking completed features off in the features file itself (Step 4), a doc-only edit that touches nothing a worktree builds from.
 
 ## 0. Preflight (once, before any worktree)
 - If `$ARGUMENTS` is empty or not a readable `.md` file, ask me for the path. Read the file.
@@ -18,8 +18,9 @@ The worktrees give true isolation: parallel features can't collide on files, the
 
 ## 1. Parse the features file
 - **One feature per top-level item — auto-detect the file's structure.** If the file is organized by **`##` headings**, each heading is a feature (heading text = *name*; the prose/bullets beneath it until the next `##` = *description*). If it's a **top-level list** — a **numbered list** (`1.`, `2.`, …), a **bulleted list** (`-`/`*`), or a **checklist** (`- [ ]`) — each top-level item is a feature (the item's text = *name*; any indented sub-bullets/lines beneath it = *description*). A leading `#` title or intro paragraph, and section headers that merely group the list, are context — not features; `---`-separated blocks also work. Whatever structure you detect, **state how you parsed the file** at the ⏸ gate below so I can correct it.
+- **Decide how you'll mark each item done — from that same detected structure — because you'll check items off in this file as their features land (Step 4).** A **checklist** item (`- [ ]`) → flip it to `- [x]`; a **numbered** or **plain-bulleted** item → append ` — ✅ DONE` to its line; a **`##`-heading** feature → append ` — ✅ DONE` to the heading; a **`---`-separated block** → mark its title line the same way. If any items are **already** marked done (`- [x]`, or a trailing `DONE`/`COMPLETE`/`✅`), treat them as **already built** and **skip** them — don't rebuild them unless I ask.
 - For each feature, derive a **slug from its name** (lowercase, kebab-case, punctuation stripped, ≤ ~40 chars; e.g. "Add a `--json` output flag" → `json-output-flag`). Branch = `feature/<slug>`, worktree dir = `../<repo>-worktrees/<slug>`. De-duplicate collisions (`-2`, `-3`).
-- ⏸ **Present the parsed list — each feature's name, one-line description, branch, and worktree path — and wait for my approval.** This is where I confirm you understood the features and like the names.
+- ⏸ **Present the parsed list — each feature's name, one-line description, branch, and worktree path — and wait for my approval.** This is where I confirm you understood the features and like the names. Include **how each item will be marked done** and **which items you're skipping as already-done**, so I can correct both.
 
 ## 2. Create one worktree per feature (serial)
 Create the worktrees **one at a time** (git multi-worktree ops aren't guaranteed concurrency-safe), even though the pipelines afterward run in parallel:
@@ -43,9 +44,11 @@ When a feature is fully green in its worktree (`pixi run check` passes, real-CLI
 - Open the PR: capture the URL — `PR_URL=$(gh pr create --base <base-branch> --head <branch> --title "<feature name>" --body-file <summary-file>)`. Write a real body (what was built, new pixi deps/tasks, tests, review rounds) rather than `--fill`. Report `PR_URL`.
 - **Fallback** (no `gh`/remote from preflight): after `git push -u origin <branch>`, print the compare URL for manual PR creation — `https://github.com/<owner>/<repo>/compare/<base>...<branch>?expand=1` (the `?expand=1` is an informal convention; treat it as best-effort UX, not something to depend on).
 - **One PR per feature** — never fold two features into one branch/PR.
+- **Then mark that feature done in the source file.** With its PR open (or, in the fallback, its branch pushed and its compare URL printed), edit `$ARGUMENTS` in place to mark **only that feature's item** complete using the convention chosen in Step 1 — tick its checkbox (`- [x]`) or append ` — ✅ DONE` to its line/heading. **Re-read the file immediately before editing** so features finishing around the same time don't clobber each other's check-offs, and leave every other line unchanged. If the file can't be written (read-only, or outside the repo), report it and move on — never fail a finished feature over a check-off.
 
 ## 5. Summary & cleanup
 - Report a table: feature → branch → worktree → PR URL (or compare URL) → gate/test result → review rounds → new pixi deps/tasks → outstanding Should-fix/Nit items → anything still waiting on me.
+- The completed features are now **checked off in `$ARGUMENTS`** (unfinished, failed, or still-blocked ones left unmarked). That edit is an **uncommitted change in the base working tree** — commit or revert it as you prefer; it's separate from the per-feature branches.
 - **Ask before removing worktrees.** On my OK: `git worktree remove <path>` each (`-f` if dirty), then `git worktree prune`. Leave branches and PRs intact.
 
 Stop and ask if a feature's preconditions fail, a pipeline loop won't converge, or a PR can't be created — surface it, don't paper over it.

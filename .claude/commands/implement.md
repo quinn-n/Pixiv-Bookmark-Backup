@@ -1,5 +1,5 @@
 ---
-description: Implement an already-approved plan with parallel tracks and per-track review loops, then run the real CLI and the feature-level review board.
+description: Implement an already-approved plan with parallel tracks and per-track review loops, run a simplify pass, then run the real CLI and the feature-level review board.
 argument-hint: <plan file path or description of the approved plan>
 ---
 
@@ -11,6 +11,10 @@ Execute the approved plan: **$ARGUMENTS**
    - `quality-reviewer` returns **APPROVED** or **CHANGES REQUESTED** (Must-fix list).
    - On CHANGES REQUESTED, the same `implementer` addresses them with a change log; re-review. Loop until APPROVED (cap ~3 rounds, then surface disagreement to me).
    - When all tracks in the batch are APPROVED, integrate (serialize shared touch-points like the click group / manifest), run `pixi run check`, then start the next batch.
+2b. **Simplify pass** — after the last batch integrates green, run **one** `code-refactorer` in pipeline mode over the feature's whole diff. Give it the list of changed files and the implementers' deferred refactor notes, plus any simplicity/duplication/dead-code Should-fix items from the track reviews.
+   - It keeps behavior and the CLI contract (flags, output, exit codes) unchanged and `pixi run check` green.
+   - If it changed anything, loop its diff through `quality-reviewer` until **APPROVED** (cap ~3 rounds). Revert any change that can't win approval rather than escalating.
+   - "Nothing worth simplifying" is a valid result. Report what it changed and what it deferred in the step 5 summary.
 3. `cli-tester` — run the real command via pixi on the integrated feature; verify behaviors, exit codes, and pipe/no-TTY handling.
 4. In parallel: `security-reviewer`, `cli-ux-reviewer`, and a final `quality-reviewer` pass — each returns a verdict. Loop any CHANGES REQUESTED back through `implementer` (or `cli-ux-reviewer` for help-text/format-only) until APPROVED; re-test after.
 5. Route remaining defects to `bug-fixer` (loop through `quality-reviewer` until APPROVED). Summarize parallel tracks, review rounds per track, results, new pixi deps/tasks, and follow-ups.

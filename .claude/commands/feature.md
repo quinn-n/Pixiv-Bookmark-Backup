@@ -1,5 +1,5 @@
 ---
-description: Run the full feature pipeline — design, plan, fact-check, parallel implement+review loops, test, review — for a CLI feature described in the argument.
+description: Run the full feature pipeline — design, plan, fact-check, parallel implement+review loops, simplify, test, review — for a CLI feature described in the argument.
 argument-hint: <feature / command description>
 ---
 
@@ -19,10 +19,16 @@ Orchestrate the specialized subagents in order, pausing for my approval at each 
      c. If CHANGES REQUESTED, send the Must-fix list back to the **same** track's `implementer` to address (with a change log), then re-review with `quality-reviewer`.
      d. Repeat b–c until **APPROVED**. Cap at ~3 rounds; if not converged or implementer and reviewer disagree on a Must-fix, ⏸ surface it to me instead of looping further.
    - Review loops for different tracks run concurrently. When every track in the batch is APPROVED, **integrate the batch** (resolve shared touch-points like registering subcommands in the click group serially), run `pixi run check`, and only then start the next batch.
+4b. **Simplify pass** — once every batch is integrated and green, delegate to **one** `code-refactorer` in pipeline mode. Use one refactorer, not one per track, because duplication *across* tracks is what this pass is for. Give it:
+   - **Scope:** the feature's whole diff, as the list of files the tracks changed. It edits only those files.
+   - **Inputs:** the refactor notes the implementers deferred, plus any simplicity, duplication, or dead-code **Should-fix** items from the track reviews.
+   - **Bar:** behavior and the CLI contract (flag names, output, exit codes) stay unchanged, and `pixi run check` stays green before and after. **"Nothing worth simplifying"** is a valid result and ends the step.
+   - **Review loop:** if it changed anything, run that diff through `quality-reviewer` until **APPROVED**, with the refactorer in the implementer's seat (cap ~3 rounds). If a change can't win approval, revert that change instead of escalating — the pass is optional polish, never a blocker.
+   - **Hand-offs:** carry anything it deferred (bugs, contract-changing simplifications) into step 8 as follow-ups.
 5. **CLI test** — once all batches are integrated, delegate to `cli-tester` to run the real command via pixi and verify the acceptance criteria, exit codes, and pipe/no-TTY behavior.
 6. **Feature-level review board** — run `security-reviewer` and `cli-ux-reviewer` (and a final `quality-reviewer` pass) on the integrated feature, in parallel. Each returns a verdict. For any **CHANGES REQUESTED**, run the same implement↔review loop (route to `implementer`, or `cli-ux-reviewer` for help-text/format-only fixes) until that reviewer APPROVES; then re-run the relevant CLI tests.
 7. **Fix** — route any remaining defects from testing to `bug-fixer`; loop its fixes back through `quality-reviewer` until APPROVED.
-8. **Summary** — what was built, which tasks ran in parallel, review rounds per track, gate/test results, new pixi deps & tasks, and outstanding Should-fix/Nit items.
+8. **Summary** — what was built, which tasks ran in parallel, review rounds per track, what the simplify pass changed (or that it found nothing) and what it deferred, gate/test results, new pixi deps & tasks, and outstanding Should-fix/Nit items.
 
 Give a one-paragraph status at each batch/loop (which tracks are running, current verdicts, round counts). Stop and ask if any agent reports a blocker or a loop fails to converge.
 

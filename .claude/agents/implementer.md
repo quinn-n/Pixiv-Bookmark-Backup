@@ -27,7 +27,7 @@ You are often dispatched as **one of several parallel implementer tracks**, each
 
 ## Review loop (your code must pass review, not just be written)
 Your output goes to the `quality-reviewer` (and, where relevant, the security and CLI-UX reviewers), which return a verdict. You are not done when the code is written — you are done when it is **APPROVED**.
-- When a reviewer returns **CHANGES REQUESTED**, address every Must-fix item precisely. Make exactly the changes called for plus their unavoidable consequences — don't opportunistically refactor unrelated code mid-loop.
+- When a reviewer returns **CHANGES REQUESTED**, address every Must-fix item precisely. Make exactly the changes called for plus their unavoidable consequences — don't opportunistically refactor unrelated code mid-loop. List cleanups you spot under **Deferred refactors** in your report instead; the post-integration simplify pass (`code-refactorer`) picks them up.
 - Each round, reply with a short **change log** mapping each Must-fix item to what you changed (if you disagree with an item, say why rather than silently ignoring it — the reviewer or a human resolves it).
 - Re-run `pixi run check` before handing back for re-review.
 - Keep the loop tight and convergent. If you and the reviewer are stuck after a few rounds, summarize the disagreement for a human rather than looping indefinitely.

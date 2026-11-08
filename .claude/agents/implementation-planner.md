@@ -37,6 +37,15 @@ Group the tasks into ordered **execution batches** so the orchestrator can run i
 - Present as: `Batch 1 (parallel): T1, T3 · Batch 2 (parallel): T2, T4 · Batch 3: T5`. Call out any **shared touch-points to coordinate** (e.g. the click group in `cli.py` that registers each subcommand, a shared `__init__`/exports, a shared config model) that may need a serialized final edit even if not "owned" — prefer making such wiring its own small task in a later batch so parallel tracks don't clobber it.
 - If everything is interdependent, say so and present a single sequential batch — don't force unsafe parallelism. Correctness beats concurrency: when in doubt about a collision, serialize.
 
+### PR slices
+How the finished feature splits into a stack of small PRs for review (see the `stacked-prs` skill). List ordered slices, each with a number, a one-line purpose, its tasks (T-ids), and the exact paths it changes. Slices must be:
+- **path-disjoint**: each file's whole change is in exactly one slice, and a rename or deletion lists both its old and new path in that slice;
+- **dependency-ordered**: slice k depends only on slices below it, e.g. attrs/core logic + tests → I/O helpers → click command + its registration in the click group → docs;
+- **green and safe alone**: each tip passes `pixi run check` and exposes no half-built flag or subcommand;
+- **dependency-complete**: the pixi manifest change and its `pixi.lock` go together in the lowest slice that needs them.
+
+Slices are for review, not execution, so they needn't match the batches. If the feature is small or won't split cleanly, write the single line `Single PR — <reason>` instead.
+
 ### Test plan (pytest)
 - **Unit tests:** each unit + cases (happy/edge/error), using fixtures, `tmp_path`, `monkeypatch` as needed.
 - **CLI tests:** `click.testing.CliRunner` invocations asserting output, exit codes, and stderr/stdout separation for each command path.
@@ -50,4 +59,4 @@ Backward compat of the CLI contract (renamed flags break scripts!), migration st
 ### Refactor triggers
 If the fact-checker refutes a `[VERIFY]` item, state explicitly which steps change.
 
-Done only when every `[VERIFY]` item is listed and every step has a "Done when".
+Done only when every `[VERIFY]` item is listed, every step has a "Done when", and the PR slices section is present (slices or `Single PR — <reason>`).

@@ -1,9 +1,9 @@
 ---
-description: From a Markdown file listing multiple CLI features, build each one in parallel in its own git worktree via the full `/feature` pipeline, then open a PR per feature. Forwards each pipeline's gates and any subagent questions back to you, labeled by feature.
+description: From a Markdown file listing multiple CLI features, build each one in parallel in its own git worktree via the full `/feature` pipeline, then open a PR (or a stack of small PRs) per feature. Forwards each pipeline's gates and any subagent questions back to you, labeled by feature.
 argument-hint: <path/to/features.md>
 ---
 
-Build **every feature listed in the Markdown file at `$ARGUMENTS`**, each isolated in its **own git worktree**, running the same pipeline `/feature` runs — design → plan → fact-check → parallel implement↔review loops → real-CLI test → feature review (security/CLI-UX) → fix — **concurrently across features**, then open **one pull request per feature**.
+Build **every feature listed in the Markdown file at `$ARGUMENTS`**, each isolated in its **own git worktree**, running the same pipeline `/feature` runs — design → plan → fact-check → parallel implement↔review loops → real-CLI test → feature review (security/CLI-UX) → fix — **concurrently across features**, then open **one pull request — or one stack of small PRs, when a big feature splits cleanly — per feature**.
 
 The worktrees give true isolation: parallel features can't collide on files, the `pixi` manifest, the `cli.py` click group, the lockfile, or the `pixi run check` gate — stronger than in-tree `Owns` sets. Correctness still beats concurrency: create worktrees serially, and never mutate the base checkout mid-run — the sole exception is checking completed features off in the features file itself (Step 4), a doc-only edit that touches nothing a worktree builds from.
 
@@ -14,6 +14,7 @@ The worktrees give true isolation: parallel features can't collide on files, the
   - `gh --version` and `gh auth status` (GitHub CLI installed + authenticated?),
   - `git remote get-url origin` and confirm it points at `github.com` (or the host `gh` is configured for).
   - If `gh` is missing/unauthenticated or there's no GitHub remote, we still do all the work but **fall back** to pushing each branch and printing its compare URL for manual PR creation. Tell me up front which path we're on.
+- **Probe stack tooling once** (see the `stacked-prs` skill, section 5): `gh stack --help` (GitHub native stacks), `test -e "$(git rev-parse --git-path .graphite_repo_config)"` (Graphite), `git show-ref --verify --quiet refs/spice/data` (git-spice). Never install one. Tell me which stacking path is in use — native `gh stack`, a detected Graphite/git-spice setup (offered, not assumed), or plain git + `gh` — and the **stacked-PR threshold** from `CLAUDE.md` → *Project specifics* (default 400 changed lines; `never` turns stacking off).
 - (Complementary, optional) Claude Code also has a **native worktree surface** — `claude --worktree <name>`/`--tmux`, the `isolation: worktree` subagent field, `EnterWorktree`, and a `.worktreeinclude` file for copying untracked files into new worktrees. It branches from the default branch and auto-names branches, so it isn't a drop-in for feature-derived branch names — we hand-roll `git worktree` below for deterministic names. Re-check `claude --help` / the worktrees docs at use-time, since that surface is new and evolving; use `.worktreeinclude` if features need `.env`/untracked files present in each worktree.
 
 ## 1. Parse the features file
@@ -37,17 +38,25 @@ For each feature, run the **complete `/feature` pipeline scoped to its worktree*
 
 Give a **one-paragraph status per round** covering every feature: phase, current verdicts, round counts, and what's blocked on me.
 
-## 4. Open a PR per feature
+## 4. Open a PR — or a stack — per feature
 When a feature is fully green in its worktree (`pixi run check` passes, real-CLI tests pass, review board APPROVED):
+- **Decide: one PR or a stack.** First pin the start sha: record `git merge-base <base-branch> HEAD` as a literal sha, and use it (never the live base ref) for the measurement and any rebuild reset. Measure the finished diff against that sha, excluding `pixi.lock`, snapshot/golden files and any generated or vendored paths (the exact command is in the `stacked-prs` skill, section 2). **Stack only if** the total is over the threshold **and** the feature's approved plan has ≥ 2 PR slices. Otherwise follow the single-PR steps below unchanged.
+- **If stacking**, follow the `stacked-prs` skill, sections 3–4, in this worktree:
+  - Commit slice by slice by path; lower slices get branches `feature/<slug>-pt<k>-<slice-slug>` and the top stays on `feature/<slug>`. `git status --porcelain` must be empty afterwards.
+  - Gate every lower tip with the full `nice -n 10 pixi run check` (`git switch --detach <tip>` → gate → `git switch feature/<slug>`, switching back **even when the gate fails**). A failing tip folds into the slice above it: rebuild with `git reset --mixed <start-sha>` and delete only the `-pt<k>-` branches this run created. If everything collapses to one slice, open one PR.
+  - Push **all** the stack's branches, then open the PRs **bottom-up** — PR 1 on the base branch, PR k on slice k−1's branch — titled `<feature> (k/n): <purpose>`. Each body opens with a **stack map** (all n slices by branch name, this one marked, "merge bottom-up") and states that lower tips carry gate evidence only.
+  - With native `gh stack` (or a detected Graphite/git-spice setup I accepted), submit the same slices with it instead, reading its `--help` at use-time.
+  - **The studio never merges.** Merging bottom-up and any restack (a force-push to my branches, see section 6 of the skill) are mine; do a restack only on my request and after I confirm each push.
+- **Single PR** (the steps below; a stack applies the same body rules to each of its PRs):
 - Commit its work on its branch with a clear message.
 - **Push first — `gh pr create` will not push for you in this non-interactive context:** `git push -u origin <branch>` (from inside that worktree).
 - Open the PR: capture the URL — `PR_URL=$(gh pr create --base <base-branch> --head <branch> --title "<feature name>" --body-file <summary-file>)`. Write a real body (what was built, new pixi deps/tasks, tests, review rounds) rather than `--fill`. Report `PR_URL`.
-- **Fallback** (no `gh`/remote from preflight): after `git push -u origin <branch>`, print the compare URL for manual PR creation — `https://github.com/<owner>/<repo>/compare/<base>...<branch>?expand=1` (the `?expand=1` is an informal convention; treat it as best-effort UX, not something to depend on).
-- **One PR per feature** — never fold two features into one branch/PR.
-- **Then mark that feature done in the source file.** With its PR open (or, in the fallback, its branch pushed and its compare URL printed), edit `$ARGUMENTS` in place to mark **only that feature's item** complete using the convention chosen in Step 1 — tick its checkbox (`- [x]`) or append ` — ✅ DONE` to its line/heading. **Re-read the file immediately before editing** so features finishing around the same time don't clobber each other's check-offs, and leave every other line unchanged. If the file can't be written (read-only, or outside the repo), report it and move on — never fail a finished feature over a check-off.
+- **Fallback** (no `gh`/remote from preflight): after `git push -u origin <branch>`, print the compare URL for manual PR creation — `https://github.com/<owner>/<repo>/compare/<base>...<branch>?expand=1`. For a stack, push every slice branch and print **one compare URL per slice**, `compare/<parent-branch>...<slice-branch>?expand=1`, bottom-up (the `?expand=1` is an informal convention; treat it as best-effort UX, not something to depend on).
+- **One PR or one stack per feature** — never fold two features into one branch, PR, or stack. Stacks never cross features, and no PR in a stack names a sibling feature.
+- **Then mark that feature done in the source file.** Once its PR is open (for a stack, once its last — top — PR is open; in the fallback, once its branch(es) are pushed and the compare URL(s) printed), edit `$ARGUMENTS` in place to mark **only that feature's item** complete using the convention chosen in Step 1 — tick its checkbox (`- [x]`) or append ` — ✅ DONE` to its line/heading. **Re-read the file immediately before editing** so features finishing around the same time don't clobber each other's check-offs, and leave every other line unchanged. If the file can't be written (read-only, or outside the repo), report it and move on — never fail a finished feature over a check-off.
 
 ## 5. Summary & cleanup
-- Report a table: feature → branch → worktree → PR URL (or compare URL) → gate/test result → review rounds → new pixi deps/tasks → outstanding Should-fix/Nit items → anything still waiting on me.
+- Report a table: feature → branch(es) → worktree → PR URL(s) (for a stack, every PR bottom-up as `k/n`; or compare URLs) → gate/test result → review rounds → new pixi deps/tasks → outstanding Should-fix/Nit items → anything still waiting on me.
 - The completed features are now **checked off in `$ARGUMENTS`** (unfinished, failed, or still-blocked ones left unmarked). That edit is an **uncommitted change in the base working tree** — commit or revert it as you prefer; it's separate from the per-feature branches.
 - **Ask before removing worktrees.** On my OK: `git worktree remove <path>` each (`-f` if dirty), then `git worktree prune`. Leave branches and PRs intact.
 
